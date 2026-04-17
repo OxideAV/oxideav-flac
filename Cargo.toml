@@ -12,3 +12,4 @@ description = "Pure-Rust FLAC: native container + codec id (decoder forthcoming)
 oxideav-core = { workspace = true }
 oxideav-codec = { workspace = true }
 oxideav-container = { workspace = true }
+oxideav-id3 = { workspace = true }
