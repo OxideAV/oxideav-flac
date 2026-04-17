@@ -1,20 +1,20 @@
 [package]
 name = "oxideav-flac"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-flac"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust FLAC: native container + codec id (decoder forthcoming)"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-flac"
 keywords = ["multimedia", "audio", "flac", "lossless", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
-oxideav-container = { workspace = true }
-oxideav-id3 = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
+oxideav-container = "0.0"
+oxideav-id3 = "0.0"
