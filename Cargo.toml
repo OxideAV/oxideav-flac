@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-flac"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust FLAC: native container + codec id (decoder forthcoming)"
+description = "Pure-Rust FLAC lossless audio codec and native container: decoder, encoder, demuxer, muxer"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-flac"

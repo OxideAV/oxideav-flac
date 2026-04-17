@@ -2,13 +2,12 @@
 //!
 //! The demuxer walks the metadata blocks to populate
 //! [`CodecParameters`] from STREAMINFO, then emits frames as packets by
-//! scanning for the FLAC frame sync pattern (0xFF, 0xF8/0xF9). The full set of
-//! metadata blocks (including their headers) is preserved verbatim in
-//! `extradata` so the muxer can round-trip byte-identical output.
-//!
-//! Per-packet timestamps are not yet computed — that requires parsing the
-//! variable-length frame header in detail. The decoder (forthcoming) will do
-//! that work.
+//! scanning for the FLAC frame sync pattern (0xFF, 0xF8/0xF9) and
+//! CRC-8-verifying each candidate header to reject false matches. The
+//! full set of metadata blocks (including their headers) is preserved
+//! verbatim in `extradata` so the muxer can round-trip byte-identical
+//! output, and per-packet timestamps are computed directly from the
+//! frame header.
 
 use std::io::{Read, Seek, SeekFrom};
 
