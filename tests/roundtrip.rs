@@ -208,3 +208,87 @@ fn roundtrip_multi_block_via_traits() {
     }
     roundtrip_through_traits(SampleFormat::S16, 1, sr, vec![s]);
 }
+
+/// A clean stereo sine is exactly the kind of signal LPC + M/S should
+/// obliterate. Verifies bit-exact round-trip through the full codec
+/// trait interface plus the post-flush STREAMINFO updates (MD5 set,
+/// min/max frame size populated, total sample count recorded).
+#[test]
+fn lpc_and_stereo_decorrelation_roundtrip_and_streaminfo() {
+    let sr = 48_000u32;
+    let n = 8192usize;
+    let mut l = Vec::with_capacity(n);
+    let mut r = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f64 / sr as f64;
+        let base = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 18_000.0;
+        l.push(base as i32);
+        r.push((base * 0.95 + 17.0) as i32);
+    }
+
+    let mut enc_params = CodecParameters::audio(CodecId::new("flac"));
+    enc_params.channels = Some(2);
+    enc_params.sample_rate = Some(sr);
+    enc_params.sample_format = Some(SampleFormat::S16);
+    let mut enc = oxideav_flac::encoder::make_encoder(&enc_params).expect("make_encoder");
+
+    let frame = build_audio_frame(SampleFormat::S16, 2, sr, &[l.clone(), r.clone()]);
+    enc.send_frame(&Frame::Audio(frame)).expect("send_frame");
+    enc.flush().expect("flush");
+
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected encoder error: {:?}", e),
+        }
+    }
+    assert!(!packets.is_empty());
+
+    let final_params = enc.output_params().clone();
+    let total_compressed: usize = packets.iter().map(|p| p.data.len()).sum();
+    let verbatim_bits = n * 2 * 16;
+    assert!(
+        total_compressed * 8 < verbatim_bits / 2,
+        "LPC + stereo decorrelation should compress below 50% of VERBATIM size; \
+         got {total_compressed} bytes vs {} bytes verbatim-equivalent",
+        verbatim_bits / 8
+    );
+
+    // STREAMINFO checks on the post-flush extradata.
+    let md5_bytes = &final_params.extradata[4 + 18..4 + 34];
+    assert!(
+        md5_bytes.iter().any(|&b| b != 0),
+        "post-flush STREAMINFO MD5 must be non-zero"
+    );
+    let min_fs = ((final_params.extradata[4 + 4] as u32) << 16)
+        | ((final_params.extradata[4 + 5] as u32) << 8)
+        | (final_params.extradata[4 + 6] as u32);
+    let max_fs = ((final_params.extradata[4 + 7] as u32) << 16)
+        | ((final_params.extradata[4 + 8] as u32) << 8)
+        | (final_params.extradata[4 + 9] as u32);
+    assert!(min_fs > 0 && max_fs >= min_fs, "frame-size bounds recorded");
+    let packed = u64::from_be_bytes(
+        final_params.extradata[4 + 10..4 + 18]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    assert_eq!(packed & 0x0000_000F_FFFF_FFFF, n as u64, "total samples");
+
+    // Decode back and verify bit-exact recovery via the decorrelation path.
+    let mut dec = oxideav_flac::decoder::make_decoder(&final_params).expect("make_decoder");
+    let mut recovered = Vec::new();
+    for pkt in packets {
+        dec.send_packet(&pkt).expect("send_packet");
+        let f = dec.receive_frame().expect("receive_frame");
+        let Frame::Audio(a) = f else {
+            panic!("expected audio");
+        };
+        recovered.extend(decode_interleaved(&a));
+    }
+    for i in 0..n {
+        assert_eq!(recovered[i * 2], l[i]);
+        assert_eq!(recovered[i * 2 + 1], r[i]);
+    }
+}

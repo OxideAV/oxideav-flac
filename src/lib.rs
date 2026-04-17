@@ -10,8 +10,10 @@
 //!   subframe types, all residual partition methods, 8/12/16/20/24/32 bps,
 //!   up to 8 channels, stereo decorrelation) and a working pure-Rust
 //!   encoder that produces bit-exact round-trippable output. The encoder
-//!   uses FIXED predictor order 2 + partitioned Rice; LPC is not yet used
-//!   on the encode side, so compressed size is larger than `flac --best`.
+//!   tries CONSTANT, FIXED 0..=4, LPC 1..=8 and VERBATIM per subframe,
+//!   picks the smallest, evaluates all four stereo channel assignments
+//!   for 2-channel input, and writes a full STREAMINFO (including MD5
+//!   signature and frame-size/sample-count bookkeeping) at flush time.
 
 pub mod bitreader;
 pub mod bitwriter;
@@ -21,6 +23,7 @@ pub mod crc;
 pub mod decoder;
 pub mod encoder;
 pub mod frame;
+pub mod md5;
 pub mod metadata;
 pub mod subframe;
 

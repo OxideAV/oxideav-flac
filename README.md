@@ -104,20 +104,25 @@ non-Subset):
 - **Bit depths**: 8 (`U8`), 16 (`S16`), 24 (`S24`), 32 (`S32`) bps.
 - **Sample rates**: any rate the STREAMINFO format can hold
   (up to 655_350 Hz).
-- **Channels**: 1..=8, independent (no stereo decorrelation — L/R are
-  stored as two independent subframes).
-- **Predictors**: CONSTANT for flat blocks, FIXED order 2 for everything
-  else, VERBATIM fallback for pathological inputs. LPC is not currently
-  used on the encode side, so file sizes are larger than what reference
-  encoders (`flac --best`) produce. The bitstream is still fully valid
-  and fully lossless — any compliant decoder (including this crate's own)
-  will recover the original PCM bit-exactly.
+- **Channels**: 1..=8 independent. For stereo (2-channel) inputs the
+  encoder evaluates all four spec-defined channel assignments
+  (independent L/R, left-side, right-side, mid-side) per frame and
+  picks the one that produces the smallest total subframe size.
+- **Predictors**: per subframe the encoder tries CONSTANT, FIXED
+  orders 0..=4, LPC orders 1..=8 (Levinson-Durbin on a Welch-windowed
+  autocorrelation with 12-bit coefficient quantisation) and VERBATIM,
+  and keeps the smallest. The output remains fully valid and fully
+  lossless — any compliant decoder (including this crate's own) will
+  recover the original PCM bit-exactly.
 - **Residual coding**: partitioned Rice with partition order 0,
   exhaustive choice between Rice methods 0 and 1 per subframe, and
   escape partitions for samples that can't be Rice-coded cheaply.
 - **Block size**: 4096 samples per frame (fixed-blocking strategy).
-- **Metadata**: emits a STREAMINFO-only metadata header in `extradata`.
-  MD5 is written as all-zero (valid per spec; indicates "unset").
+- **Metadata**: emits a STREAMINFO metadata header in `extradata`. An
+  MD5 signature of the PCM input is computed during encode and written
+  into the block at `flush()` time, along with the observed min/max
+  frame size and the total sample count. Fetch the final
+  `enc.output_params().extradata` after flushing to feed a muxer.
 
 ## Native container
 
