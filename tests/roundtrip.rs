@@ -1,0 +1,206 @@
+//! End-to-end FLAC encoder -> decoder round-trip through the public
+//! trait objects (not the internal helper functions). Verifies bit-exact
+//! PCM recovery (FLAC is lossless) for several sample formats and
+//! channel counts.
+
+use oxideav_core::{
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
+};
+
+fn build_audio_frame(
+    format: SampleFormat,
+    channels: u16,
+    sample_rate: u32,
+    pcm_per_channel: &[Vec<i32>],
+) -> AudioFrame {
+    assert_eq!(pcm_per_channel.len(), channels as usize);
+    let n = pcm_per_channel[0].len();
+    for c in pcm_per_channel {
+        assert_eq!(c.len(), n);
+    }
+    let bytes_per_sample = format.bytes_per_sample();
+    let mut interleaved: Vec<u8> = Vec::with_capacity(n * channels as usize * bytes_per_sample);
+    for i in 0..n {
+        for c in 0..channels as usize {
+            let s = pcm_per_channel[c][i];
+            match format {
+                SampleFormat::U8 => interleaved.push(((s + 128) & 0xFF) as u8),
+                SampleFormat::S16 => {
+                    interleaved.extend_from_slice(&(s as i16).to_le_bytes());
+                }
+                SampleFormat::S24 => {
+                    interleaved.push((s & 0xFF) as u8);
+                    interleaved.push(((s >> 8) & 0xFF) as u8);
+                    interleaved.push(((s >> 16) & 0xFF) as u8);
+                }
+                SampleFormat::S32 => interleaved.extend_from_slice(&s.to_le_bytes()),
+                _ => panic!("unsupported format for test: {:?}", format),
+            }
+        }
+    }
+    AudioFrame {
+        format,
+        channels,
+        sample_rate,
+        samples: n as u32,
+        pts: Some(0),
+        time_base: TimeBase::new(1, sample_rate as i64),
+        data: vec![interleaved],
+    }
+}
+
+fn decode_interleaved(a: &AudioFrame) -> Vec<i32> {
+    let n_ch = a.channels as usize;
+    let bps = a.format.bytes_per_sample();
+    let mut out = Vec::with_capacity(a.samples as usize * n_ch);
+    for chunk in a.data[0].chunks_exact(bps * n_ch) {
+        for c in 0..n_ch {
+            let off = c * bps;
+            let v = match a.format {
+                SampleFormat::U8 => (chunk[off] as i32) - 128,
+                SampleFormat::S16 => i16::from_le_bytes([chunk[off], chunk[off + 1]]) as i32,
+                SampleFormat::S24 => {
+                    let mut v = (chunk[off] as i32)
+                        | ((chunk[off + 1] as i32) << 8)
+                        | ((chunk[off + 2] as i32) << 16);
+                    if v & 0x0080_0000 != 0 {
+                        v |= 0xFF00_0000_u32 as i32;
+                    }
+                    v
+                }
+                SampleFormat::S32 => i32::from_le_bytes([
+                    chunk[off],
+                    chunk[off + 1],
+                    chunk[off + 2],
+                    chunk[off + 3],
+                ]),
+                _ => panic!("unexpected format"),
+            };
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn roundtrip_through_traits(
+    format: SampleFormat,
+    channels: u16,
+    sample_rate: u32,
+    pcm_per_channel: Vec<Vec<i32>>,
+) {
+    let n = pcm_per_channel[0].len();
+
+    let mut enc_params = CodecParameters::audio(CodecId::new("flac"));
+    enc_params.channels = Some(channels);
+    enc_params.sample_rate = Some(sample_rate);
+    enc_params.sample_format = Some(format);
+    let mut enc = oxideav_flac::encoder::make_encoder(&enc_params).expect("make_encoder");
+
+    let dec_params = enc.output_params().clone();
+    assert!(!dec_params.extradata.is_empty(), "encoder must emit extradata (STREAMINFO)");
+    let mut dec = oxideav_flac::decoder::make_decoder(&dec_params).expect("make_decoder");
+
+    let frame = build_audio_frame(format, channels, sample_rate, &pcm_per_channel);
+    enc.send_frame(&Frame::Audio(frame)).expect("send_frame");
+    enc.flush().expect("flush");
+
+    let mut packets: Vec<Packet> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected encoder error: {:?}", e),
+        }
+    }
+    assert!(!packets.is_empty(), "encoder must produce at least one packet");
+
+    let mut recovered: Vec<i32> = Vec::new();
+    for pkt in packets {
+        dec.send_packet(&pkt).expect("send_packet");
+        let f = dec.receive_frame().expect("receive_frame");
+        let Frame::Audio(a) = f else {
+            panic!("expected audio frame");
+        };
+        recovered.extend(decode_interleaved(&a));
+    }
+
+    let n_ch = channels as usize;
+    assert_eq!(recovered.len(), n * n_ch, "sample count mismatch");
+    for i in 0..n {
+        for c in 0..n_ch {
+            assert_eq!(
+                recovered[i * n_ch + c],
+                pcm_per_channel[c][i],
+                "mismatch at sample {i} channel {c}"
+            );
+        }
+    }
+}
+
+#[test]
+fn roundtrip_s16_stereo_sine_via_traits() {
+    let sr = 48_000u32;
+    let n = 5000usize;
+    let mut l = Vec::with_capacity(n);
+    let mut r = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f64 / sr as f64;
+        l.push(((t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 18_000.0) as i32);
+        r.push(((t * 660.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0) as i32);
+    }
+    roundtrip_through_traits(SampleFormat::S16, 2, sr, vec![l, r]);
+}
+
+#[test]
+fn roundtrip_s24_mono_ramp_via_traits() {
+    let n = 3000usize;
+    let mut s = Vec::with_capacity(n);
+    let mut v: i32 = -0x7F_FFFF;
+    for _ in 0..n {
+        s.push(v);
+        v = v.wrapping_add(0x1234);
+        if v > 0x7F_FFFF {
+            v = -0x7F_FFFF;
+        }
+    }
+    roundtrip_through_traits(SampleFormat::S24, 1, 44_100, vec![s]);
+}
+
+#[test]
+fn roundtrip_u8_mono_via_traits() {
+    let n = 2048usize;
+    let mut s = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = ((i as i32 % 200) - 100).max(-127).min(127);
+        s.push(v);
+    }
+    roundtrip_through_traits(SampleFormat::U8, 1, 8_000, vec![s]);
+}
+
+#[test]
+fn roundtrip_s32_stereo_via_traits() {
+    let sr = 96_000u32;
+    let n = 2500usize;
+    let mut l = Vec::with_capacity(n);
+    let mut r = Vec::with_capacity(n);
+    let mut acc: i32 = i32::MIN / 2;
+    for i in 0..n {
+        l.push(acc);
+        acc = acc.wrapping_add(0x0010_0001);
+        let t = i as f64 / sr as f64;
+        r.push(((t * 220.0 * 2.0 * std::f64::consts::PI).sin() * (i32::MAX as f64 * 0.9)) as i32);
+    }
+    roundtrip_through_traits(SampleFormat::S32, 2, sr, vec![l, r]);
+}
+
+#[test]
+fn roundtrip_multi_block_via_traits() {
+    // More than one 4096-sample default block -> multiple packets.
+    let sr = 48_000u32;
+    let n = 10_000usize;
+    let mut s = Vec::with_capacity(n);
+    for i in 0..n {
+        s.push((((i * 37) & 0xFFFF) as i32) - 0x8000);
+    }
+    roundtrip_through_traits(SampleFormat::S16, 1, sr, vec![s]);
+}

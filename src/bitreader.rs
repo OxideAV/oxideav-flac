@@ -122,9 +122,11 @@ impl<'a> BitReader<'a> {
                 self.acc <<= lz_avail;
             }
             self.bits_in_acc -= lz_avail;
-            if lz_avail < lz_total {
-                // We hit the end of the buffered bits without finding a 1 —
-                // loop and refill.
+            // If we exhausted the buffered bits without finding a 1, loop and
+            // refill. This also covers the degenerate case where the whole
+            // 64-bit accumulator was zero (`lz_total == lz_avail == 64` and
+            // now `bits_in_acc == 0`).
+            if lz_avail < lz_total || self.bits_in_acc == 0 {
                 continue;
             }
             // Consume the terminating 1 bit.
@@ -232,6 +234,24 @@ mod tests {
         let bytes = [b0, b1, b2, b3];
         let mut br = BitReader::new(&bytes);
         assert_eq!(br.read_utf8_u64().unwrap() as u32, v);
+    }
+
+    #[test]
+    fn unary_rejects_all_zero_bytes_without_underflow() {
+        // 8 bytes of 0x00 followed by no terminator: previously this
+        // triggered a subtract-with-overflow panic in `read_unary`. Now
+        // it must return a clean error.
+        let mut br = BitReader::new(&[0u8; 8]);
+        let err = br.read_unary().expect_err("unterminated unary should error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unary") || msg.contains("out of bits"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn unary_long_run_across_byte_boundary() {
+        // 16 zero bits followed by a 1 bit — unary value 16.
+        let mut br = BitReader::new(&[0x00, 0x00, 0x80]);
+        assert_eq!(br.read_unary().unwrap(), 16);
     }
 
     #[test]
