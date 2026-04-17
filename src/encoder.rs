@@ -31,7 +31,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         SampleFormat::U8 => 8,
         SampleFormat::S16 => 16,
         SampleFormat::S24 => 24,
-        SampleFormat::S32 => 24, // FLAC stores up to 32-bit but WAV→FLAC is typically ≤24
+        SampleFormat::S32 => 32,
         _ => {
             return Err(Error::unsupported(format!(
                 "FLAC encoder: sample format {:?} not supported",
@@ -405,18 +405,57 @@ fn encode_verbatim(w: &mut BitWriter, samples: &[i32], bps: u32) -> Result<()> {
 }
 
 fn encode_rice_residual(w: &mut BitWriter, residuals: &[i32]) {
-    // Method 0 (4-bit Rice parameter), partition_order = 0 (one partition).
-    let k = choose_rice_k(residuals);
-    w.write_u32(0, 2); // method
+    // Choose between method 0 (4-bit k) and method 1 (5-bit k) based on
+    // which produces fewer bits. Both use partition_order = 0.
+    let (method, k_max) = {
+        // Upper bound on unary-quotient-length for a method-0 partition:
+        // with k ≤ 14 a residual zigzagged to u32 can yield quotients up to
+        // ~2^18. Method 1 (k ≤ 30) keeps quotients to ~2^2. For 32-bit
+        // samples we generally want method 1.
+        let (bits0, _k0) = best_rice_params(residuals, 14);
+        let (bits1, _k1) = best_rice_params(residuals, 30);
+        if bits1 + 1 < bits0 {
+            // +1 accounts for the extra Rice-parameter bit in method 1.
+            (1u32, 30u32)
+        } else {
+            (0u32, 14u32)
+        }
+    };
+    let (_, k) = best_rice_params(residuals, k_max);
+    let param_bits = if method == 0 { 4 } else { 5 };
+    let escape_marker: u32 = (1u32 << param_bits) - 1;
+
+    w.write_u32(method, 2); // method
     w.write_u32(0, 4); // partition_order
-    w.write_u32(k, 4); // Rice parameter
-    for &r in residuals {
-        let u = zigzag_encode(r);
-        let q = u >> k;
-        w.write_unary(q);
-        if k > 0 {
-            let rem = u & ((1u32 << k) - 1);
-            w.write_u32(rem, k);
+
+    // If any residual is still too big to Rice-code sanely (e.g., huge
+    // 32-bit outliers) use an escape partition with raw bits.
+    let needed_bits = raw_bits_needed(residuals);
+    // Compare: Rice cost vs. escape cost (5 bits raw_bps + n * needed_bits).
+    // Escape partitions store raw_bps in a 5-bit field so `needed_bits` must
+    // fit in 0..=31; for full-scale 32-bit residuals we can't escape and
+    // must rely on Rice (or fall back to VERBATIM at the caller).
+    let rice_cost = encoded_rice_cost(residuals, k);
+    let escape_cost: u64 = 5 + (residuals.len() as u64) * (needed_bits as u64);
+    let escape_ok = needed_bits <= 31;
+    if escape_ok && escape_cost < rice_cost {
+        // Escape partition: k field = escape_marker, then 5 bits raw_bps, then raw samples.
+        w.write_u32(escape_marker, param_bits);
+        w.write_u32(needed_bits, 5);
+        for &r in residuals {
+            // Two's complement with `needed_bits` bits.
+            w.write_i32(r, needed_bits);
+        }
+    } else {
+        w.write_u32(k, param_bits);
+        for &r in residuals {
+            let u = zigzag_encode(r);
+            let q = u >> k;
+            w.write_unary(q);
+            if k > 0 {
+                let rem = u & ((1u32 << k) - 1);
+                w.write_u32(rem, k);
+            }
         }
     }
 }
@@ -425,15 +464,44 @@ fn zigzag_encode(s: i32) -> u32 {
     ((s << 1) ^ (s >> 31)) as u32
 }
 
-/// Choose the Rice parameter that minimises total encoded bits. The 4-bit
-/// field range is 0..15 with 15 reserved as an escape — pick 0..=14.
-fn choose_rice_k(residuals: &[i32]) -> u32 {
+/// Cost in bits of Rice-coding `residuals` with parameter `k` (no method /
+/// partition overhead included).
+fn encoded_rice_cost(residuals: &[i32], k: u32) -> u64 {
+    let mut total: u64 = 0;
+    for &r in residuals {
+        let u = zigzag_encode(r) as u64;
+        total += (u >> k) + 1 + k as u64;
+    }
+    total
+}
+
+/// Minimum signed bit width needed to represent the largest-magnitude
+/// residual. Clamped to 1..=32. Used for escape-partition fallback.
+fn raw_bits_needed(residuals: &[i32]) -> u32 {
+    let mut max_bits = 1u32;
+    for &r in residuals {
+        let needed = if r >= 0 {
+            33 - (r as u32).leading_zeros()
+        } else {
+            33 - (!r as u32).leading_zeros()
+        };
+        if needed > max_bits {
+            max_bits = needed;
+        }
+    }
+    max_bits.min(32)
+}
+
+/// Pick the Rice parameter in 0..=k_max that minimises encoded bits and
+/// return `(best_bits, best_k)`. `k_max` must be the true ceiling (i.e. 14
+/// for method 0, 30 for method 1).
+fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     if residuals.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let mut best_k = 0u32;
     let mut best_bits = u64::MAX;
-    for k in 0..=14u32 {
+    for k in 0..=k_max {
         let mut total: u64 = 0;
         for &r in residuals {
             let u = zigzag_encode(r) as u64;
@@ -447,7 +515,7 @@ fn choose_rice_k(residuals: &[i32]) -> u32 {
             best_k = k;
         }
     }
-    best_k
+    (best_bits, best_k)
 }
 
 #[cfg(test)]
@@ -523,6 +591,12 @@ mod tests {
                             }
                             v
                         }
+                        oxideav_core::SampleFormat::S32 => i32::from_le_bytes([
+                            chunk[off],
+                            chunk[off + 1],
+                            chunk[off + 2],
+                            chunk[off + 3],
+                        ]),
                         _ => panic!("unexpected format"),
                     };
                     out_interleaved.push(s);
@@ -575,5 +649,40 @@ mod tests {
         // All samples the same → CONSTANT subframe.
         let samples = vec![12345i32; 1024];
         roundtrip(vec![samples], 48_000, 16);
+    }
+
+    #[test]
+    fn encode_decode_stereo_s32_ramp_plus_sine() {
+        // 32-bit PCM: linear ramp on L (exercises fixed predictor at full
+        // 32-bit precision) mixed with a large-amplitude sine on R
+        // (exercises the verbatim fallback when residuals exceed i32).
+        let sr = 48_000u32;
+        let n = 3000usize;
+        let mut l: Vec<i32> = Vec::with_capacity(n);
+        let mut r: Vec<i32> = Vec::with_capacity(n);
+        // Ramp uses a step that sets the high byte of the sample — without
+        // full 32-bit support, samples would be truncated to 24 bits and
+        // this assertion would fail.
+        let step: i32 = 0x0010_0001;
+        let mut acc: i32 = -0x4000_0000;
+        for i in 0..n {
+            l.push(acc);
+            acc = acc.wrapping_add(step);
+            let v = ((i as f64 / sr as f64 * 220.0 * 2.0 * std::f64::consts::PI).sin()
+                * (i32::MAX as f64 * 0.95)) as i32;
+            r.push(v);
+        }
+        roundtrip(vec![l, r], sr, 32);
+    }
+
+    #[test]
+    fn encode_decode_mono_s32_extremes() {
+        // Exercises edge values and the CONSTANT subframe path at 32-bit.
+        let mut samples: Vec<i32> = vec![i32::MIN; 100];
+        samples.extend(std::iter::repeat_n(i32::MAX, 100));
+        samples.extend([0i32, 1, -1, i32::MIN / 2, i32::MAX / 2]);
+        // Pad with a trailing run of identical values to trigger CONSTANT.
+        samples.extend(std::iter::repeat_n(-12345i32, 512));
+        roundtrip(vec![samples], 48_000, 32);
     }
 }

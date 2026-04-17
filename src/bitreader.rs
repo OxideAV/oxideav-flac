@@ -113,7 +113,14 @@ impl<'a> BitReader<'a> {
             count = count
                 .checked_add(lz_avail)
                 .ok_or_else(|| Error::invalid("BitReader: unary count overflow"))?;
-            self.acc <<= lz_avail;
+            // Shifting a u64 by 64 is UB in Rust — guard that case. It only
+            // arises for very long zero runs (e.g. 32-bit residuals Rice-
+            // coded with a small k).
+            if lz_avail >= 64 {
+                self.acc = 0;
+            } else {
+                self.acc <<= lz_avail;
+            }
             self.bits_in_acc -= lz_avail;
             if lz_avail < lz_total {
                 // We hit the end of the buffered bits without finding a 1 —
