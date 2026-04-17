@@ -20,6 +20,7 @@ fn build_audio_frame(
     }
     let bytes_per_sample = format.bytes_per_sample();
     let mut interleaved: Vec<u8> = Vec::with_capacity(n * channels as usize * bytes_per_sample);
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for c in 0..channels as usize {
             let s = pcm_per_channel[c][i];
@@ -68,12 +69,9 @@ fn decode_interleaved(a: &AudioFrame) -> Vec<i32> {
                     }
                     v
                 }
-                SampleFormat::S32 => i32::from_le_bytes([
-                    chunk[off],
-                    chunk[off + 1],
-                    chunk[off + 2],
-                    chunk[off + 3],
-                ]),
+                SampleFormat::S32 => {
+                    i32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]])
+                }
                 _ => panic!("unexpected format"),
             };
             out.push(v);
@@ -97,7 +95,10 @@ fn roundtrip_through_traits(
     let mut enc = oxideav_flac::encoder::make_encoder(&enc_params).expect("make_encoder");
 
     let dec_params = enc.output_params().clone();
-    assert!(!dec_params.extradata.is_empty(), "encoder must emit extradata (STREAMINFO)");
+    assert!(
+        !dec_params.extradata.is_empty(),
+        "encoder must emit extradata (STREAMINFO)"
+    );
     let mut dec = oxideav_flac::decoder::make_decoder(&dec_params).expect("make_decoder");
 
     let frame = build_audio_frame(format, channels, sample_rate, &pcm_per_channel);
@@ -112,7 +113,10 @@ fn roundtrip_through_traits(
             Err(e) => panic!("unexpected encoder error: {:?}", e),
         }
     }
-    assert!(!packets.is_empty(), "encoder must produce at least one packet");
+    assert!(
+        !packets.is_empty(),
+        "encoder must produce at least one packet"
+    );
 
     let mut recovered: Vec<i32> = Vec::new();
     for pkt in packets {
@@ -171,7 +175,7 @@ fn roundtrip_u8_mono_via_traits() {
     let n = 2048usize;
     let mut s = Vec::with_capacity(n);
     for i in 0..n {
-        let v = ((i as i32 % 200) - 100).max(-127).min(127);
+        let v = ((i as i32 % 200) - 100).clamp(-127, 127);
         s.push(v);
     }
     roundtrip_through_traits(SampleFormat::U8, 1, 8_000, vec![s]);

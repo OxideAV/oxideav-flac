@@ -242,9 +242,14 @@ mod tests {
         // triggered a subtract-with-overflow panic in `read_unary`. Now
         // it must return a clean error.
         let mut br = BitReader::new(&[0u8; 8]);
-        let err = br.read_unary().expect_err("unterminated unary should error");
+        let err = br
+            .read_unary()
+            .expect_err("unterminated unary should error");
         let msg = format!("{err:?}");
-        assert!(msg.contains("unary") || msg.contains("out of bits"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("unary") || msg.contains("out of bits"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
