@@ -106,7 +106,9 @@ fn flac_seek_lands_on_expected_frame() {
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
     let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
-    let mut demuxer = reg.open_demuxer("flac", cursor).expect("open flac");
+    let mut demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
 
     // 5. Seek to target_pts = 300 (inside frame 1 which covers [192, 384)).
     let landed = demuxer.seek_to(0, 300).expect("seek");
@@ -152,7 +154,9 @@ fn flac_seek_before_first_seekpoint_lands_on_frame_zero() {
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
     let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
-    let mut demuxer = reg.open_demuxer("flac", cursor).expect("open flac");
+    let mut demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
 
     let landed = demuxer.seek_to(0, 0).expect("seek");
     assert_eq!(landed, 0);
@@ -171,7 +175,9 @@ fn flac_seek_without_seektable_is_unsupported() {
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
     let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
-    let mut demuxer = reg.open_demuxer("flac", cursor).expect("open flac");
+    let mut demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
 
     match demuxer.seek_to(0, 0) {
         Err(oxideav_core::Error::Unsupported(msg)) => {

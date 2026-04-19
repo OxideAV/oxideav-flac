@@ -88,7 +88,9 @@ fn flac_metadata_and_picture_surface_through() {
     oxideav_flac::register_containers(&mut reg);
 
     let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
-    let demuxer = reg.open_demuxer("flac", cursor).expect("open flac");
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
 
     let md = demuxer.metadata();
     assert!(
@@ -145,7 +147,9 @@ fn flac_id3v2_prefix_surfaces_fallback_metadata() {
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
     let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
-    let demuxer = reg.open_demuxer("flac", cursor).expect("open flac");
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
     let md = demuxer.metadata();
     assert!(
         md.iter().any(|(k, v)| k == "title" && v == "FromId3"),

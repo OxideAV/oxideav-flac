@@ -13,8 +13,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
-    AttachedPicture, CodecId, CodecParameters, Error, MediaType, Packet, PictureType, Result,
-    SampleFormat, StreamInfo, TimeBase,
+    AttachedPicture, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet,
+    PictureType, Result, SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::frame::{parse_frame_header, FrameHeader};
@@ -50,7 +50,10 @@ fn probe(p: &oxideav_container::ProbeData) -> u8 {
 
 // --- Demuxer ---------------------------------------------------------------
 
-fn open_demuxer(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open_demuxer(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut pictures: Vec<AttachedPicture> = Vec::new();
     read_id3v2_if_present(&mut input, &mut metadata, &mut pictures)?;
