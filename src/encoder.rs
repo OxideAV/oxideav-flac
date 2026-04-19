@@ -15,9 +15,10 @@ use oxideav_core::{
     TimeBase,
 };
 
-use crate::bitwriter::BitWriter;
+use crate::bits_ext::BitWriterExt;
 use crate::crc;
 use crate::md5::Md5;
+use oxideav_core::bits::BitWriter;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// Highest LPC order the encoder will try. The decoder supports up to
@@ -475,35 +476,42 @@ fn choose_channel_assignment(channels: &[Vec<i32>], bps: u32) -> Result<(u32, Ve
     let l = &channels[0];
     let r = &channels[1];
     let n = l.len();
-    let mut side = Vec::with_capacity(n);
-    let mut mid = Vec::with_capacity(n);
-    for i in 0..n {
-        side.push((l[i] as i64 - r[i] as i64) as i32);
-        // FLAC's spec-defined mid is floor((L+R)/2); the absorbed LSB is
-        // recovered via `side`. `((L+R) >> 1)` matches libFLAC.
-        let sum = l[i] as i64 + r[i] as i64;
-        mid.push((sum >> 1) as i32);
-    }
 
     let sf_l = best_subframe(l, bps)?;
     let sf_r = best_subframe(r, bps)?;
-    let sf_s = best_subframe(&side, bps + 1)?;
-    let sf_m = best_subframe(&mid, bps)?;
-
     let independent_bits = sf_l.bits + sf_r.bits;
-    let left_side_bits = sf_l.bits + sf_s.bits;
-    let right_side_bits = sf_s.bits + sf_r.bits;
-    let mid_side_bits = sf_m.bits + sf_s.bits;
-
     let mut best = (independent_bits, 1u32, vec![sf_l.clone(), sf_r.clone()]);
-    if left_side_bits < best.0 {
-        best = (left_side_bits, 8, vec![sf_l.clone(), sf_s.clone()]);
-    }
-    if right_side_bits < best.0 {
-        best = (right_side_bits, 9, vec![sf_s.clone(), sf_r.clone()]);
-    }
-    if mid_side_bits < best.0 {
-        best = (mid_side_bits, 10, vec![sf_m, sf_s]);
+
+    // Stereo decorrelation modes need a side channel at `bps + 1` bits
+    // (to span the full L-R range). Our subframe encoders clamp to 32
+    // bits, so for 32-bit input we skip the decorrelation modes and
+    // fall back to LR-only (`assignment = 1`). This matches libFLAC,
+    // which rejects any `bits_per_sample > 32` outright and keeps LR
+    // for the `== 32` boundary.
+    if bps < 32 {
+        let mut side = Vec::with_capacity(n);
+        let mut mid = Vec::with_capacity(n);
+        for i in 0..n {
+            side.push((l[i] as i64 - r[i] as i64) as i32);
+            // FLAC's spec-defined mid is floor((L+R)/2); the absorbed LSB is
+            // recovered via `side`. `((L+R) >> 1)` matches libFLAC.
+            let sum = l[i] as i64 + r[i] as i64;
+            mid.push((sum >> 1) as i32);
+        }
+        let sf_s = best_subframe(&side, bps + 1)?;
+        let sf_m = best_subframe(&mid, bps)?;
+        let left_side_bits = sf_l.bits + sf_s.bits;
+        let right_side_bits = sf_s.bits + sf_r.bits;
+        let mid_side_bits = sf_m.bits + sf_s.bits;
+        if left_side_bits < best.0 {
+            best = (left_side_bits, 8, vec![sf_l.clone(), sf_s.clone()]);
+        }
+        if right_side_bits < best.0 {
+            best = (right_side_bits, 9, vec![sf_s.clone(), sf_r.clone()]);
+        }
+        if mid_side_bits < best.0 {
+            best = (mid_side_bits, 10, vec![sf_m, sf_s]);
+        }
     }
     Ok((best.1, best.2))
 }

@@ -15,8 +15,7 @@
 //!   for 2-channel input, and writes a full STREAMINFO (including MD5
 //!   signature and frame-size/sample-count bookkeeping) at flush time.
 
-pub mod bitreader;
-pub mod bitwriter;
+pub mod bits_ext;
 pub mod codec;
 pub mod container;
 pub mod crc;

@@ -4,8 +4,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use crate::bits_ext::BitReaderExt;
 use crate::crc;
+use oxideav_core::bits::BitReader;
 
 /// Per-channel layout of the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

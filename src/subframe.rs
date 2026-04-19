@@ -4,7 +4,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use oxideav_core::bits::BitReader;
 
 /// Decode one subframe from the bitstream.
 ///

@@ -5,11 +5,11 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::bitreader::BitReader;
 use crate::crc;
 use crate::frame::{parse_frame_header, ChannelAssignment};
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 use crate::subframe::decode_subframe;
+use oxideav_core::bits::BitReader;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let streaminfo = find_streaminfo(&params.extradata)?;
