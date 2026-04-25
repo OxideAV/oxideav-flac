@@ -11,18 +11,18 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_container::{Demuxer, Muxer, ReadSeek, WriteSeek};
 use oxideav_core::{
     AttachedPicture, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet,
     PictureType, Result, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{Demuxer, Muxer, ReadSeek, WriteSeek};
 
 use crate::frame::{parse_frame_header, FrameHeader};
 use crate::metadata::{
     parse_seektable, BlockHeader, BlockType, SeekPoint, StreamInfo as Si, FLAC_MAGIC,
 };
 
-pub fn register(reg: &mut oxideav_container::ContainerRegistry) {
+pub fn register(reg: &mut oxideav_core::ContainerRegistry) {
     reg.register_demuxer("flac", open_demuxer);
     reg.register_muxer("flac", open_muxer);
     reg.register_extension("flac", "flac");
@@ -31,7 +31,7 @@ pub fn register(reg: &mut oxideav_container::ContainerRegistry) {
 }
 
 /// `fLaC` magic at offset 0, or after an ID3v2 tag at offset 0.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 4 && &p.buf[0..4] == b"fLaC" {
         return 100;
     }

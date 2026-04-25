@@ -26,8 +26,8 @@ pub mod md5;
 pub mod metadata;
 pub mod subframe;
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
+use oxideav_core::CodecRegistry;
+use oxideav_core::ContainerRegistry;
 
 pub const CODEC_ID_STR: &str = "flac";
 

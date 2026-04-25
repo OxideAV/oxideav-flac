@@ -7,7 +7,7 @@
 
 use std::io::Cursor;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_flac::crc::crc8;
 
 /// Pack a FLAC metadata-block header: last-flag (1 bit) + type (7 bits) +
@@ -105,7 +105,7 @@ fn flac_seek_lands_on_expected_frame() {
     // 4. Open through the container registry.
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
-    let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
     let mut demuxer = reg
         .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
         .expect("open flac");
@@ -153,7 +153,7 @@ fn flac_seek_before_first_seekpoint_lands_on_frame_zero() {
 
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
-    let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
     let mut demuxer = reg
         .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
         .expect("open flac");
@@ -174,7 +174,7 @@ fn flac_seek_without_seektable_is_unsupported() {
 
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
-    let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
     let mut demuxer = reg
         .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
         .expect("open flac");

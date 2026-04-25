@@ -1,7 +1,7 @@
 //! FLAC codec registration.
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("flac_sw")

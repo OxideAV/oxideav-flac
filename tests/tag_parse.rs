@@ -10,7 +10,7 @@
 
 use std::io::Cursor;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::PictureType;
 
 /// Pack a FLAC metadata block header: last-flag (1 bit) + type (7 bits) +
@@ -87,7 +87,7 @@ fn flac_metadata_and_picture_surface_through() {
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
 
-    let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
     let demuxer = reg
         .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
         .expect("open flac");
@@ -146,7 +146,7 @@ fn flac_id3v2_prefix_surfaces_fallback_metadata() {
 
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
-    let cursor: Box<dyn oxideav_container::ReadSeek> = Box::new(Cursor::new(file));
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
     let demuxer = reg
         .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
         .expect("open flac");
