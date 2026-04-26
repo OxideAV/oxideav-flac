@@ -155,18 +155,11 @@ struct FlacEncoder {
 
 impl FlacEncoder {
     fn ingest_frame(&mut self, a: &AudioFrame) -> Result<()> {
-        if a.channels != self.channels || a.sample_rate != self.sample_rate {
-            return Err(Error::invalid(
-                "FLAC encoder: frame channels/sample_rate do not match encoder configuration",
-            ));
-        }
-        if a.format != self.sample_format {
-            return Err(Error::invalid(format!(
-                "FLAC encoder: frame format {:?} does not match encoder format {:?}",
-                a.format, self.sample_format
-            )));
-        }
-        if a.format.is_planar() {
+        // Stream-level format/channels/sample_rate are now contractual via
+        // CodecParameters — validated at encoder construction time. The
+        // per-frame checks against `a.format`/`a.channels`/`a.sample_rate`
+        // disappeared with the slim AudioFrame shape.
+        if self.sample_format.is_planar() {
             return Err(Error::unsupported("FLAC encoder: planar input unsupported"));
         }
         let data = a
@@ -959,10 +952,20 @@ mod tests {
             let oxideav_core::Frame::Audio(a) = frame else {
                 panic!("expected audio frame");
             };
-            for chunk in a.data[0].chunks_exact(a.format.bytes_per_sample() * n_ch) {
+            // Decoder picks output format from STREAMINFO bps:
+            //   1..=16  -> S16
+            //   17..=24 -> S24
+            //   25..=32 -> S32
+            let format = match bps {
+                1..=16 => oxideav_core::SampleFormat::S16,
+                17..=24 => oxideav_core::SampleFormat::S24,
+                _ => oxideav_core::SampleFormat::S32,
+            };
+            let bps_bytes = format.bytes_per_sample();
+            for chunk in a.data[0].chunks_exact(bps_bytes * n_ch) {
                 for c in 0..n_ch {
-                    let off = c * a.format.bytes_per_sample();
-                    let s = match a.format {
+                    let off = c * bps_bytes;
+                    let s = match format {
                         oxideav_core::SampleFormat::S16 => {
                             i16::from_le_bytes([chunk[off], chunk[off + 1]]) as i32
                         }

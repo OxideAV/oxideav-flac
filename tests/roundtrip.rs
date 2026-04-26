@@ -3,9 +3,7 @@
 //! PCM recovery (FLAC is lossless) for several sample formats and
 //! channel counts.
 
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat};
 
 fn build_audio_frame(
     format: SampleFormat,
@@ -39,25 +37,22 @@ fn build_audio_frame(
             }
         }
     }
+    let _ = sample_rate;
     AudioFrame {
-        format,
-        channels,
-        sample_rate,
         samples: n as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sample_rate as i64),
         data: vec![interleaved],
     }
 }
 
-fn decode_interleaved(a: &AudioFrame) -> Vec<i32> {
-    let n_ch = a.channels as usize;
-    let bps = a.format.bytes_per_sample();
+fn decode_interleaved(a: &AudioFrame, format: SampleFormat, channels: u16) -> Vec<i32> {
+    let n_ch = channels as usize;
+    let bps = format.bytes_per_sample();
     let mut out = Vec::with_capacity(a.samples as usize * n_ch);
     for chunk in a.data[0].chunks_exact(bps * n_ch) {
         for c in 0..n_ch {
             let off = c * bps;
-            let v = match a.format {
+            let v = match format {
                 SampleFormat::U8 => (chunk[off] as i32) - 128,
                 SampleFormat::S16 => i16::from_le_bytes([chunk[off], chunk[off + 1]]) as i32,
                 SampleFormat::S24 => {
@@ -118,6 +113,15 @@ fn roundtrip_through_traits(
         "encoder must produce at least one packet"
     );
 
+    // FLAC decoder remaps bps -> output sample format:
+    //   1..=16  -> S16  (so U8 encoded input decodes as S16)
+    //   17..=24 -> S24
+    //   25..=32 -> S32
+    let dec_format = match format.bytes_per_sample() {
+        1 | 2 => SampleFormat::S16,
+        3 => SampleFormat::S24,
+        _ => SampleFormat::S32,
+    };
     let mut recovered: Vec<i32> = Vec::new();
     for pkt in packets {
         dec.send_packet(&pkt).expect("send_packet");
@@ -125,7 +129,7 @@ fn roundtrip_through_traits(
         let Frame::Audio(a) = f else {
             panic!("expected audio frame");
         };
-        recovered.extend(decode_interleaved(&a));
+        recovered.extend(decode_interleaved(&a, dec_format, channels));
     }
 
     let n_ch = channels as usize;
@@ -285,7 +289,7 @@ fn lpc_and_stereo_decorrelation_roundtrip_and_streaminfo() {
         let Frame::Audio(a) = f else {
             panic!("expected audio");
         };
-        recovered.extend(decode_interleaved(&a));
+        recovered.extend(decode_interleaved(&a, SampleFormat::S16, 2));
     }
     for i in 0..n {
         assert_eq!(recovered[i * 2], l[i]);

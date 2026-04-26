@@ -2,7 +2,7 @@
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat,
 };
 
 use crate::crc;
@@ -20,12 +20,10 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         25..=32 => SampleFormat::S32,
         _ => return Err(Error::unsupported(format!("FLAC bps {bps}"))),
     };
-    let time_base = TimeBase::new(1, streaminfo.sample_rate as i64);
     Ok(Box::new(FlacDecoder {
         codec_id: params.codec_id.clone(),
         streaminfo,
         output_format,
-        time_base,
         pending: None,
         eof: false,
     }))
@@ -35,7 +33,6 @@ struct FlacDecoder {
     codec_id: CodecId,
     streaminfo: StreamInfo,
     output_format: SampleFormat,
-    time_base: TimeBase,
     pending: Option<Packet>,
     eof: bool,
 }
@@ -63,13 +60,7 @@ impl Decoder for FlacDecoder {
                 Err(Error::NeedMore)
             };
         };
-        decode_one_frame(
-            &pkt.data,
-            &self.streaminfo,
-            self.output_format,
-            self.time_base,
-            pkt.pts,
-        )
+        decode_one_frame(&pkt.data, &self.streaminfo, self.output_format, pkt.pts)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -108,7 +99,6 @@ fn decode_one_frame(
     data: &[u8],
     streaminfo: &StreamInfo,
     output_format: SampleFormat,
-    time_base: TimeBase,
     pts: Option<i64>,
 ) -> Result<Frame> {
     let header = parse_frame_header(data)?;
@@ -183,12 +173,8 @@ fn decode_one_frame(
     }
 
     Ok(Frame::Audio(AudioFrame {
-        format: output_format,
-        channels: n_out as u16,
-        sample_rate: streaminfo.sample_rate,
         samples: total_samples as u32,
         pts,
-        time_base,
         data: vec![out],
     }))
 }
