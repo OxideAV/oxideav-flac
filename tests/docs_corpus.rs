@@ -272,11 +272,7 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
                 // This is robust to FLAC's STREAMINFO-vs-output-format
                 // mapping (e.g. 8 bps STREAMINFO decodes into S16 PCM).
                 let total = af.samples as usize * channels as usize;
-                let stride = if total > 0 {
-                    af.data[0].len() / total
-                } else {
-                    0
-                };
+                let stride = af.data[0].len().checked_div(total).unwrap_or(0);
                 if decoder_stride == 0 {
                     decoder_stride = stride;
                 }
