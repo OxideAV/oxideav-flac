@@ -272,7 +272,11 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
                 // This is robust to FLAC's STREAMINFO-vs-output-format
                 // mapping (e.g. 8 bps STREAMINFO decodes into S16 PCM).
                 let total = af.samples as usize * channels as usize;
-                let stride = if total > 0 { af.data[0].len() / total } else { 0 };
+                let stride = if total > 0 {
+                    af.data[0].len() / total
+                } else {
+                    0
+                };
                 if decoder_stride == 0 {
                     decoder_stride = stride;
                 }
@@ -329,7 +333,8 @@ fn append_pcm_samples(plane: &[u8], stride: usize, out: &mut Vec<i32>) {
         let v: i32 = match stride {
             2 => i16::from_le_bytes([chunk[0], chunk[1]]) as i32,
             3 => {
-                let mut v = (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
+                let mut v =
+                    (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
                 if v & 0x0080_0000 != 0 {
                     v |= 0xFF00_0000_u32 as i32;
                 }
@@ -431,7 +436,8 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
         return None;
     }
 
-    let mut samples: Vec<i32> = Vec::with_capacity(data.len() * 8 / bits_per_sample.max(1) as usize);
+    let mut samples: Vec<i32> =
+        Vec::with_capacity(data.len() * 8 / bits_per_sample.max(1) as usize);
     if is_float {
         match bits_per_sample {
             32 => {
@@ -500,9 +506,7 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
             }
             32 => {
                 for chunk in data.chunks_exact(4) {
-                    samples.push(i32::from_le_bytes([
-                        chunk[0], chunk[1], chunk[2], chunk[3],
-                    ]));
+                    samples.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
             }
             other => {
