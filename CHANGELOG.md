@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-flac/compare/v0.0.7...v0.0.8) - 2026-05-04
+
+### Other
+
+- detect + emit per-subframe wasted bits per sample
+- graduate every fixture to Tier::BitExact
+- emit U8 for 8 bps; container: accept 12 + 20 bps
+
 ### Fixed
 
 - decoder: 8 bps STREAMINFO now decodes into `SampleFormat::U8`
