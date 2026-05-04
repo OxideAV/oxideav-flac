@@ -80,8 +80,8 @@ Fully implemented, covering the FLAC format specification (Subset and
 non-Subset):
 
 - **Bit depths**: 8, 12, 16, 20, 24, 32 bits per sample. Output format
-  is `U8` for 8 bps, `S16` for 9..=16, `S24` for 17..=24, `S32` for
-  25..=32.
+  is `U8` for 8 bps, `S16` for 9..=16 (covers 12 bps), `S24` for
+  17..=24 (covers 20 bps), `S32` for 25..=32.
 - **Sample rates**: full spec range (1 Hz up to 655_350 Hz), including
   the 11 fixed rate codes and the three variable-rate escapes
   (`code 12`: multiples of 1000 Hz; `code 13`: 16-bit Hz; `code 14`:

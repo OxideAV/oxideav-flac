@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder: 8 bps STREAMINFO now decodes into `SampleFormat::U8`
+  (offset-128 unsigned bytes), matching the demuxer's
+  `params.sample_format` and the README contract. Previously the
+  decoder unconditionally emitted S16 PCM for 1..=16 bps, which
+  contradicted the U8 the container surfaced and forced consumers to
+  carry a workaround mapping.
+
+### Added
+
+- container/decoder: 12 bps and 20 bps STREAMINFO files now open
+  without error. They project onto `SampleFormat::S16` and
+  `SampleFormat::S24` respectively, matching the next-wider standard
+  variant per the spec's "no narrower container exists" convention.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-flac/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other

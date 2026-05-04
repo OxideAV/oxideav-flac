@@ -270,7 +270,8 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
                 // Derive the byte stride per sample from the frame:
                 // af.samples * channels * stride == af.data[0].len().
                 // This is robust to FLAC's STREAMINFO-vs-output-format
-                // mapping (e.g. 8 bps STREAMINFO decodes into S16 PCM).
+                // mapping (e.g. 12 bps STREAMINFO decodes into S16 PCM,
+                // 20 bps decodes into S24, 8 bps decodes into U8).
                 let total = af.samples as usize * channels as usize;
                 let stride = af.data[0].len().checked_div(total).unwrap_or(0);
                 if decoder_stride == 0 {
@@ -327,6 +328,11 @@ fn append_pcm_samples(plane: &[u8], stride: usize, out: &mut Vec<i32>) {
     }
     for chunk in plane.chunks_exact(stride) {
         let v: i32 = match stride {
+            // 8-bit FLAC samples decode into U8 (offset-128 unsigned PCM
+            // in the FLAC container's `SampleFormat::U8` projection),
+            // matching what WAV stores. Convert back to signed for the
+            // common comparator scale.
+            1 => (chunk[0] as i32) - 128,
             2 => i16::from_le_bytes([chunk[0], chunk[1]]) as i32,
             3 => {
                 let mut v =

@@ -14,7 +14,17 @@ use oxideav_core::bits::BitReader;
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let streaminfo = find_streaminfo(&params.extradata)?;
     let bps = streaminfo.bits_per_sample;
+    // Map STREAMINFO bps to the narrowest container-friendly output:
+    //   8        -> U8  (matches the FLAC spec's "8-bit samples are signed
+    //                   two's complement" rendered as WAV-style unsigned
+    //                   offset-128 bytes, the format the FLAC container
+    //                   surfaces in `params.sample_format`).
+    //   9..=16   -> S16
+    //   12 sits inside this range and stays S16.
+    //   17..=24  -> S24 (also covers the 20-bps spec corner).
+    //   25..=32  -> S32
     let output_format = match bps {
+        8 => SampleFormat::U8,
         1..=16 => SampleFormat::S16,
         17..=24 => SampleFormat::S24,
         25..=32 => SampleFormat::S32,
@@ -156,6 +166,10 @@ fn decode_one_frame(
         for c in 0..n_out {
             let s = channels[c][i];
             match output_format {
+                // FLAC stores 8-bit samples as signed two's complement;
+                // SampleFormat::U8 is unsigned-offset (WAV/PCM convention),
+                // so add 128 to land in 0..=255.
+                SampleFormat::U8 => out.push(((s + 128) & 0xFF) as u8),
                 SampleFormat::S16 => out.extend_from_slice(&(s as i16).to_le_bytes()),
                 SampleFormat::S24 => {
                     out.push((s & 0xFF) as u8);
@@ -209,3 +223,49 @@ fn apply_decorrelation(channels: &mut [Vec<i32>], assign: ChannelAssignment) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::CodecId;
+
+    /// Construct a STREAMINFO metadata block with the given bps. Other
+    /// fields take placeholder values; only the bps slot affects the
+    /// codepath under test.
+    fn streaminfo_extradata(bps: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 34);
+        // METADATA_BLOCK header: last=1, type=0 (StreamInfo), length=34.
+        out.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]);
+        let mut block = vec![0u8; 34];
+        block[0..2].copy_from_slice(&4096u16.to_be_bytes());
+        block[2..4].copy_from_slice(&4096u16.to_be_bytes());
+        // packed: sr(20)=44100, channels-1(3)=0, bps-1(5)=bps-1, total=0.
+        let packed: u64 = (44_100u64 << 44) | (((bps - 1) as u64) << 36);
+        block[10..18].copy_from_slice(&packed.to_be_bytes());
+        out.extend_from_slice(&block);
+        out
+    }
+
+    fn make_params(bps: u8) -> CodecParameters {
+        let mut p = CodecParameters::audio(CodecId::new("flac"));
+        p.channels = Some(1);
+        p.sample_rate = Some(44_100);
+        p.extradata = streaminfo_extradata(bps);
+        p
+    }
+
+    #[test]
+    fn make_decoder_accepts_8_12_16_20_24_32_bps() {
+        // 8 bps used to construct a decoder that emitted S16 bytes
+        // even though the container surfaced U8 in
+        // `params.sample_format`. 12 and 20 bps used to be rejected
+        // outright by the container. After the fix both work end to
+        // end; here we just check the decoder constructor accepts each
+        // spec-allowed bit depth.
+        for &bps in &[8u8, 12, 16, 20, 24, 32] {
+            let r = make_decoder(&make_params(bps));
+            assert!(r.is_ok(), "make_decoder({bps} bps) failed: {:?}", r.err());
+        }
+    }
+}
+

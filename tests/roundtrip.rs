@@ -113,12 +113,14 @@ fn roundtrip_through_traits(
         "encoder must produce at least one packet"
     );
 
-    // FLAC decoder remaps bps -> output sample format:
-    //   1..=16  -> S16  (so U8 encoded input decodes as S16)
+    // FLAC decoder maps bps -> output sample format:
+    //   8       -> U8  (matches encoder's accepted U8 input)
+    //   9..=16  -> S16
     //   17..=24 -> S24
     //   25..=32 -> S32
     let dec_format = match format.bytes_per_sample() {
-        1 | 2 => SampleFormat::S16,
+        1 => SampleFormat::U8,
+        2 => SampleFormat::S16,
         3 => SampleFormat::S24,
         _ => SampleFormat::S32,
     };
