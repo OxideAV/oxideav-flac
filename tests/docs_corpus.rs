@@ -24,10 +24,11 @@
 //!
 //! Tiering:
 //! * `Tier::BitExact` — must decode bit-exactly. CI fails on any
-//!   divergence. FLAC is lossless so any clean fixture should land
-//!   here once it's been confirmed clean in `ReportOnly` mode.
-//! * `Tier::ReportOnly` — log deltas, never gate CI. All fixtures
-//!   start here per the brief and graduate after one CI round.
+//!   divergence. FLAC is lossless so every well-formed fixture lives
+//!   here. All 18 fixtures graduated from `ReportOnly` once one full
+//!   CI round confirmed 100.0000% match per channel.
+//! * `Tier::ReportOnly` — log deltas, never gate CI. Reserved for
+//!   new fixtures whose reference WAV alignment hasn't been confirmed.
 //!
 //! The test logs `skip <name>: ...` and returns success when fixtures
 //! aren't present (standalone-crate CI checkout has no `docs/`).
@@ -704,10 +705,11 @@ fn evaluate(case: &CorpusCase) {
 
 // ---------------------------------------------------------------------------
 // Per-fixture tests — every entry maps 1:1 to a directory under
-// docs/audio/flac/fixtures/. All start `Tier::ReportOnly` per the
-// brief. FLAC is lossless so any well-formed fixture should round-trip
-// bit-exactly through our decoder; the few that don't are real bugs in
-// the decoder or container parser.
+// docs/audio/flac/fixtures/. FLAC is lossless so every well-formed
+// fixture round-trips bit-exactly through our decoder; the entries
+// below all sit at `Tier::BitExact` after one CI round confirmed a
+// 100.0000% match. Any future divergence is a real decoder regression
+// and CI hard-fails on it.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -717,7 +719,7 @@ fn corpus_constant_subframe_silence() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -728,7 +730,7 @@ fn corpus_fixed_subframe_low_order() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -739,7 +741,7 @@ fn corpus_left_right_channel_pair() {
         channels: Some(2),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -750,7 +752,7 @@ fn corpus_left_side_channel_pair() {
         channels: Some(2),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -761,7 +763,7 @@ fn corpus_lpc_subframe_typical_music() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -772,7 +774,7 @@ fn corpus_mid_side_channel_pair() {
         channels: Some(2),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -783,7 +785,7 @@ fn corpus_mono_16bit_44100_fixed_blocksize() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -798,7 +800,7 @@ fn corpus_mono_8bit_22050() {
         channels: Some(1),
         sample_rate: Some(22_050),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -809,7 +811,7 @@ fn corpus_right_side_channel_pair() {
         channels: Some(2),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -820,7 +822,7 @@ fn corpus_stereo_16bit_44100_fixed() {
         channels: Some(2),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -831,7 +833,7 @@ fn corpus_stereo_16bit_44100_small_blocksize() {
         channels: Some(2),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -842,7 +844,7 @@ fn corpus_stereo_24bit_96000() {
         channels: Some(2),
         sample_rate: Some(96_000),
         bits_per_sample: Some(24),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -858,7 +860,7 @@ fn corpus_stereo_32bit_192000() {
         channels: Some(2),
         sample_rate: Some(192_000),
         bits_per_sample: Some(24),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -869,7 +871,7 @@ fn corpus_surround_7_1_24bit_48000() {
         channels: Some(8),
         sample_rate: Some(48_000),
         bits_per_sample: Some(24),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -880,7 +882,7 @@ fn corpus_verbatim_subframe_noise() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -891,7 +893,7 @@ fn corpus_with_padding_block() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -902,7 +904,7 @@ fn corpus_with_picture_block() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -913,6 +915,6 @@ fn corpus_with_vorbis_comment() {
         channels: Some(1),
         sample_rate: Some(44_100),
         bits_per_sample: Some(16),
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }

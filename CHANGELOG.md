@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SampleFormat::S24` respectively, matching the next-wider standard
   variant per the spec's "no narrower container exists" convention.
 
+### Changed
+
+- tests/docs_corpus: all 18 fixtures graduated from `Tier::ReportOnly`
+  to `Tier::BitExact`. Local + CI runs already showed 100.0000% match
+  per channel, so any future divergence is a real decoder regression
+  and now hard-fails CI.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-flac/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other
