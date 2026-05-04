@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `Tier::BitExact`. Local + CI runs already showed 100.0000% match
   per channel, so any future divergence is a real decoder regression
   and now hard-fails CI.
+- encoder: detect per-subframe "wasted bits per sample" (the largest
+  `k` such that every sample in the subframe is divisible by `2^k`)
+  and fold it into the spec's wasted-bits unary header. Subframes
+  whose payload is naturally aligned to a power-of-two boundary
+  (upsampled / low-amplitude / dithered-down content) now encode at
+  the smaller effective bps. Output remains bit-exact through the
+  decoder.
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-flac/compare/v0.0.6...v0.0.7) - 2026-05-03
 

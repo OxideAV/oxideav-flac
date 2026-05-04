@@ -114,6 +114,11 @@ non-Subset):
   and keeps the smallest. The output remains fully valid and fully
   lossless — any compliant decoder (including this crate's own) will
   recover the original PCM bit-exactly.
+- **Wasted bits per sample**: detected per subframe (largest `k`
+  such that every sample is divisible by `2^k`) and folded into the
+  spec's wasted-bits unary header. This shaves the trailing-zero
+  payload off upsampled or low-amplitude content (e.g. a 16-bit
+  stream that only ever uses its top 8 bits).
 - **Residual coding**: partitioned Rice with partition order 0,
   exhaustive choice between Rice methods 0 and 1 per subframe, and
   escape partitions for samples that can't be Rice-coded cheaply.

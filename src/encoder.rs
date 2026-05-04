@@ -536,25 +536,50 @@ impl SubframePlan {
 /// Build the smallest-footprint subframe for `samples`, trying
 /// CONSTANT, FIXED orders 0..=4, LPC orders 1..=MAX_LPC_ORDER and
 /// VERBATIM.
+///
+/// Detects "wasted bits per sample" (the count of trailing zero bits
+/// shared by every sample) and subtracts that bit width from the
+/// effective sample storage. Common in upsampled or low-amplitude
+/// content; the spec's wasted-bits header is single-byte, so any
+/// detection that saves at least one bit per sample wins.
 fn best_subframe(samples: &[i32], bps: u32) -> Result<SubframePlan> {
     let n = samples.len();
     if n == 0 {
         return Err(Error::invalid("FLAC encoder: empty subframe"));
     }
 
+    // The wasted-bit indicator + count occupies `1 + max(wasted, 1)`
+    // bits. To stay safe vs reducing effective bps below 1 we cap the
+    // count at bps-1.
+    let wasted = wasted_bits(samples).min(bps.saturating_sub(1));
+    if wasted > 0 {
+        let mut shifted: Vec<i32> = Vec::with_capacity(n);
+        for &s in samples {
+            shifted.push(s >> wasted);
+        }
+        return best_subframe_with_wasted(&shifted, bps - wasted, wasted);
+    }
+    best_subframe_with_wasted(samples, bps, 0)
+}
+
+/// Inner driver that scores every subframe type at the given
+/// (already-wasted-shifted) bps and tags the chosen plan with the
+/// wasted-bits count so the writer can prepend the header bits.
+fn best_subframe_with_wasted(samples: &[i32], bps: u32, wasted: u32) -> Result<SubframePlan> {
+    let n = samples.len();
     // CONSTANT dominates whenever every sample matches.
     if samples.iter().all(|&s| s == samples[0]) {
-        return Ok(encode_constant_plan(samples[0], bps));
+        return Ok(encode_constant_plan(samples[0], bps, wasted));
     }
 
-    let verbatim = encode_verbatim_plan(samples, bps);
+    let verbatim = encode_verbatim_plan(samples, bps, wasted);
     let mut best = verbatim;
 
     for order in 0..=4usize {
         if n <= order {
             continue;
         }
-        if let Some(plan) = encode_fixed_plan(samples, bps, order) {
+        if let Some(plan) = encode_fixed_plan(samples, bps, order, wasted) {
             if plan.bits < best.bits {
                 best = plan;
             }
@@ -563,7 +588,7 @@ fn best_subframe(samples: &[i32], bps: u32) -> Result<SubframePlan> {
 
     let max_lpc = MAX_LPC_ORDER.min(n.saturating_sub(1));
     for order in 1..=max_lpc {
-        if let Some(plan) = encode_lpc_plan(samples, bps, order) {
+        if let Some(plan) = encode_lpc_plan(samples, bps, order, wasted) {
             if plan.bits < best.bits {
                 best = plan;
             }
@@ -573,27 +598,65 @@ fn best_subframe(samples: &[i32], bps: u32) -> Result<SubframePlan> {
     Ok(best)
 }
 
-fn encode_constant_plan(value: i32, bps: u32) -> SubframePlan {
-    let mut w = BitWriter::new();
-    w.write_u32(0, 1); // pad
-    w.write_u32(0b000000, 6); // CONSTANT
-    w.write_u32(0, 1); // no wasted bits
-    w.write_i32(value, bps);
-    bits_snapshot(w, 1 + 6 + 1 + bps)
+/// Count the largest `k` such that every sample in `s` is divisible
+/// by `2^k`. Returns 0 for an all-zero input (the CONSTANT path
+/// trumps that case anyway). Caps at 31 — anything more would fold
+/// every sample onto its sign bit.
+fn wasted_bits(samples: &[i32]) -> u32 {
+    let mut acc: u32 = 0;
+    for &s in samples {
+        if s != 0 {
+            acc |= s as u32;
+            if acc & 1 != 0 {
+                return 0;
+            }
+        }
+    }
+    if acc == 0 {
+        return 0;
+    }
+    acc.trailing_zeros().min(31)
 }
 
-fn encode_verbatim_plan(samples: &[i32], bps: u32) -> SubframePlan {
+/// Write the 1-bit pad + 6-bit subframe-type + wasted-bits prelude,
+/// returning the bit count consumed. The wasted-bits unary format is
+/// `(wasted - 1)` zero bits followed by a `1` bit (so a 3-bit waste
+/// emits `001`). When `wasted == 0` only the single `0` flag is
+/// emitted.
+fn write_subframe_header(w: &mut BitWriter, type_code: u32, wasted: u32) -> u32 {
+    w.write_u32(0, 1);
+    w.write_u32(type_code & 0x3F, 6);
+    if wasted == 0 {
+        w.write_u32(0, 1);
+        1 + 6 + 1
+    } else {
+        w.write_u32(1, 1);
+        // Unary: (wasted-1) zeros + 1 = wasted bits total.
+        for _ in 0..(wasted - 1) {
+            w.write_u32(0, 1);
+        }
+        w.write_u32(1, 1);
+        1 + 6 + 1 + wasted
+    }
+}
+
+fn encode_constant_plan(value: i32, bps: u32, wasted: u32) -> SubframePlan {
     let mut w = BitWriter::new();
-    w.write_u32(0, 1);
-    w.write_u32(0b000001, 6);
-    w.write_u32(0, 1);
+    let header_bits = write_subframe_header(&mut w, 0b000000, wasted);
+    w.write_i32(value, bps);
+    bits_snapshot(w, header_bits + bps)
+}
+
+fn encode_verbatim_plan(samples: &[i32], bps: u32, wasted: u32) -> SubframePlan {
+    let mut w = BitWriter::new();
+    let header_bits = write_subframe_header(&mut w, 0b000001, wasted);
     for &s in samples {
         w.write_i32(s, bps);
     }
-    bits_snapshot(w, 1 + 6 + 1 + (bps * samples.len() as u32))
+    bits_snapshot(w, header_bits + (bps * samples.len() as u32))
 }
 
-fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize) -> Option<SubframePlan> {
+fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Option<SubframePlan> {
     let n = samples.len();
     if n <= order {
         return None;
@@ -615,18 +678,18 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize) -> Option<Subframe
     }
 
     let mut w = BitWriter::new();
-    w.write_u32(0, 1);
-    w.write_u32(0b001000 | (order as u32 & 0x07), 6);
-    w.write_u32(0, 1);
+    let header_bits = write_subframe_header(&mut w, 0b001000 | (order as u32 & 0x07), wasted);
     for i in 0..order {
         w.write_i32(samples[i], bps);
     }
     let residual_bits = encode_rice_residual(&mut w, &residuals);
-    let header_bits = 1 + 6 + 1 + (bps * order as u32);
-    Some(bits_snapshot(w, header_bits + residual_bits))
+    Some(bits_snapshot(
+        w,
+        header_bits + (bps * order as u32) + residual_bits,
+    ))
 }
 
-fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize) -> Option<SubframePlan> {
+fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Option<SubframePlan> {
     let n = samples.len();
     if n <= order {
         return None;
@@ -649,10 +712,8 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize) -> Option<SubframePl
     }
 
     let mut w = BitWriter::new();
-    w.write_u32(0, 1);
     // LPC subframe type is 100000 | (order-1).
-    w.write_u32(0b100000 | ((order - 1) as u32 & 0x1F), 6);
-    w.write_u32(0, 1);
+    let header_bits = write_subframe_header(&mut w, 0b100000 | ((order - 1) as u32 & 0x1F), wasted);
     for i in 0..order {
         w.write_i32(samples[i], bps);
     }
@@ -665,8 +726,8 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize) -> Option<SubframePl
         w.write_i32(q, LPC_QLP_PRECISION);
     }
     let residual_bits = encode_rice_residual(&mut w, &residuals);
-    let header_bits = 1 + 6 + 1 + (bps * order as u32) + 4 + 5 + (LPC_QLP_PRECISION * order as u32);
-    Some(bits_snapshot(w, header_bits + residual_bits))
+    let body_bits = (bps * order as u32) + 4 + 5 + (LPC_QLP_PRECISION * order as u32);
+    Some(bits_snapshot(w, header_bits + body_bits + residual_bits))
 }
 
 fn bits_snapshot(w: BitWriter, total_bits: u32) -> SubframePlan {
@@ -1110,6 +1171,65 @@ mod tests {
             "expected a decorrelated stereo code (8/9/10), got {code}"
         );
         assert_eq!(plans.len(), 2);
+    }
+
+    /// `wasted_bits` returns the GCD of trailing zero bits across the
+    /// non-zero samples. Used as the FLAC "wasted bits per sample"
+    /// shift; a non-zero return tells `best_subframe` to scale samples
+    /// down before predictor selection.
+    #[test]
+    fn wasted_bits_detects_common_trailing_zeros() {
+        assert_eq!(wasted_bits(&[0i32; 10]), 0); // CONSTANT path takes over for all-zero
+        assert_eq!(wasted_bits(&[1, 2, 3, 4]), 0); // odd value present
+        assert_eq!(wasted_bits(&[0, 256, -256, 512, -512]), 8); // all multiples of 256
+        assert_eq!(wasted_bits(&[2, 4, 6, 8]), 1); // every value even, but lowest power-of-2 is 2
+        assert_eq!(wasted_bits(&[16, 32, 64]), 4); // every value divisible by 16
+    }
+
+    /// A signal whose samples are all multiples of 256 should encode
+    /// noticeably smaller than the same content at full 16-bit
+    /// precision: the wasted-bits detector folds the 8 trailing zero
+    /// bits into the 1-byte unary header instead of paying them out
+    /// per sample.
+    #[test]
+    fn wasted_bits_shrinks_subframe_for_8_bit_padded_signal() {
+        let n = 1024usize;
+        let mut padded: Vec<i32> = Vec::with_capacity(n);
+        let mut raw: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = ((i as f64 / n as f64 * 17.0 * std::f64::consts::PI).sin() * 100.0) as i32;
+            raw.push(v);
+            padded.push(v << 8);
+        }
+        let sf_padded = best_subframe(&padded, 16).unwrap();
+        let sf_raw = best_subframe(&raw, 16).unwrap();
+        // sf_padded carries an 8-bit unary header but uses the same
+        // residual coding as sf_raw — the difference is only the
+        // header. Total cost should be within ~20 bits of the raw plan.
+        assert!(
+            sf_padded.bits < sf_raw.bits + 20,
+            "wasted bits should fold the 8 trailing zeros: padded={} raw={}",
+            sf_padded.bits,
+            sf_raw.bits,
+        );
+    }
+
+    /// End-to-end: encode a wasted-bits-friendly signal, decode it, and
+    /// verify bit-exact recovery. The wasted-bits header in the
+    /// subframe is opaque to the caller — what matters is that the
+    /// shifted predictor + post-shift on the decode side reconstruct
+    /// every sample identically.
+    #[test]
+    fn encode_decode_wasted_bits_roundtrip() {
+        let n = 1024usize;
+        let mut samples: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Sine scaled to 8-bit precision then padded into the 16-bit
+            // sample window — every sample is a multiple of 256.
+            let v = ((i as f64 / n as f64 * 17.0 * std::f64::consts::PI).sin() * 100.0) as i32;
+            samples.push(v << 8);
+        }
+        roundtrip(vec![samples], 48_000, 16);
     }
 
     /// Verify stereo decorrelation is actually triggered on an
