@@ -28,6 +28,7 @@ pub mod subframe;
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::ContainerRegistry;
+use oxideav_core::RuntimeContext;
 
 pub const CODEC_ID_STR: &str = "flac";
 
@@ -37,4 +38,30 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 
 pub fn register_containers(reg: &mut ContainerRegistry) {
     container::register(reg);
+}
+
+/// Unified entry point: install every codec and container provided by
+/// `oxideav-flac` into a [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_factories() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        assert!(
+            ctx.codecs.decoder_ids().next().is_some(),
+            "register(ctx) should install codec decoder factories"
+        );
+        assert!(
+            ctx.containers.demuxer_names().next().is_some(),
+            "register(ctx) should install container demuxer factories"
+        );
+    }
 }
