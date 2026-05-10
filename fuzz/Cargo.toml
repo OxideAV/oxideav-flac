@@ -1,0 +1,77 @@
+[package]
+name = "oxideav-flac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libavcodec interop: the cross-decode oracle
+# `dlopen`s the system-installed shared library at startup. No
+# `ffmpeg-sys` / `rusty_ffmpeg`-style build-script dep that would pull
+# libavcodec source into the workspace's cargo dep tree. The harness
+# skips silently (eprintln, no `#[ignore]`) when libavcodec isn't
+# installed (see fuzz/src/lib.rs).
+#
+# Why libavcodec instead of libFLAC: libFLAC's `<FLAC/stream_decoder.h>`
+# API is callback-driven (read / seek / eof / write / error / metadata
+# callbacks) — wrapping that cleanly through `libloading` requires
+# trampolines that hold per-call state, which is awkward and fragile.
+# libavcodec exposes the simpler `avcodec_send_packet` /
+# `avcodec_receive_frame` buffer-in/buffer-out API for `AV_CODEC_ID_FLAC`
+# (== 86028) and is installed on every CI runner that already has
+# `ffmpeg`. Workspace policy bars vendoring libavcodec / libFLAC source
+# — we only inspect the public C headers (<libavcodec/avcodec.h>,
+# <libavutil/frame.h>, <libavutil/samplefmt.h>) for function signatures
+# + opaque pointer typedefs.
+libloading = "0.8"
+
+[dependencies.oxideav-flac]
+path = ".."
+
+[lib]
+name = "oxideav_flac_fuzz"
+path = "src/lib.rs"
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1: panic-freedom. Feed arbitrary bytes through the FLAC
+# demuxer + decoder pipeline. Every public API surface MUST return a
+# `Result` for malformed input — never panic, never abort.
+[[bin]]
+name = "panic_free_decode"
+path = "fuzz_targets/panic_free_decode.rs"
+test = false
+doc = false
+
+# Target 2: oxideav-flac self-roundtrip. Encode random PCM frames,
+# decode, expect bit-exact recovery (FLAC is lossless).
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+# Target 3: libavcodec oracle. Use OUR encoder to synthesise a valid
+# FLAC stream from arbitrary PCM input; decode through both
+# oxideav-flac and libavcodec; assert bit-exact per-sample equality
+# whenever libavcodec accepts (FLAC is lossless — no tolerance).
+[[bin]]
+name = "flac_oracle_decode"
+path = "fuzz_targets/flac_oracle_decode.rs"
+test = false
+doc = false
