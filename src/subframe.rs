@@ -10,7 +10,21 @@ use oxideav_core::bits::BitReader;
 ///
 /// `bps` is the per-sample bit depth for *this* channel — caller must add 1
 /// for the side channel of left-side / right-side / mid-side stereo frames.
+///
+/// Returns [`Error::Unsupported`] if `bps` exceeds 32. The decoder reads
+/// samples through `BitReader::read_i32`, which is bounded at 32-bit
+/// reads, so a 33-bit side channel (which arises from a STREAMINFO
+/// declaring `bits_per_sample=32` combined with a stereo-decorrelated
+/// frame) cannot currently be decoded losslessly. Reject up front
+/// rather than panicking inside the bit reader. Caught by the
+/// `panic_free_decode` fuzz harness on 2026-05-10.
 pub fn decode_subframe(br: &mut BitReader, block_size: u32, bps: u32) -> Result<Vec<i32>> {
+    if bps == 0 || bps > 32 {
+        return Err(Error::unsupported(format!(
+            "FLAC subframe bps {bps} out of supported range 1..=32 \
+             (32-bit samples cannot be combined with stereo decorrelation)"
+        )));
+    }
     let pad = br.read_u32(1)?;
     if pad != 0 {
         return Err(Error::invalid("subframe header pad bit must be zero"));
@@ -184,4 +198,35 @@ fn decode_residual(
         }
     }
     Ok(residual)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the panic the `panic_free_decode` fuzz
+    /// harness found on 2026-05-10 — a STREAMINFO declaring
+    /// `bits_per_sample=32` combined with a stereo-decorrelated frame
+    /// asks for a 33-bit side-channel sample, which `read_i32` can't
+    /// represent. We now reject `bps > 32` (and `bps == 0`) at
+    /// `decode_subframe` entry rather than panicking inside the
+    /// bit reader.
+    #[test]
+    fn decode_subframe_rejects_bps_above_32_without_panic() {
+        let bytes = [0u8; 16];
+        let mut br = BitReader::new(&bytes);
+        let err = decode_subframe(&mut br, 4096, 33).expect_err("bps 33 must be rejected");
+        match err {
+            Error::Unsupported(_) => {}
+            other => panic!("expected Error::Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_subframe_rejects_bps_zero_without_panic() {
+        let bytes = [0u8; 16];
+        let mut br = BitReader::new(&bytes);
+        let err = decode_subframe(&mut br, 4096, 0).expect_err("bps 0 must be rejected");
+        assert!(matches!(err, Error::Unsupported(_)));
+    }
 }

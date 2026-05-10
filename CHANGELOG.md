@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `subframe::decode_subframe` now rejects `bps == 0` and `bps > 32` with
+  `Error::Unsupported` rather than panicking inside `BitReader::read_i32`.
+  The 33-bit side-channel that arises from a STREAMINFO declaring
+  `bits_per_sample=32` plus a stereo-decorrelated frame can't be
+  represented through the current 32-bit-bounded bit reader; we surface
+  it as an unsupported-input error. Found by the `panic_free_decode`
+  cargo-fuzz harness.
+
+### Added
+
+- `fuzz/` cargo-fuzz scaffold with three targets:
+  - `panic_free_decode` (panic-freedom of the demuxer + decoder pipeline)
+  - `roundtrip` (random PCM through encoder→decoder, expect bit-exact)
+  - `flac_oracle_decode` (cross-validate decoded PCM against
+    libavcodec's FLAC decoder, loaded via `libloading`)
+- `.github/workflows/fuzz.yml` — daily 30-minute fuzz run on the org-
+  level reusable workflow with `ffmpeg` + `flac` + `libflac-dev` apt
+  packages installed for the oracle.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-flac/compare/v0.0.8...v0.0.9) - 2026-05-06
 
 ### Other
