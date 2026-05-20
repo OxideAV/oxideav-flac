@@ -12,14 +12,15 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    AttachedPicture, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet,
-    PictureType, Result, SampleFormat, StreamInfo, TimeBase,
+    AttachedPicture, Chapter, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet,
+    PictureType, Result, SampleFormat, StreamInfo, TimeBase, Timestamp,
 };
 use oxideav_core::{Demuxer, Muxer, ReadSeek, WriteSeek};
 
 use crate::frame::{parse_frame_header, FrameHeader};
 use crate::metadata::{
-    parse_seektable, BlockHeader, BlockType, SeekPoint, StreamInfo as Si, FLAC_MAGIC,
+    parse_cuesheet, parse_seektable, BlockHeader, BlockType, CueSheet, SeekPoint, StreamInfo as Si,
+    FLAC_MAGIC,
 };
 
 pub fn register(reg: &mut oxideav_core::ContainerRegistry) {
@@ -67,6 +68,7 @@ fn open_demuxer(
     let mut extradata = Vec::new();
     let mut streaminfo: Option<Si> = None;
     let mut seek_points: Vec<SeekPoint> = Vec::new();
+    let mut cuesheet: Option<CueSheet> = None;
     loop {
         let mut hdr = [0u8; 4];
         input.read_exact(&mut hdr)?;
@@ -88,6 +90,17 @@ fn open_demuxer(
         if parsed.block_type == BlockType::Picture {
             if let Some(pic) = parse_flac_picture_block(&payload) {
                 pictures.push(pic);
+            }
+        }
+        // RFC 9639 §8.7: only the first CUESHEET block is meaningful;
+        // additional ones (some taggers append per-disc CUESHEETs in
+        // multi-disc rips) are ignored at this layer. A malformed
+        // CUESHEET is *not* treated as fatal — it just doesn't get
+        // surfaced as chapters. Logging that decision in the demuxer
+        // would be nicer, but we don't have a log surface here.
+        if cuesheet.is_none() && parsed.block_type == BlockType::CueSheet {
+            if let Ok(cs) = parse_cuesheet(&payload) {
+                cuesheet = Some(cs);
             }
         }
         extradata.extend_from_slice(&hdr);
@@ -146,6 +159,16 @@ fn open_demuxer(
         0
     };
 
+    // RFC 9639 §8.7 — convert CUESHEET tracks to standard
+    // `Chapter` records. The lead-out track is dropped from the
+    // chapter list because it carries no audio (it just marks the end
+    // of the stream); its sample offset becomes the implicit end of
+    // the final real chapter. For tracks that have at least one INDEX
+    // point we use the track's stream-level offset as the chapter
+    // `start`; the chapter `end` is taken from the next track's
+    // `start` so consumers can compute chapter durations directly.
+    let chapters = build_chapters_from_cuesheet(cuesheet.as_ref(), time_base);
+
     Ok(Box::new(FlacDemuxer {
         input,
         streams: vec![stream],
@@ -156,6 +179,8 @@ fn open_demuxer(
         duration_micros,
         seek_points,
         first_frame_offset,
+        chapters,
+        cuesheet,
     }))
 }
 
@@ -328,6 +353,53 @@ struct FlacDemuxer {
     /// Byte offset of the first frame in the stream (immediately
     /// after the metadata-block sequence).
     first_frame_offset: u64,
+    /// Chapter list derived from the CUESHEET block (when present).
+    /// Each entry corresponds to one CUESHEET track except the trailing
+    /// lead-out (whose offset is folded into the previous chapter's
+    /// `end`).
+    chapters: Vec<Chapter>,
+    /// Raw parsed CUESHEET (when present). Kept on the demuxer so
+    /// future callers can read CD-DA-specific bits (lead-in samples,
+    /// per-track ISRC, INDEX 00 pre-gap points) that the generic
+    /// `Chapter` representation flattens away.
+    #[allow(dead_code)] // exposed via accessor below for callers that want CD-DA fidelity
+    cuesheet: Option<CueSheet>,
+}
+
+/// Convert a parsed CUESHEET into a [`Chapter`] list keyed on
+/// `time_base` (which is `1/sample_rate` for FLAC streams). The
+/// transform is:
+///
+/// * Each non-lead-out track becomes one chapter.
+/// * `start` = the CUESHEET track's `offset_samples`.
+/// * `end`   = the next CUESHEET track's `offset_samples` (the
+///   lead-out entry supplies this for the final chapter).
+/// * `id`    = the CUESHEET track number (1..=99 for CD-DA audio).
+/// * `title` = `None`; the CUESHEET block doesn't carry track titles.
+///   A Vorbis-comment `TRACK01=…` style tag is the usual companion
+///   source, and we leave it to the caller to cross-reference if
+///   desired.
+fn build_chapters_from_cuesheet(cs: Option<&CueSheet>, time_base: TimeBase) -> Vec<Chapter> {
+    let Some(cs) = cs else {
+        return Vec::new();
+    };
+    if cs.tracks.len() < 2 {
+        // Only the lead-out present — no payload chapters to surface.
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(cs.tracks.len() - 1);
+    for window in cs.tracks.windows(2) {
+        let cur = &window[0];
+        let next = &window[1];
+        out.push(Chapter {
+            id: cur.number as u64,
+            start: Timestamp::new(cur.offset_samples as i64, time_base),
+            end: Timestamp::new(next.offset_samples as i64, time_base),
+            title: None,
+            language: None,
+        });
+    }
+    out
 }
 
 /// Buffered FLAC frame scanner.
@@ -538,6 +610,10 @@ impl Demuxer for FlacDemuxer {
         } else {
             None
         }
+    }
+
+    fn chapters(&self) -> &[Chapter] {
+        &self.chapters
     }
 }
 

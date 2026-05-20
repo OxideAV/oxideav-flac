@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `metadata::parse_cuesheet` parses the FLAC CUESHEET metadata block
+  (RFC 9639 §8.7). Surfaces media catalog number, lead-in sample
+  count, CD-DA flag, and the per-track structure including ISRC,
+  audio / pre-emphasis flags and INDEX point lists. Strict reserved-
+  bit / reserved-byte enforcement so malformed blocks can't smuggle
+  garbage through (CD-DA decoders rely on those zeros).
+- `container::FlacDemuxer` now exposes CUESHEET tracks through the
+  standard `Demuxer::chapters()` accessor: one `Chapter` per non-
+  lead-out track, with `start` / `end` taken from sample offsets and
+  the chapter `id` set to the CUESHEET track number. A malformed
+  CUESHEET is non-fatal — the demuxer drops it and returns an empty
+  chapter list, so existing CUESHEET-less files keep working
+  unchanged.
 - `fuzz/` cargo-fuzz scaffold with three targets:
   - `panic_free_decode` (panic-freedom of the demuxer + decoder pipeline)
   - `roundtrip` (random PCM through encoder→decoder, expect bit-exact)

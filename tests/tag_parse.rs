@@ -157,3 +157,133 @@ fn flac_id3v2_prefix_surfaces_fallback_metadata() {
         md
     );
 }
+
+/// Synthesise a minimal valid CUESHEET payload (RFC 9639 §8.7) carrying
+/// `tracks` entries. The last entry is treated as the lead-out (zero
+/// indices); every other entry gets a single INDEX 01 at offset 0
+/// within the track.
+fn build_cuesheet(is_cdda: bool, tracks: &[(u64, u8, u8)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0u8; 128]); // empty media catalog number
+    buf.extend_from_slice(&0u64.to_be_bytes()); // lead-in samples
+    buf.push(if is_cdda { 0x80 } else { 0x00 }); // flags
+    buf.extend_from_slice(&[0u8; 258]); // reserved
+    buf.push(tracks.len() as u8); // num_tracks
+    for &(offset, number, num_indices) in tracks {
+        buf.extend_from_slice(&offset.to_be_bytes());
+        buf.push(number);
+        buf.extend_from_slice(&[0u8; 12]); // ISRC
+        buf.push(0); // audio, no pre-emphasis
+        buf.extend_from_slice(&[0u8; 13]); // reserved
+        buf.push(num_indices);
+        for ix in 0..num_indices {
+            buf.extend_from_slice(&0u64.to_be_bytes()); // index offset
+            buf.push(ix + 1); // index number (1-based)
+            buf.extend_from_slice(&[0u8; 3]); // reserved
+        }
+    }
+    buf
+}
+
+#[test]
+fn flac_cuesheet_block_surfaces_as_chapters() {
+    // Build a STREAMINFO + CUESHEET (last block). Confirm the demuxer
+    // exposes one chapter per non-lead-out CUESHEET track, with the
+    // expected start/end sample offsets and IDs equal to the CUESHEET
+    // track numbers. CD-DA lead-out track number = 170.
+    let streaminfo = build_streaminfo();
+    let cuesheet = build_cuesheet(
+        true,
+        &[
+            (0, 1, 1),                 // track 1 starts at sample 0
+            (44_100 * 60 * 3, 2, 1),   // track 2 starts at 3:00
+            (44_100 * 60 * 5, 170, 0), // CD-DA lead-out at 5:00
+        ],
+    );
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 5, cuesheet.len()));
+    file.extend_from_slice(&cuesheet);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
+
+    let chapters = demuxer.chapters();
+    assert_eq!(
+        chapters.len(),
+        2,
+        "expected 2 chapters (lead-out folded into final end), got {}",
+        chapters.len()
+    );
+    assert_eq!(chapters[0].id, 1);
+    assert_eq!(chapters[0].start.value, 0);
+    assert_eq!(chapters[0].end.value, 44_100 * 60 * 3);
+    assert_eq!(chapters[1].id, 2);
+    assert_eq!(chapters[1].start.value, 44_100 * 60 * 3);
+    assert_eq!(chapters[1].end.value, 44_100 * 60 * 5);
+    // Time base is `1/sample_rate` per the FLAC container.
+    assert_eq!(chapters[0].start.base.0.num, 1);
+    assert_eq!(chapters[0].start.base.0.den, 44_100);
+}
+
+#[test]
+fn flac_cuesheet_only_lead_out_yields_no_chapters() {
+    // Spec-minimal CUESHEET: only the lead-out track present. The
+    // chapter list should be empty since there are no payload tracks.
+    let streaminfo = build_streaminfo();
+    let cuesheet = build_cuesheet(false, &[(1000, 255, 0)]);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 5, cuesheet.len()));
+    file.extend_from_slice(&cuesheet);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
+
+    assert!(
+        demuxer.chapters().is_empty(),
+        "lead-out-only CUESHEET should produce zero chapters, got {:?}",
+        demuxer.chapters()
+    );
+}
+
+#[test]
+fn flac_malformed_cuesheet_does_not_break_demuxer() {
+    // A CUESHEET payload that is *technically present in the block
+    // chain* but fails strict parsing (e.g. a non-zero reserved byte)
+    // must not fatally fail the demuxer open. Instead the malformed
+    // block is silently dropped and chapters() returns empty.
+    let streaminfo = build_streaminfo();
+    // 396 bytes of all-0xAA: every reserved byte is non-zero, so
+    // parse_cuesheet returns Err. The demuxer should still construct.
+    let cuesheet = vec![0xAAu8; 396];
+
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 5, cuesheet.len()));
+    file.extend_from_slice(&cuesheet);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("malformed CUESHEET must not break open_demuxer");
+    assert!(demuxer.chapters().is_empty());
+}

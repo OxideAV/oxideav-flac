@@ -132,9 +132,9 @@ non-Subset):
 ## Native container
 
 - **Demuxer**: parses `fLaC` magic + metadata block chain
-  (STREAMINFO, VORBIS_COMMENT, SEEKTABLE, PICTURE, plus ID3v2 tags
-  prepended by some taggers), emits one packet per frame via a
-  CRC-verified sync-code scanner.
+  (STREAMINFO, VORBIS_COMMENT, SEEKTABLE, PICTURE, CUESHEET, plus
+  ID3v2 tags prepended by some taggers), emits one packet per frame
+  via a CRC-verified sync-code scanner.
 - **Muxer**: writes `fLaC` + preserved metadata blocks + frame packets.
   Packets produced by the encoder pass straight through.
 - **Seeking**: SEEKTABLE-driven byte-offset seek (`seek_to(pts)` lands
@@ -142,6 +142,16 @@ non-Subset):
   `Error::Unsupported` on seek.
 - **Metadata surfaces**: Vorbis-comment key/value pairs and attached
   pictures (FLAC PICTURE block + ID3v2 APIC fallback).
+- **Chapters**: CUESHEET tracks are surfaced through the standard
+  `Demuxer::chapters()` API. Each non-lead-out CUESHEET track becomes
+  one `Chapter` whose `start` / `end` are the track's sample-offset
+  range (taken from the next track's offset for the closing bound).
+  Chapter `id` carries the CUESHEET track number (1..=99 for CD-DA
+  audio). The full parsed CUESHEET — including the 128-byte media
+  catalog number, lead-in sample count, per-track ISRC and INDEX
+  point list — is also retained on the demuxer for callers needing
+  CD-DA fidelity. A malformed CUESHEET is non-fatal: the demuxer
+  drops it and returns an empty chapter list instead of erroring out.
 
 ## Codec / container IDs
 
