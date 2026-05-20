@@ -24,7 +24,7 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// Highest LPC order the encoder will try. The decoder supports up to
 /// 32, but beyond ~8 the gains shrink while per-frame encode cost grows
 /// (Levinson-Durbin is O(order^2) per subframe, residual search is
-/// linear in order). 8 matches libFLAC's `-5` preset.
+/// linear in order). 8 is the conventional default for moderate-quality encoders.
 const MAX_LPC_ORDER: usize = 8;
 /// Precision used when quantising LPC coefficients. 12 bits is a
 /// common sweet spot: tight enough to keep residual magnitudes small,
@@ -478,16 +478,15 @@ fn choose_channel_assignment(channels: &[Vec<i32>], bps: u32) -> Result<(u32, Ve
     // Stereo decorrelation modes need a side channel at `bps + 1` bits
     // (to span the full L-R range). Our subframe encoders clamp to 32
     // bits, so for 32-bit input we skip the decorrelation modes and
-    // fall back to LR-only (`assignment = 1`). This matches libFLAC,
-    // which rejects any `bits_per_sample > 32` outright and keeps LR
-    // for the `== 32` boundary.
+    // fall back to LR-only (`assignment = 1`). The FLAC format spec
+    // caps `bits_per_sample` at 32, so the `== 32` boundary stays in LR.
     if bps < 32 {
         let mut side = Vec::with_capacity(n);
         let mut mid = Vec::with_capacity(n);
         for i in 0..n {
             side.push((l[i] as i64 - r[i] as i64) as i32);
             // FLAC's spec-defined mid is floor((L+R)/2); the absorbed LSB is
-            // recovered via `side`. `((L+R) >> 1)` matches libFLAC.
+            // recovered via `side`. `((L+R) >> 1)` is the canonical encoding.
             let sum = l[i] as i64 + r[i] as i64;
             mid.push((sum >> 1) as i32);
         }

@@ -197,8 +197,8 @@ pub fn parse_cuesheet(bytes: &[u8]) -> Result<CueSheet> {
     }
     let is_cdda = (flags & 0x80) != 0;
     // RFC 9639 §8.7 requires the 258-byte reserved span be all zeros.
-    // libFLAC's parser tolerates non-zero bytes here; we follow the
-    // spec strictly so a fuzzer can't sneak garbage through.
+    // Some FLAC files in the wild leave non-zero bytes here; we follow
+    // the spec strictly so a fuzzer can't sneak garbage through.
     if bytes[137..395].iter().any(|&b| b != 0) {
         return Err(Error::invalid(
             "FLAC CUESHEET: reserved 258-byte region must be all zero",
@@ -312,7 +312,7 @@ pub struct SeekPoint {
 /// (non-placeholder) seek points. Each wire-format SEEKPOINT is 18
 /// bytes: `sample_number: u64 BE`, `offset: u64 BE`, `frame_samples:
 /// u16 BE`. A payload whose length isn't a multiple of 18 has its
-/// trailing bytes ignored (same shape as libFLAC's tolerant parser).
+/// trailing bytes ignored (matches the tolerance shown by typical FLAC files in the wild).
 pub fn parse_seektable(bytes: &[u8]) -> Vec<SeekPoint> {
     const PLACEHOLDER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
     let n = bytes.len() / 18;
