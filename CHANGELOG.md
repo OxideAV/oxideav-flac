@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `metadata::write_cuesheet` serialises a `CueSheet` back into the
+  RFC 9639 §8.7 CUESHEET block payload, completing the round-trip with
+  `parse_cuesheet`. The writer is structural (it does not enforce CD-DA
+  semantics like 588-sample alignment, since non-CD-DA cuesheets
+  legitimately violate them) but refuses to emit cuesheets the parser
+  would reject: empty track list, track number 0, zero indices on any
+  non-lead-out track, non-printable bytes in the media catalog number,
+  and any count that would overflow the on-wire `u8` fields. Reserved
+  spans (258 bytes after the flag byte, 13 bytes per track, 3 bytes per
+  index point) are written as zeros so the strict reserved-bit checks
+  in the reader accept the result. Eight unit tests cover the
+  round-trip, the synthetic-bytes equality path, and each rejection
+  branch; one integration test (`tests/tag_parse.rs`) builds a FLAC
+  file from a written CUESHEET and confirms the demuxer surfaces the
+  same chapter list as the equivalent hand-built payload.
+
 ### Fixed
 
+- `metadata::parse_cuesheet` doc-comment had a stale "12 + 1 + 12 + 1
+  + 13 + 1 = 40" per-track byte budget; the code (and RFC 9639 §8.7.1)
+  use `8 + 1 + 12 + 1 + 13 + 1 = 36`. Fixed in passing.
 - `subframe::decode_subframe` now rejects `bps == 0` and `bps > 32` with
   `Error::Unsupported` rather than panicking inside `BitReader::read_i32`.
   The 33-bit side-channel that arises from a STREAMINFO declaring

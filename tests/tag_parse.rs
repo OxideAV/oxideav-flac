@@ -262,6 +262,82 @@ fn flac_cuesheet_only_lead_out_yields_no_chapters() {
 }
 
 #[test]
+fn flac_write_cuesheet_round_trips_through_demuxer() {
+    // Build a CUESHEET via metadata::write_cuesheet, embed it into a
+    // FLAC stream, demux, and verify the same track structure surfaces
+    // through chapters(). This is the symmetric end-to-end roundtrip
+    // for the writer added in this round.
+    use oxideav_flac::metadata::{write_cuesheet, CueSheet, CueSheetIndex, CueSheetTrack};
+
+    let cs = CueSheet {
+        media_catalog_number: {
+            let mut m = [0u8; 128];
+            m[..13].copy_from_slice(b"9876543210123");
+            m
+        },
+        lead_in_samples: 88_200,
+        is_cdda: true,
+        tracks: vec![
+            CueSheetTrack {
+                offset_samples: 0,
+                number: 1,
+                isrc: *b"GBAYE0601477",
+                is_audio: true,
+                pre_emphasis: false,
+                indices: vec![CueSheetIndex {
+                    offset_samples: 0,
+                    number: 1,
+                }],
+            },
+            CueSheetTrack {
+                offset_samples: 44_100 * 60 * 4,
+                number: 2,
+                isrc: [0u8; 12],
+                is_audio: true,
+                pre_emphasis: true,
+                indices: vec![CueSheetIndex {
+                    offset_samples: 0,
+                    number: 1,
+                }],
+            },
+            CueSheetTrack {
+                offset_samples: 44_100 * 60 * 7,
+                number: 170,
+                isrc: [0u8; 12],
+                is_audio: true,
+                pre_emphasis: false,
+                indices: vec![],
+            },
+        ],
+    };
+    let cuesheet_bytes = write_cuesheet(&cs).expect("write_cuesheet");
+
+    let streaminfo = build_streaminfo();
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 5, cuesheet_bytes.len()));
+    file.extend_from_slice(&cuesheet_bytes);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac with written CUESHEET");
+
+    let chapters = demuxer.chapters();
+    assert_eq!(chapters.len(), 2, "expected 2 chapters, got {chapters:?}");
+    assert_eq!(chapters[0].id, 1);
+    assert_eq!(chapters[0].start.value, 0);
+    assert_eq!(chapters[0].end.value, 44_100 * 60 * 4);
+    assert_eq!(chapters[1].id, 2);
+    assert_eq!(chapters[1].start.value, 44_100 * 60 * 4);
+    assert_eq!(chapters[1].end.value, 44_100 * 60 * 7);
+}
+
+#[test]
 fn flac_malformed_cuesheet_does_not_break_demuxer() {
     // A CUESHEET payload that is *technically present in the block
     // chain* but fails strict parsing (e.g. a non-zero reserved byte)

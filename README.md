@@ -152,6 +152,13 @@ non-Subset):
   point list — is also retained on the demuxer for callers needing
   CD-DA fidelity. A malformed CUESHEET is non-fatal: the demuxer
   drops it and returns an empty chapter list instead of erroring out.
+- **CUESHEET writer**: `metadata::write_cuesheet` serialises a
+  `CueSheet` back into a RFC 9639 §8.7-conformant block payload.
+  Round-trips through `metadata::parse_cuesheet` bit-for-bit; reserved
+  spans are zero-padded so the strict reader accepts the output.
+  Rejects structurally illegal cuesheets (empty track list, track
+  number 0, zero indices on a non-lead-out track, non-printable bytes
+  in the media catalog) before emitting any bytes.
 
 ## Codec / container IDs
 

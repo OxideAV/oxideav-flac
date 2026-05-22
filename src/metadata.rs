@@ -166,7 +166,7 @@ impl CueSheet {
 ///   N × cuesheet_track (variable, terminated by num_tracks counter)
 /// ```
 ///
-/// Each cuesheet_track is `12 + 1 + 12 + 1 + 13 + 1 = 40` fixed bytes
+/// Each cuesheet_track is `8 + 1 + 12 + 1 + 13 + 1 = 36` fixed bytes
 /// followed by `12 B × num_indices` index points.
 ///
 /// Returns `Error::invalid` when:
@@ -292,6 +292,128 @@ pub fn parse_cuesheet(bytes: &[u8]) -> Result<CueSheet> {
         is_cdda,
         tracks,
     })
+}
+
+/// Serialise a [`CueSheet`] back into a CUESHEET metadata-block payload
+/// (RFC 9639 §8.7). This is the inverse of [`parse_cuesheet`]: feeding
+/// the output back through `parse_cuesheet` returns an equal `CueSheet`.
+///
+/// The function is **structural**: it writes whatever the caller put in
+/// the struct. It does *not* enforce CD-DA semantics (Red Book limits
+/// like "track numbers 1..=99 plus 170 lead-out", "offsets multiple of
+/// 588 samples", "track 1 INDEX 01 at offset 0") because non-CD-DA
+/// cuesheets legitimately violate them. Callers that need those
+/// invariants should validate before encoding.
+///
+/// The on-wire reserved spans (258 bytes after the flags byte, 13 bytes
+/// per track, 3 bytes per index point) are emitted as zeros so the
+/// strict reserved-bit checks in `parse_cuesheet` accept the result. The
+/// flag bytes likewise leave their reserved low bits as zero.
+///
+/// Returns `Error::invalid` when:
+/// * the track list is empty (the spec requires at least the lead-out),
+/// * the track list contains more than `u8::MAX` (255) entries (the on-
+///   wire `num_tracks` field is a single byte),
+/// * any non-trailing track declares zero index points (only the lead-
+///   out is permitted to do so),
+/// * any track declares more than `u8::MAX` index points (the on-wire
+///   `num_indices` field is a single byte),
+/// * any track carries track number 0 (reserved by Red Book for the
+///   lead-in slot, which is not represented inside the cuesheet),
+/// * the media catalog number contains a non-ASCII / non-printable byte
+///   in the leading run (every byte before the first NUL terminator
+///   must be in `0x20..=0x7E` per spec).
+pub fn write_cuesheet(cs: &CueSheet) -> Result<Vec<u8>> {
+    if cs.tracks.is_empty() {
+        return Err(Error::invalid(
+            "FLAC CUESHEET: track list must contain at least the lead-out",
+        ));
+    }
+    if cs.tracks.len() > u8::MAX as usize {
+        return Err(Error::invalid(format!(
+            "FLAC CUESHEET: track count {} exceeds u8 (255)",
+            cs.tracks.len()
+        )));
+    }
+    // Per RFC 9639 §8.7 the media catalog number is ASCII printable
+    // (0x20-0x7E) up to the first 0x00 terminator. Anything after the
+    // first NUL is ignored on the wire, but we still refuse to emit a
+    // catalog with non-printable bytes in the leading run because that
+    // would round-trip through a reader that rejects the same bytes —
+    // and we don't want the writer producing payloads our own reader
+    // would reject.
+    let leading = cs
+        .media_catalog_number
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(cs.media_catalog_number.len());
+    for &b in &cs.media_catalog_number[..leading] {
+        if !(0x20..=0x7E).contains(&b) {
+            return Err(Error::invalid(format!(
+                "FLAC CUESHEET: media catalog byte 0x{b:02X} is non-printable ASCII"
+            )));
+        }
+    }
+
+    // Pre-size the output: 396-byte fixed prefix + per-track payload.
+    const FIXED_PREFIX: usize = 128 + 8 + 1 + 258 + 1;
+    const TRACK_PREFIX: usize = 8 + 1 + 12 + 1 + 13 + 1;
+    const INDEX_SIZE: usize = 8 + 1 + 3;
+    let mut total = FIXED_PREFIX;
+    for t in &cs.tracks {
+        total += TRACK_PREFIX + t.indices.len() * INDEX_SIZE;
+    }
+    let mut out = Vec::with_capacity(total);
+
+    out.extend_from_slice(&cs.media_catalog_number);
+    out.extend_from_slice(&cs.lead_in_samples.to_be_bytes());
+    out.push(if cs.is_cdda { 0x80 } else { 0x00 });
+    out.extend_from_slice(&[0u8; 258]);
+    out.push(cs.tracks.len() as u8);
+
+    for (idx, t) in cs.tracks.iter().enumerate() {
+        if t.number == 0 {
+            return Err(Error::invalid(
+                "FLAC CUESHEET: track number 0 is reserved (lead-in only)",
+            ));
+        }
+        let is_last = idx + 1 == cs.tracks.len();
+        if !is_last && t.indices.is_empty() {
+            return Err(Error::invalid(
+                "FLAC CUESHEET: only the lead-out track may have zero indices",
+            ));
+        }
+        if t.indices.len() > u8::MAX as usize {
+            return Err(Error::invalid(format!(
+                "FLAC CUESHEET: index count {} exceeds u8 (255)",
+                t.indices.len()
+            )));
+        }
+        out.extend_from_slice(&t.offset_samples.to_be_bytes());
+        out.push(t.number);
+        out.extend_from_slice(&t.isrc);
+        // Track flag byte: bit 7 = non-audio, bit 6 = pre-emphasis,
+        // bits 0..=5 reserved (zero). `is_audio == true` means bit 7
+        // stays clear.
+        let mut flags = 0u8;
+        if !t.is_audio {
+            flags |= 0x80;
+        }
+        if t.pre_emphasis {
+            flags |= 0x40;
+        }
+        out.push(flags);
+        out.extend_from_slice(&[0u8; 13]);
+        out.push(t.indices.len() as u8);
+        for ix in &t.indices {
+            out.extend_from_slice(&ix.offset_samples.to_be_bytes());
+            out.push(ix.number);
+            out.extend_from_slice(&[0u8; 3]);
+        }
+    }
+
+    debug_assert_eq!(out.len(), total);
+    Ok(out)
 }
 
 /// A single entry in a FLAC SEEKTABLE (§SEEKPOINT). Placeholder
@@ -520,6 +642,248 @@ mod tests {
         // Corrupt the 258-byte reserved region (right after flags).
         payload[137 + 5] = 0x01;
         assert!(parse_cuesheet(&payload).is_err());
+    }
+
+    #[test]
+    fn cuesheet_round_trip_cdda_three_tracks() {
+        // Build a realistic CD-DA cuesheet (two audio tracks + lead-out),
+        // serialise, re-parse, and assert structural equality. Track 1
+        // has a pre-gap INDEX 00 + main INDEX 01; track 2 carries an
+        // ISRC. This exercises every non-empty field on the writer
+        // side.
+        let isrc_track2 = *b"GBAYE0601477";
+        let cs_in = CueSheet {
+            media_catalog_number: {
+                let mut m = [0u8; 128];
+                m[..13].copy_from_slice(b"0123456789012");
+                m
+            },
+            lead_in_samples: 88_200, // 2 sec @ 44.1 kHz pre-gap
+            is_cdda: true,
+            tracks: vec![
+                CueSheetTrack {
+                    offset_samples: 0,
+                    number: 1,
+                    isrc: [0u8; 12],
+                    is_audio: true,
+                    pre_emphasis: false,
+                    indices: vec![
+                        CueSheetIndex {
+                            offset_samples: 0,
+                            number: 0,
+                        },
+                        CueSheetIndex {
+                            offset_samples: 588 * 150, // 2 sec into the track
+                            number: 1,
+                        },
+                    ],
+                },
+                CueSheetTrack {
+                    offset_samples: 44_100 * 60 * 3,
+                    number: 2,
+                    isrc: isrc_track2,
+                    is_audio: true,
+                    pre_emphasis: true,
+                    indices: vec![CueSheetIndex {
+                        offset_samples: 0,
+                        number: 1,
+                    }],
+                },
+                CueSheetTrack {
+                    offset_samples: 44_100 * 60 * 5,
+                    number: 170,
+                    isrc: [0u8; 12],
+                    is_audio: true,
+                    pre_emphasis: false,
+                    indices: vec![],
+                },
+            ],
+        };
+        let bytes = write_cuesheet(&cs_in).unwrap();
+        let cs_out = parse_cuesheet(&bytes).unwrap();
+        assert_eq!(cs_in, cs_out);
+        // Spot-check on-wire structure: fixed prefix + 2×(36+12) +
+        // 2×(36+24) - wait: track 1 has 2 indices, track 2 has 1, lead-
+        // out has 0 → 396 + (36+24) + (36+12) + 36 = 540.
+        assert_eq!(bytes.len(), 396 + (36 + 24) + (36 + 12) + 36);
+    }
+
+    #[test]
+    fn cuesheet_round_trip_non_cdda_single_leadout() {
+        // Minimum legal cuesheet: a single lead-out track, no pre-gap
+        // catalog. Confirms the writer accepts lead-out-only payloads
+        // (so does the parser; this exercises the cs.tracks.len()==1
+        // edge case end-to-end).
+        let cs_in = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![CueSheetTrack {
+                offset_samples: 1_000_000,
+                number: 255, // non-CD-DA lead-out marker
+                isrc: [0u8; 12],
+                is_audio: true,
+                pre_emphasis: false,
+                indices: vec![],
+            }],
+        };
+        let bytes = write_cuesheet(&cs_in).unwrap();
+        assert_eq!(bytes.len(), 396 + 36);
+        // Flag byte should have bit 7 clear (non-CD-DA) and reserved
+        // bits zero.
+        assert_eq!(bytes[136], 0x00);
+        // The 258-byte reserved span must be all zero.
+        assert!(bytes[137..395].iter().all(|&b| b == 0));
+        let cs_out = parse_cuesheet(&bytes).unwrap();
+        assert_eq!(cs_in, cs_out);
+    }
+
+    #[test]
+    fn cuesheet_writer_rejects_empty_track_list() {
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![],
+        };
+        assert!(write_cuesheet(&cs).is_err());
+    }
+
+    #[test]
+    fn cuesheet_writer_rejects_track_zero() {
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![CueSheetTrack {
+                offset_samples: 0,
+                number: 0, // reserved for lead-in, illegal here
+                isrc: [0u8; 12],
+                is_audio: true,
+                pre_emphasis: false,
+                indices: vec![],
+            }],
+        };
+        assert!(write_cuesheet(&cs).is_err());
+    }
+
+    #[test]
+    fn cuesheet_writer_rejects_zero_indices_on_non_leadout() {
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![
+                CueSheetTrack {
+                    offset_samples: 0,
+                    number: 1,
+                    isrc: [0u8; 12],
+                    is_audio: true,
+                    pre_emphasis: false,
+                    indices: vec![], // illegal: not the lead-out
+                },
+                CueSheetTrack {
+                    offset_samples: 1000,
+                    number: 255,
+                    isrc: [0u8; 12],
+                    is_audio: true,
+                    pre_emphasis: false,
+                    indices: vec![],
+                },
+            ],
+        };
+        assert!(write_cuesheet(&cs).is_err());
+    }
+
+    #[test]
+    fn cuesheet_writer_rejects_non_printable_catalog_byte() {
+        let mut m = [0u8; 128];
+        m[..3].copy_from_slice(b"\x01AB"); // 0x01 is non-printable
+        let cs = CueSheet {
+            media_catalog_number: m,
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![CueSheetTrack {
+                offset_samples: 0,
+                number: 255,
+                isrc: [0u8; 12],
+                is_audio: true,
+                pre_emphasis: false,
+                indices: vec![],
+            }],
+        };
+        assert!(write_cuesheet(&cs).is_err());
+    }
+
+    #[test]
+    fn cuesheet_writer_emits_track_flag_bits_correctly() {
+        // Audio with pre-emphasis: bit 6 set, bit 7 clear → 0x40.
+        // Non-audio (data) with no pre-emphasis: bit 7 set → 0x80.
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: true,
+            tracks: vec![
+                CueSheetTrack {
+                    offset_samples: 0,
+                    number: 1,
+                    isrc: [0u8; 12],
+                    is_audio: true,
+                    pre_emphasis: true,
+                    indices: vec![CueSheetIndex {
+                        offset_samples: 0,
+                        number: 1,
+                    }],
+                },
+                CueSheetTrack {
+                    offset_samples: 1000,
+                    number: 2,
+                    isrc: [0u8; 12],
+                    is_audio: false,
+                    pre_emphasis: false,
+                    indices: vec![CueSheetIndex {
+                        offset_samples: 0,
+                        number: 1,
+                    }],
+                },
+                CueSheetTrack {
+                    offset_samples: 2000,
+                    number: 170,
+                    isrc: [0u8; 12],
+                    is_audio: true,
+                    pre_emphasis: false,
+                    indices: vec![],
+                },
+            ],
+        };
+        let bytes = write_cuesheet(&cs).unwrap();
+        // Track 1 flag byte sits at offset 396 + 8 + 1 + 12 = 417.
+        assert_eq!(bytes[396 + 21], 0x40);
+        // Track 2 flag byte sits one full track-record later: 417 +
+        // 36-byte prefix + 12-byte single index = 465.
+        assert_eq!(bytes[396 + 36 + 12 + 21], 0x80);
+        // Round-trip preserves the flags.
+        let cs2 = parse_cuesheet(&bytes).unwrap();
+        assert!(cs2.tracks[0].pre_emphasis);
+        assert!(cs2.tracks[0].is_audio);
+        assert!(!cs2.tracks[1].pre_emphasis);
+        assert!(!cs2.tracks[1].is_audio);
+    }
+
+    #[test]
+    fn cuesheet_round_trip_synthetic_parsed_bytes() {
+        // Take the synth_cuesheet helper's output, parse it, write it
+        // back, and confirm the writer reproduces the exact same bytes.
+        // This pins the writer to the parser's understanding of the
+        // wire format byte-for-byte.
+        let original = synth_cuesheet(
+            b"ABCDEFGHIJKLM",
+            true,
+            &[(0, 1, 2), (44_100 * 60, 2, 1), (44_100 * 120, 170, 0)],
+        );
+        let cs = parse_cuesheet(&original).unwrap();
+        let reemitted = write_cuesheet(&cs).unwrap();
+        assert_eq!(original, reemitted);
     }
 
     #[test]
