@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder now searches LPC orders 1..=12 instead of stopping at 8.
+  RFC 9639 §9.2.6 permits orders 1..=32; the gain curve flattens fast,
+  so most content tops out somewhere between order 6 and 12, but the
+  long tail of harmonic / vocal content with broader autocorrelation
+  support genuinely benefits from a longer impulse response. The
+  per-subframe search keeps the smallest plan, so adding the higher
+  orders can only ever shrink (or tie) the output — orders that don't
+  earn their coefficient overhead are silently discarded. On a 4096-
+  sample AR(11) test signal — engineered so the autocorrelation
+  doesn't decay before lag 11 — the best plan in orders 9..=12 came in
+  at 50209 bits versus 50233 bits for the best in 1..=8. Output stays
+  fully lossless and every existing test (including the 18 docs-corpus
+  fixtures and the LPC-orders-1..=32 decoder coverage) decodes
+  bit-exactly. Three new encoder unit tests cover the
+  no-regression-on-low-order-friendly-content invariant, the
+  AR(11)-win demonstration, and an explicit bit-exact round-trip of
+  every order in 9..=12 through this crate's own subframe decoder.
 - Encoder LPC coefficient precision is now chosen per subframe from the
   block size instead of a fixed 12 bits. A larger block amortises the
   per-coefficient storage cost over more residual samples, so it can

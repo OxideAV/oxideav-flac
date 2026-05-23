@@ -26,11 +26,17 @@ use crate::md5::Md5;
 use oxideav_core::bits::BitWriter;
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
-/// Highest LPC order the encoder will try. The decoder supports up to
-/// 32, but beyond ~8 the gains shrink while per-frame encode cost grows
-/// (Levinson-Durbin is O(order^2) per subframe, residual search is
-/// linear in order). 8 is the conventional default for moderate-quality encoders.
-const MAX_LPC_ORDER: usize = 8;
+/// Highest LPC order the encoder will try. The decoder (and RFC 9639
+/// §9.2.6) supports up to 32, but the gain curve flattens fast: most
+/// content tops out somewhere between order 6 and order 12. We search
+/// 1..=12, which captures the long tail of harmonic / vocal content
+/// that benefits from a longer impulse response while keeping the
+/// per-frame encode cost bounded (Levinson-Durbin is O(order^2),
+/// residual search is linear in order). The `best_subframe` driver
+/// picks the minimum-bit plan, so adding higher orders can only ever
+/// shrink (or tie) the output: orders that don't earn their
+/// coefficient overhead are silently discarded.
+const MAX_LPC_ORDER: usize = 12;
 /// Highest LPC coefficient precision the encoder will quantise to.
 /// The 4-bit `qlp_precis` field stores `precision - 1`, and the
 /// all-ones encoding `0b1111` (precision 16) is forbidden by RFC 9639
@@ -1579,5 +1585,162 @@ mod tests {
             r.push((v * 0.7) as i32);
         }
         roundtrip(vec![l, r], sr, 16);
+    }
+
+    /// Lifting MAX_LPC_ORDER from 8 to 12 must not regress on a
+    /// content type where the lower orders already win — the encoder
+    /// considers every order in 1..=MAX_LPC_ORDER and keeps the
+    /// smallest, so adding orders can only ever shrink (or tie) the
+    /// output. A clean sine has its energy concentrated at a single
+    /// harmonic, so order ≈ 2..4 already captures the bulk of the
+    /// correlation; orders 9..=12 should be discarded silently,
+    /// producing the same byte count as a search restricted to
+    /// 1..=8.
+    #[test]
+    fn higher_max_order_does_not_regress_low_order_friendly_signal() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let mut samples: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 20_000.0;
+            samples.push(v as i32);
+        }
+        // Encoder-with-current-cap should choose a plan no larger than
+        // a hand-rolled search capped at order 8.
+        let plan_full = best_subframe(&samples, 16).unwrap();
+        let mut best_low: u64 = encode_verbatim_plan(&samples, 16, 0).bits;
+        for order in 0..=4usize {
+            if let Some(p) = encode_fixed_plan(&samples, 16, order, 0) {
+                best_low = best_low.min(p.bits);
+            }
+        }
+        for order in 1..=8usize {
+            if let Some(p) = encode_lpc_plan(&samples, 16, order, 0) {
+                best_low = best_low.min(p.bits);
+            }
+        }
+        assert!(
+            plan_full.bits <= best_low,
+            "raising MAX_LPC_ORDER must not inflate the plan: {} > {}",
+            plan_full.bits,
+            best_low
+        );
+    }
+
+    /// A signal engineered to need a longer impulse response than
+    /// order 8 — a sum of harmonics passed through a pseudo-random
+    /// AR(11) recursion. AR processes of order p have an
+    /// autocorrelation that doesn't decay before lag p, so a p-tap
+    /// LPC fits much better than anything shorter. With
+    /// MAX_LPC_ORDER raised from 8 to 12 the encoder gets to try
+    /// orders in 9..=12, and at least one of them should produce a
+    /// strictly smaller plan than the best in 1..=8 — otherwise the
+    /// raised cap buys nothing on the workload it targets.
+    #[test]
+    fn higher_max_order_wins_on_ar11_signal() {
+        let n = 4096usize;
+        // Order-11 AR recursion: y[n] = sum a[k]*y[n-k] + drive[n].
+        // The coefficients are small fractions that keep the filter
+        // stable; the drive is a deterministic LCG so the test is
+        // reproducible.
+        let a: [f64; 11] = [
+            0.62, -0.31, 0.18, -0.12, 0.09, -0.07, 0.06, -0.05, 0.04, -0.03, 0.02,
+        ];
+        let mut y = vec![0.0f64; n];
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        for i in 0..n {
+            // Marsaglia-style xorshift, kept in [-1, 1].
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let drive = ((rng as i64) as f64) / (i64::MAX as f64);
+            let mut acc = drive * 2000.0;
+            for (k, &ak) in a.iter().enumerate() {
+                if i > k {
+                    acc += ak * y[i - 1 - k];
+                }
+            }
+            y[i] = acc;
+        }
+        let samples: Vec<i32> = y
+            .iter()
+            .map(|&v| v.clamp(-30_000.0, 30_000.0) as i32)
+            .collect();
+
+        let mut best_low: u64 = u64::MAX;
+        for order in 1..=8usize {
+            if let Some(p) = encode_lpc_plan(&samples, 16, order, 0) {
+                best_low = best_low.min(p.bits);
+            }
+        }
+        let mut best_high: u64 = u64::MAX;
+        for order in 9..=MAX_LPC_ORDER {
+            if let Some(p) = encode_lpc_plan(&samples, 16, order, 0) {
+                best_high = best_high.min(p.bits);
+            }
+        }
+        assert!(
+            best_high < best_low,
+            "expected order 9..=12 to beat order 1..=8 on an AR(11) signal, \
+             got best_high={best_high} best_low={best_low}"
+        );
+    }
+
+    /// An LPC subframe encoded at each of the newly-enabled orders
+    /// 9..=12 must round-trip bit-exactly through this crate's own
+    /// subframe decoder. The decoder already accepts orders up to 32
+    /// per RFC 9639 §9.2.6, so this guards that the encoder's
+    /// `100000 | (order-1)` subframe-type encoding, the warmup-sample
+    /// emission, and the coefficient field width all line up with the
+    /// decoder's expectations for every order in the lifted range.
+    /// We drive the AR(11) signal so the chosen LPC coefficients are
+    /// stable; the test is independent of whether `best_subframe`
+    /// happens to prefer the high-order plan on this particular block.
+    #[test]
+    fn encode_decode_lpc_orders_9_to_12_subframe_roundtrip() {
+        use oxideav_core::bits::BitReader;
+
+        let n = 4096usize;
+        let a: [f64; 11] = [
+            0.62, -0.31, 0.18, -0.12, 0.09, -0.07, 0.06, -0.05, 0.04, -0.03, 0.02,
+        ];
+        let mut y = vec![0.0f64; n];
+        let mut rng: u64 = 0xfedc_ba98_7654_3210;
+        for i in 0..n {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let drive = ((rng as i64) as f64) / (i64::MAX as f64);
+            let mut acc = drive * 2000.0;
+            for (k, &ak) in a.iter().enumerate() {
+                if i > k {
+                    acc += ak * y[i - 1 - k];
+                }
+            }
+            y[i] = acc;
+        }
+        let samples: Vec<i32> = y
+            .iter()
+            .map(|&v| v.clamp(-30_000.0, 30_000.0) as i32)
+            .collect();
+
+        let bps = 16u32;
+        for order in 9..=MAX_LPC_ORDER {
+            let plan = encode_lpc_plan(&samples, bps, order, 0)
+                .unwrap_or_else(|| panic!("encode_lpc_plan failed at order {order}"));
+            // Decode the subframe payload back and check bit-exact
+            // recovery against the source samples.
+            let mut br = BitReader::new(&plan.payload);
+            let decoded = crate::subframe::decode_subframe(&mut br, n as u32, bps)
+                .unwrap_or_else(|e| panic!("decode failed at order {order}: {e}"));
+            assert_eq!(decoded.len(), n, "decode length mismatch at order {order}");
+            for (i, (&s, &d)) in samples.iter().zip(decoded.iter()).enumerate() {
+                assert_eq!(
+                    s, d,
+                    "round-trip mismatch at order {order} sample {i}: {s} vs {d}"
+                );
+            }
+        }
     }
 }

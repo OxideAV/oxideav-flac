@@ -109,17 +109,22 @@ non-Subset):
   (independent L/R, left-side, right-side, mid-side) per frame and
   picks the one that produces the smallest total subframe size.
 - **Predictors**: per subframe the encoder tries CONSTANT, FIXED
-  orders 0..=4, LPC orders 1..=8 (Levinson-Durbin on a Welch-windowed
-  autocorrelation) and VERBATIM, and keeps the smallest. LPC
-  coefficient precision is chosen per subframe from the block size — a
-  larger block amortises the coefficient cost over more residual
-  samples, so it earns more precision (rising with `log2(block_len)`,
-  clamped to the legal `[5, 15]` window; RFC 9639 §9.2.6 forbids the
-  16-bit `0b1111` encoding). The default 4096-sample frame quantises at
-  the 15-bit ceiling, keeping coefficients closer to their
-  floating-point ideals and shrinking the residual. The output remains
-  fully valid and fully lossless — any compliant decoder (including
-  this crate's own) will recover the original PCM bit-exactly.
+  orders 0..=4, LPC orders 1..=12 (Levinson-Durbin on a Welch-windowed
+  autocorrelation) and VERBATIM, and keeps the smallest. RFC 9639
+  §9.2.6 permits orders up to 32; the gain curve flattens past order
+  ~12 while per-frame encode cost grows quadratically, so we cap at 12
+  as the conventional moderate-quality ceiling. Orders 9..=12 are
+  silently discarded when shorter taps already win, so the lift only
+  helps content with broader autocorrelation support. LPC coefficient
+  precision is chosen per subframe from the block size — a larger
+  block amortises the coefficient cost over more residual samples, so
+  it earns more precision (rising with `log2(block_len)`, clamped to
+  the legal `[5, 15]` window; RFC 9639 §9.2.6 forbids the 16-bit
+  `0b1111` encoding). The default 4096-sample frame quantises at the
+  15-bit ceiling, keeping coefficients closer to their floating-point
+  ideals and shrinking the residual. The output remains fully valid
+  and fully lossless — any compliant decoder (including this crate's
+  own) will recover the original PCM bit-exactly.
 - **Wasted bits per sample**: detected per subframe (largest `k`
   such that every sample is divisible by `2^k`) and folded into the
   spec's wasted-bits unary header. This shaves the trailing-zero
