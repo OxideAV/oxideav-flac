@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Encoder residual coding now searches partition orders 0..=8 instead
+  of always emitting a single order-0 partition (RFC 9639 §9.2.5). For
+  each subframe the encoder scores every partition order legal for the
+  block size and predictor order under both Rice methods (4-bit and
+  5-bit parameters), keeps the layout with the smallest total payload,
+  and lets each partition independently fall back to an escape (raw
+  fixed-width) coding when that beats Rice. Splitting the residual lets
+  locally varying content pick a tighter Rice parameter per region, so
+  files with quiet passages next to transients shrink noticeably; output
+  remains fully lossless and decodes bit-exactly via this crate's own
+  decoder and the reference `flac` tool. Two new encoder unit tests
+  (`partition_search_beats_order_zero_on_split_statistics`,
+  `encode_decode_partitioned_residual_roundtrip`) cover the search and
+  the partitioned round-trip.
+
 ### Added
 
 - `metadata::write_cuesheet` serialises a `CueSheet` back into the

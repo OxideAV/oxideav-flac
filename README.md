@@ -119,9 +119,14 @@ non-Subset):
   spec's wasted-bits unary header. This shaves the trailing-zero
   payload off upsampled or low-amplitude content (e.g. a 16-bit
   stream that only ever uses its top 8 bits).
-- **Residual coding**: partitioned Rice with partition order 0,
-  exhaustive choice between Rice methods 0 and 1 per subframe, and
-  escape partitions for samples that can't be Rice-coded cheaply.
+- **Residual coding**: partitioned Rice with a full search over
+  partition orders 0..=8 (every order legal for the block size and
+  predictor order is scored, RFC 9639 §9.2.5) under both Rice methods
+  (4-bit and 5-bit parameters); the cheapest layout wins, and each
+  partition independently falls back to an escape (raw fixed-width)
+  coding when that beats Rice. Splitting the residual lets locally
+  varying content (quiet passages next to transients) pick a tighter
+  Rice parameter per region instead of one global compromise.
 - **Block size**: 4096 samples per frame (fixed-blocking strategy).
 - **Metadata**: emits a STREAMINFO metadata header in `extradata`. An
   MD5 signature of the PCM input is computed during encode and written

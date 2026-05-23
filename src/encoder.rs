@@ -5,9 +5,11 @@
 //! LPC orders 1..=8 and VERBATIM, and picks the smallest. For stereo
 //! inputs it evaluates independent L/R alongside the three decorrelated
 //! layouts (left-side, right-side, mid-side) and keeps the smallest
-//! total. An MD5 signature over the input PCM (in FLAC's native byte
-//! order) is accumulated during encode and written into STREAMINFO at
-//! flush time.
+//! total. Each subframe's residual is partitioned-Rice coded with a full
+//! search over partition orders 0..=8 and both Rice methods, with each
+//! partition free to fall back to a raw "escape" coding. An MD5 signature
+//! over the input PCM (in FLAC's native byte order) is accumulated during
+//! encode and written into STREAMINFO at flush time.
 
 use oxideav_core::Encoder;
 use oxideav_core::{
@@ -681,7 +683,7 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
     for i in 0..order {
         w.write_i32(samples[i], bps);
     }
-    let residual_bits = encode_rice_residual(&mut w, &residuals);
+    let residual_bits = encode_rice_residual(&mut w, &residuals, n, order);
     Some(bits_snapshot(
         w,
         header_bits + (bps * order as u32) + residual_bits,
@@ -724,7 +726,7 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
     for &q in &qcoeffs {
         w.write_i32(q, LPC_QLP_PRECISION);
     }
-    let residual_bits = encode_rice_residual(&mut w, &residuals);
+    let residual_bits = encode_rice_residual(&mut w, &residuals, n, order);
     let body_bits = (bps * order as u32) + 4 + 5 + (LPC_QLP_PRECISION * order as u32);
     Some(bits_snapshot(w, header_bits + body_bits + residual_bits))
 }
@@ -740,51 +742,167 @@ fn bits_snapshot(w: BitWriter, total_bits: u32) -> SubframePlan {
 
 // --- Residual coding ----------------------------------------------------
 
-/// Emit partitioned-Rice residual (order 0) and return the exact number
-/// of bits written. Chooses between method 0 (4-bit k) and method 1
-/// (5-bit k), and falls back to an escape partition when raw coding is
-/// cheaper.
-fn encode_rice_residual(w: &mut BitWriter, residuals: &[i32]) -> u32 {
-    let (bits0, _k0) = best_rice_params(residuals, 14);
-    let (bits1, _k1) = best_rice_params(residuals, 30);
-    let (method, k_max, param_bits) = if bits1 + 1 < bits0 {
-        (1u32, 30u32, 5u32)
-    } else {
-        (0u32, 14u32, 4u32)
-    };
-    let (_, k) = best_rice_params(residuals, k_max);
-    let escape_marker: u32 = (1u32 << param_bits) - 1;
+/// Highest partition order the encoder will search. RFC 9639 §9.2.5
+/// allows the 4-bit partition order to reach 15, but a block of 4096
+/// samples can never split beyond order 12 (4096 = 2^12); going further
+/// only buys diminishing returns at quadratic search cost, so 8 is the
+/// conventional ceiling (256 partitions of a 4096-sample block).
+const MAX_PARTITION_ORDER: u32 = 8;
+
+/// One partition's chosen coding: either a Rice parameter `k`, or an
+/// escape partition storing each residual raw at `raw_bps` bits.
+#[derive(Clone, Copy)]
+enum PartCoding {
+    Rice { k: u32 },
+    Escape { raw_bps: u32 },
+}
+
+struct PartChoice {
+    coding: PartCoding,
+    /// Payload bits for this partition *including* its `param_bits`
+    /// Rice-parameter field (and, for escape, the extra 5-bit width).
+    cost: u64,
+}
+
+/// Pick the cheapest coding for a single partition's residual slice
+/// under the given method (`param_bits` = 4 or 5, `k_max` = 14 or 30).
+/// Compares the best Rice parameter against an escape (raw fixed-width)
+/// partition and returns whichever costs fewer bits.
+fn best_partition(residuals: &[i32], param_bits: u32, k_max: u32) -> PartChoice {
+    let (rice_bits, k) = best_rice_params(residuals, k_max);
+    let rice_cost = param_bits as u64 + rice_bits;
 
     let needed_bits = raw_bits_needed(residuals);
-    let rice_cost = encoded_rice_cost(residuals, k);
-    let escape_cost: u64 = 5 + (residuals.len() as u64) * (needed_bits as u64);
-    let escape_ok = needed_bits <= 31;
+    if needed_bits <= 31 {
+        let escape_cost = param_bits as u64 + 5 + (residuals.len() as u64) * needed_bits as u64;
+        if escape_cost < rice_cost {
+            return PartChoice {
+                coding: PartCoding::Escape {
+                    raw_bps: needed_bits,
+                },
+                cost: escape_cost,
+            };
+        }
+    }
+    PartChoice {
+        coding: PartCoding::Rice { k },
+        cost: rice_cost,
+    }
+}
+
+/// Total residual-payload cost (sum of per-partition costs) for a given
+/// partition order under one method, or `None` if the layout is illegal
+/// (block size not divisible by `2^p`, or the first partition would have
+/// no residual slots left after the warmup samples).
+fn partition_layout_cost(
+    residuals: &[i32],
+    block_size: usize,
+    predictor_order: usize,
+    partition_order: u32,
+    param_bits: u32,
+    k_max: u32,
+) -> Option<u64> {
+    let n_partitions = 1usize << partition_order;
+    if block_size % n_partitions != 0 {
+        return None;
+    }
+    let partition_size = block_size / n_partitions;
+    if partition_size <= predictor_order {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut idx = 0usize;
+    for p in 0..n_partitions {
+        let count = if p == 0 {
+            partition_size - predictor_order
+        } else {
+            partition_size
+        };
+        total += best_partition(&residuals[idx..idx + count], param_bits, k_max).cost;
+        idx += count;
+    }
+    Some(total)
+}
+
+/// Emit the partitioned-Rice residual for one subframe and return the
+/// exact number of bits written. Searches every legal partition order
+/// (0..=MAX_PARTITION_ORDER) under both Rice methods (4-bit and 5-bit
+/// parameters), keeping the layout with the smallest total payload, and
+/// lets each partition independently fall back to an escape (raw) coding
+/// when that is cheaper than Rice. RFC 9639 §9.2.5.
+fn encode_rice_residual(
+    w: &mut BitWriter,
+    residuals: &[i32],
+    block_size: usize,
+    predictor_order: usize,
+) -> u32 {
+    // Find the (method, partition_order) pair with the smallest payload.
+    let mut best: Option<(u32, u32, u32, u32, u64)> = None; // method, param_bits, k_max, p, cost
+    for (method, param_bits, k_max) in [(0u32, 4u32, 14u32), (1u32, 5u32, 30u32)] {
+        for p in 0..=MAX_PARTITION_ORDER {
+            let Some(cost) =
+                partition_layout_cost(residuals, block_size, predictor_order, p, param_bits, k_max)
+            else {
+                // Higher orders only get more constrained — once a split
+                // is illegal for this block size, larger ones are too.
+                break;
+            };
+            // Add the constant 2-bit method + 4-bit partition-order
+            // header so cross-method comparison is fair.
+            let total = 2 + 4 + cost;
+            if best.is_none() || total < best.unwrap().4 {
+                best = Some((method, param_bits, k_max, p, total));
+            }
+        }
+    }
+
+    // Order 0 is always legal (partition_size == block_size > order),
+    // so `best` is guaranteed populated for any valid subframe.
+    let (method, param_bits, k_max, partition_order, _) =
+        best.expect("partition order 0 is always a legal layout");
+    let escape_marker: u32 = (1u32 << param_bits) - 1;
+    let n_partitions = 1usize << partition_order;
+    let partition_size = block_size / n_partitions;
 
     let mut total_bits: u32 = 0;
     w.write_u32(method, 2);
-    w.write_u32(0, 4); // partition_order = 0
+    w.write_u32(partition_order, 4);
     total_bits += 2 + 4;
 
-    if escape_ok && escape_cost < rice_cost {
-        w.write_u32(escape_marker, param_bits);
-        w.write_u32(needed_bits, 5);
-        total_bits += param_bits + 5;
-        for &r in residuals {
-            w.write_i32(r, needed_bits);
-        }
-        total_bits += needed_bits * residuals.len() as u32;
-    } else {
-        w.write_u32(k, param_bits);
-        total_bits += param_bits;
-        for &r in residuals {
-            let u = zigzag_encode(r);
-            let q = u >> k;
-            w.write_unary(q);
-            if k > 0 {
-                let rem = u & ((1u32 << k) - 1);
-                w.write_u32(rem, k);
+    let mut idx = 0usize;
+    for p in 0..n_partitions {
+        let count = if p == 0 {
+            partition_size - predictor_order
+        } else {
+            partition_size
+        };
+        let slice = &residuals[idx..idx + count];
+        idx += count;
+        let choice = best_partition(slice, param_bits, k_max);
+        match choice.coding {
+            PartCoding::Escape { raw_bps } => {
+                w.write_u32(escape_marker, param_bits);
+                w.write_u32(raw_bps, 5);
+                total_bits += param_bits + 5;
+                for &r in slice {
+                    w.write_i32(r, raw_bps);
+                }
+                total_bits += raw_bps * count as u32;
             }
-            total_bits += q + 1 + k;
+            PartCoding::Rice { k } => {
+                w.write_u32(k, param_bits);
+                total_bits += param_bits;
+                for &r in slice {
+                    let u = zigzag_encode(r);
+                    let q = u >> k;
+                    w.write_unary(q);
+                    if k > 0 {
+                        let rem = u & ((1u32 << k) - 1);
+                        w.write_u32(rem, k);
+                    }
+                    total_bits += q + 1 + k;
+                }
+            }
         }
     }
     total_bits
@@ -792,15 +910,6 @@ fn encode_rice_residual(w: &mut BitWriter, residuals: &[i32]) -> u32 {
 
 fn zigzag_encode(s: i32) -> u32 {
     ((s << 1) ^ (s >> 31)) as u32
-}
-
-fn encoded_rice_cost(residuals: &[i32], k: u32) -> u64 {
-    let mut total: u64 = 0;
-    for &r in residuals {
-        let u = zigzag_encode(r) as u64;
-        total += (u >> k) + 1 + k as u64;
-    }
-    total
 }
 
 fn raw_bits_needed(residuals: &[i32]) -> u32 {
@@ -1257,5 +1366,82 @@ mod tests {
             picked <= independent,
             "decorrelation picked {code} at {picked} bits but independent = {independent}"
         );
+    }
+
+    /// Helper: bits the residual coder spends on a residual block when it
+    /// is locked to a single partition order under method 0.
+    fn residual_bits_at_order(
+        residuals: &[i32],
+        block_size: usize,
+        order: usize,
+        partition_order: u32,
+    ) -> u64 {
+        let cost =
+            partition_layout_cost(residuals, block_size, order, partition_order, 4, 14).unwrap();
+        2 + 4 + cost
+    }
+
+    /// A residual block whose statistics change sharply between halves
+    /// (quiet first half, loud second half) is exactly the case higher
+    /// partition orders exist to exploit: a single global Rice parameter
+    /// must compromise, whereas two partitions can each pick their own.
+    /// Verify the search picks a non-trivial layout that beats order 0.
+    #[test]
+    fn partition_search_beats_order_zero_on_split_statistics() {
+        let block = 4096usize;
+        let order = 0usize;
+        let mut residuals: Vec<i32> = Vec::with_capacity(block);
+        for i in 0..block {
+            if i < block / 2 {
+                residuals.push((i % 3) as i32 - 1); // tiny: -1,0,1
+            } else {
+                residuals.push(((i * 2654435761usize) % 20000) as i32 - 10000); // large
+            }
+        }
+        let order0 = residual_bits_at_order(&residuals, block, order, 0);
+        let order1 = residual_bits_at_order(&residuals, block, order, 1);
+        assert!(
+            order1 < order0,
+            "order-1 split ({order1}) should beat order-0 ({order0}) on split stats"
+        );
+
+        // The full search (what the encoder actually emits) must be no
+        // worse than the best fixed order we can name.
+        let mut w = BitWriter::new();
+        let emitted = encode_rice_residual(&mut w, &residuals, block, order);
+        assert!(
+            (emitted as u64) <= order0,
+            "search emitted {emitted} bits, worse than order-0 {order0}"
+        );
+        // The reported bit count must match the writer's real output:
+        // finishing pads to the next byte, so the byte length is the
+        // ceiling of `emitted / 8`.
+        let written = w.into_bytes();
+        assert_eq!(
+            written.len(),
+            emitted.div_ceil(8) as usize,
+            "bit accounting mismatch: reported {emitted} bits"
+        );
+    }
+
+    /// Round-trip a stereo block engineered to favour partitioning: the
+    /// signal is quiet for the first part of every block then bursts
+    /// loud, so the encoder should reach for higher partition orders.
+    /// Bit-exact recovery proves the partitioned-Rice writer and the
+    /// decoder agree on partition boundaries.
+    #[test]
+    fn encode_decode_partitioned_residual_roundtrip() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let mut l: Vec<i32> = Vec::with_capacity(n);
+        let mut r: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let env = if i % 1024 < 256 { 200.0 } else { 18_000.0 };
+            let v = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * env;
+            l.push(v as i32);
+            r.push((v * 0.7) as i32);
+        }
+        roundtrip(vec![l, r], sr, 16);
     }
 }
