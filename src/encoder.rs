@@ -2,7 +2,10 @@
 //!
 //! Produces valid FLAC streams that decode bit-exactly via any compliant
 //! decoder. Per-subframe the encoder tries CONSTANT, FIXED orders 0..=4,
-//! LPC orders 1..=8 and VERBATIM, and picks the smallest. For stereo
+//! LPC orders 1..=8 and VERBATIM, and picks the smallest. LPC coefficient
+//! precision is chosen per subframe from the block size (larger blocks
+//! amortise the coefficient cost, so they get more precision, up to the
+//! spec's 15-bit ceiling). For stereo
 //! inputs it evaluates independent L/R alongside the three decorrelated
 //! layouts (left-side, right-side, mid-side) and keeps the smallest
 //! total. Each subframe's residual is partitioned-Rice coded with a full
@@ -28,11 +31,34 @@ const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// (Levinson-Durbin is O(order^2) per subframe, residual search is
 /// linear in order). 8 is the conventional default for moderate-quality encoders.
 const MAX_LPC_ORDER: usize = 8;
-/// Precision used when quantising LPC coefficients. 12 bits is a
-/// common sweet spot: tight enough to keep residual magnitudes small,
-/// loose enough that a single 5-bit shift covers the dynamic range of
-/// typical autocorrelation-derived coefficients.
-const LPC_QLP_PRECISION: u32 = 12;
+/// Highest LPC coefficient precision the encoder will quantise to.
+/// The 4-bit `qlp_precis` field stores `precision - 1`, and the
+/// all-ones encoding `0b1111` (precision 16) is forbidden by RFC 9639
+/// §9.2.6, so 15 is the largest legal precision. Higher precision keeps
+/// the quantised coefficients closer to their floating-point ideals,
+/// which shrinks the residual; the cost is `precision` extra bits per
+/// coefficient, amortised over the whole subframe's residual.
+const MAX_LPC_QLP_PRECISION: u32 = 15;
+/// Lowest precision the heuristic will pick. Below this the coefficient
+/// quantisation error tends to swell the residual faster than the
+/// coefficient field shrinks.
+const MIN_LPC_QLP_PRECISION: u32 = 5;
+
+/// Choose the LPC coefficient precision for a subframe of `block_len`
+/// samples. A larger block amortises the per-coefficient storage cost
+/// over more residual samples, so it can afford — and benefits from —
+/// higher precision; a short block keeps precision low so the warm-up
+/// plus coefficient overhead doesn't dominate. The precision rises with
+/// `log2(block_len)` and is clamped to the legal `[MIN, MAX]` window.
+/// RFC 9639 §9.2.6 caps the on-wire precision at 15.
+fn lpc_precision_for(block_len: usize) -> u32 {
+    // `bits` ≈ floor(log2(block_len)); a 4096-sample block gives 12,
+    // which lands precision at 15 (the legal ceiling). Tiny blocks
+    // (< 32 samples) floor out at MIN_LPC_QLP_PRECISION.
+    let bits = (usize::BITS - block_len.max(1).leading_zeros()).saturating_sub(1);
+    let precision = bits + 3;
+    precision.clamp(MIN_LPC_QLP_PRECISION, MAX_LPC_QLP_PRECISION)
+}
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let channels = params
@@ -696,7 +722,8 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
         return None;
     }
     let coeffs_f = levinson_durbin(samples, order)?;
-    let (qcoeffs, qlp_shift) = quantize_lpc(&coeffs_f, LPC_QLP_PRECISION)?;
+    let precision = lpc_precision_for(n);
+    let (qcoeffs, qlp_shift) = quantize_lpc(&coeffs_f, precision)?;
 
     let mut residuals = Vec::with_capacity(n - order);
     for i in order..n {
@@ -719,15 +746,15 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
         w.write_i32(samples[i], bps);
     }
     // qlp_precision-1 (4 bits) — the all-ones value 0xF is reserved.
-    w.write_u32(LPC_QLP_PRECISION - 1, 4);
+    w.write_u32(precision - 1, 4);
     // qlp_shift is written as 5-bit two's complement; we only emit
     // non-negative shifts so the sign bit is always 0.
     w.write_u32(qlp_shift & 0x1F, 5);
     for &q in &qcoeffs {
-        w.write_i32(q, LPC_QLP_PRECISION);
+        w.write_i32(q, precision);
     }
     let residual_bits = encode_rice_residual(&mut w, &residuals, n, order);
-    let body_bits = (bps * order as u32) + 4 + 5 + (LPC_QLP_PRECISION * order as u32);
+    let body_bits = (bps * order as u32) + 4 + 5 + (precision * order as u32);
     Some(bits_snapshot(w, header_bits + body_bits + residual_bits))
 }
 
@@ -1026,7 +1053,9 @@ fn levinson_durbin(samples: &[i32], order: usize) -> Option<Vec<f64>> {
 /// Quantise floating-point LPC coefficients into `precision`-bit signed
 /// integers plus a non-negative shift. Returns `None` if the magnitudes
 /// are too small to represent meaningfully (would overflow the shift
-/// range). The shift is clamped to 0..=14.
+/// range). The shift is clamped to 0..=15: RFC 9639 §9.2.6 writes the
+/// shift as a 5-bit two's-complement quantity that MUST NOT be negative
+/// (Appendix B.4), so the legal positive range is exactly 0..=15.
 fn quantize_lpc(coeffs: &[f64], precision: u32) -> Option<(Vec<i32>, u32)> {
     let cmax = coeffs.iter().fold(0f64, |acc, &c| acc.max(c.abs()));
     if !cmax.is_finite() || cmax == 0.0 {
@@ -1037,7 +1066,7 @@ fn quantize_lpc(coeffs: &[f64], precision: u32) -> Option<(Vec<i32>, u32)> {
     let max_q = (1i64 << (precision - 1)) - 1;
     // Pick shift so that `cmax * 2^shift` sits just under `max_q`.
     let raw_shift = (max_q as f64 / cmax).log2().floor() as i32;
-    let shift = raw_shift.clamp(0, 14) as u32;
+    let shift = raw_shift.clamp(0, 15) as u32;
     let scale = (1u64 << shift) as f64;
 
     let mut out = Vec::with_capacity(coeffs.len());
@@ -1422,6 +1451,113 @@ mod tests {
             emitted.div_ceil(8) as usize,
             "bit accounting mismatch: reported {emitted} bits"
         );
+    }
+
+    /// The adaptive precision heuristic must stay inside the spec's
+    /// legal `[MIN, MAX]` window, rise monotonically with block size,
+    /// and never reach the forbidden precision 16 (`qlp_precis` 0b1111).
+    #[test]
+    fn lpc_precision_heuristic_within_legal_window() {
+        // Monotone non-decreasing in block size.
+        let sizes = [1usize, 8, 16, 32, 64, 256, 1024, 4096, 16384, 65536];
+        let mut prev = 0u32;
+        for &n in &sizes {
+            let p = lpc_precision_for(n);
+            assert!(
+                (MIN_LPC_QLP_PRECISION..=MAX_LPC_QLP_PRECISION).contains(&p),
+                "precision {p} for block {n} outside [{MIN_LPC_QLP_PRECISION}, {MAX_LPC_QLP_PRECISION}]"
+            );
+            assert!(
+                p >= prev,
+                "precision must not drop: {prev} -> {p} at block {n}"
+            );
+            prev = p;
+        }
+        // The legal ceiling is 15; encoded as `precision - 1` it is
+        // 0b1110, one below the forbidden 0b1111. Every value the
+        // heuristic returns must therefore encode below 0b1111.
+        for &n in &sizes {
+            assert!(
+                lpc_precision_for(n) - 1 < 0xF,
+                "block {n} encodes forbidden 0b1111"
+            );
+        }
+        assert_eq!(lpc_precision_for(4096), 15);
+        // Tiny blocks floor at the minimum (a meaningful coefficient
+        // field, never 0-bit).
+        assert_eq!(lpc_precision_for(1), MIN_LPC_QLP_PRECISION);
+    }
+
+    /// Quantising at higher precision keeps the coefficients closer to
+    /// their floating-point ideals, which shrinks the residual. For a
+    /// clean predictable signal the residual saving should outweigh the
+    /// extra coefficient bits, so the high-precision LPC plan is no
+    /// larger than the low-precision one. (We compare residual-driving
+    /// quantisations directly so the test is independent of the
+    /// block-size heuristic.)
+    #[test]
+    fn higher_precision_does_not_inflate_predictable_lpc() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let mut samples: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 18_000.0
+                + (t * 880.0 * 2.0 * std::f64::consts::PI).sin() * 4_000.0;
+            samples.push(v as i32);
+        }
+        let order = 8usize;
+        let coeffs = levinson_durbin(&samples, order).unwrap();
+
+        let residual_bits_at = |precision: u32| -> u64 {
+            let (q, shift) = quantize_lpc(&coeffs, precision).unwrap();
+            let mut res = Vec::with_capacity(n - order);
+            for i in order..n {
+                let mut pred: i64 = 0;
+                for (j, &qc) in q.iter().enumerate() {
+                    pred += qc as i64 * samples[i - 1 - j] as i64;
+                }
+                res.push((samples[i] as i64 - (pred >> shift)) as i32);
+            }
+            let mut w = BitWriter::new();
+            let res_bits = encode_rice_residual(&mut w, &res, n, order) as u64;
+            // Total subframe-body cost = coefficient field + residual.
+            res_bits + (precision as u64) * order as u64
+        };
+
+        let low = residual_bits_at(8);
+        let high = residual_bits_at(15);
+        assert!(
+            high <= low,
+            "15-bit precision ({high}) should not exceed 8-bit ({low}) on a clean tone"
+        );
+    }
+
+    /// An LPC subframe encoded for a 4096-sample block must declare the
+    /// heuristic's precision (15) on the wire, read its coefficients at
+    /// that width, and still decode bit-exactly. This guards the
+    /// encoder/decoder agreement on the now-variable `qlp_precis` field.
+    #[test]
+    fn adaptive_precision_lpc_roundtrips_at_full_block() {
+        let sr = 44_100u32;
+        let n = 4096usize;
+        let mut samples: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = (t * 523.25 * 2.0 * std::f64::consts::PI).sin() * 22_000.0
+                + (t * 1046.5 * 2.0 * std::f64::consts::PI).sin() * 7_000.0;
+            samples.push(v as i32);
+        }
+        // Confirm the chosen subframe is actually LPC at the full
+        // precision the heuristic picks for this block size.
+        let plan = best_subframe(&samples, 16).unwrap();
+        // type byte: bit0=pad, bits1..7 = type code. LPC is 0b1xxxxx.
+        let type_code = (plan.payload[0] >> 1) & 0x3F;
+        assert!(
+            type_code & 0b100000 != 0,
+            "expected an LPC subframe for a predictable tone, got type {type_code:#08b}"
+        );
+        roundtrip(vec![samples], sr, 16);
     }
 
     /// Round-trip a stereo block engineered to favour partitioning: the

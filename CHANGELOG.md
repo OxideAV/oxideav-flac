@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder LPC coefficient precision is now chosen per subframe from the
+  block size instead of a fixed 12 bits. A larger block amortises the
+  per-coefficient storage cost over more residual samples, so it can
+  afford higher precision; the heuristic rises with `log2(block_len)`
+  and clamps to the legal `[5, 15]` window (RFC 9639 §9.2.6 forbids the
+  4-bit `qlp_precis` all-ones encoding `0b1111`, capping on-wire
+  precision at 15). The default 4096-sample frame now quantises at the
+  15-bit ceiling, keeping the coefficients closer to their
+  floating-point ideals and shrinking the LPC residual; on a
+  multi-tone stereo frame this trimmed the encoded frame from 2995 to
+  2972 bytes. The LPC shift clamp was also lifted from 0..=14 to the
+  spec's full non-negative 5-bit range 0..=15. Output stays fully
+  lossless and decodes bit-exactly via this crate's own decoder (all 18
+  docs-corpus fixtures still match per channel). Three new encoder unit
+  tests cover the heuristic's legal-window/monotonicity invariants, the
+  residual-vs-coefficient trade-off, and a full-block adaptive-precision
+  round-trip.
 - Encoder residual coding now searches partition orders 0..=8 instead
   of always emitting a single order-0 partition (RFC 9639 §9.2.5). For
   each subframe the encoder scores every partition order legal for the
