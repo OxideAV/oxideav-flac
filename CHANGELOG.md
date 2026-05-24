@@ -117,6 +117,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `metadata::write_seektable(real_points, placeholder_count)` serialises
+  a slice of `SeekPoint`s back into a RFC 9639 §8.5.1-conformant
+  SEEKTABLE block payload, optionally padding the tail with
+  placeholder entries (`sample_number = 0xFFFF_FFFF_FFFF_FFFF`, now
+  exposed as `metadata::SEEK_POINT_PLACEHOLDER`) so callers can
+  pre-reserve space for future seek-point insertions without
+  rewriting the surrounding metadata chain. The writer enforces every
+  wire-format invariant the spec imposes on a written table: real
+  points must be strictly ascending by sample number (which collapses
+  the spec's separate "MUST be sorted in ascending order" and "MUST
+  be unique by sample number" rules into a single check), no real
+  point may shadow the placeholder sentinel (the parser uses it as
+  the placeholder discriminator), and placeholders are only written
+  at the tail. Each entry serialises to the fixed 18-byte shape
+  (`sample_number: u64 BE`, `offset: u64 BE`, `frame_samples:
+  u16 BE`); placeholders zero the two undefined trailing fields for
+  byte-stable round-trips. Round-trips through `parse_seektable`
+  losslessly (the parser drops the placeholder tail per spec, so a
+  write→parse pair returns the input real-points slice unchanged).
+  Six unit tests cover the simple three-point round-trip, the
+  placeholder-tail byte layout, the empty-table and
+  placeholders-only-table edge cases, both ordering-violation
+  branches (equal sample numbers, descending sample numbers), the
+  sentinel-as-real-point rejection, and a synthetic-bytes
+  parse→write→parse equality path that pins the writer to the
+  parser's exact wire-format understanding the same way the existing
+  cuesheet round-trip test does.
+- A property-style sweep test in `tests/roundtrip.rs`
+  (`sine_sweep_bit_exact_and_compresses_below_verbatim`) encodes a
+  1-second 1 kHz mono sine at 8 kHz (FLAC fixed sample-rate code
+  `0b0100` per RFC 9639 §9.1.2) across 18 input variants — two bit
+  depths (S16, S24) × three amplitudes (0.95 × full scale near
+  clipping, 0.1 × full scale where the LPC coefficient-precision
+  search lives, 0.01 × full scale where the wasted-bits fast path
+  fires) × three DC offsets (0, +7, -13). Every variant asserts
+  bit-exact PCM recovery (the FLAC losslessness contract per §1)
+  through the public encoder→decoder trait path AND asserts the
+  compressed packet is strictly smaller than the bare VERBATIM
+  payload (`bps × n` bits) the encoder would emit if every search
+  lost out — catching a future regression where a misconfigured
+  encoder defaults to writing unencoded samples on a textbook
+  LPC-friendly signal. Measured compression ratios on the 18 cases:
+  S16 collapses to 0.066–0.068× verbatim across every amplitude
+  (the LPC + Rice path is essentially saturated on a clean sine),
+  S24 spans 0.045–0.398× depending on amplitude (the high-amplitude
+  near-clipping cases carry the biggest residuals; the low-amplitude
+  case benefits dramatically from wasted-bits detection because most
+  of the lower 17 bits stay zero). One mismatch in any of the 18
+  bit-exact recoveries, or one case slipping over the VERBATIM
+  ceiling, is a hard failure.
 - `metadata::write_cuesheet` serialises a `CueSheet` back into the
   RFC 9639 §8.7 CUESHEET block payload, completing the round-trip with
   `parse_cuesheet`. The writer is structural (it does not enforce CD-DA

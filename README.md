@@ -189,6 +189,19 @@ non-Subset):
   Rejects structurally illegal cuesheets (empty track list, track
   number 0, zero indices on a non-lead-out track, non-printable bytes
   in the media catalog) before emitting any bytes.
+- **SEEKTABLE writer**: `metadata::write_seektable(real_points,
+  placeholder_count)` serialises a slice of `SeekPoint`s back into a
+  RFC 9639 §8.5.1-conformant block payload, optionally padding the
+  tail with placeholder entries (sentinel sample number
+  `0xFFFF_FFFF_FFFF_FFFF`, exposed as `SEEK_POINT_PLACEHOLDER`) so a
+  caller can pre-reserve space for future seek-point insertions
+  without rewriting the surrounding metadata chain. Rejects real
+  seek points that are not strictly ascending by sample number
+  (covers both the spec's "MUST be sorted in ascending order" and
+  "MUST be unique by sample number" rules) and refuses to emit a
+  real point that shadows the placeholder sentinel — both would
+  silently corrupt the table on the next parse pass. Round-trips
+  through `parse_seektable` byte-for-byte.
 
 ## Codec / container IDs
 

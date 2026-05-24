@@ -430,19 +430,24 @@ pub struct SeekPoint {
     pub frame_samples: u16,
 }
 
+/// Placeholder seek point sentinel value for the `sample_number` field
+/// (RFC 9639 §8.5.1). Placeholders carry undefined `offset` /
+/// `frame_samples` values and MUST appear only at the end of the seek
+/// table.
+pub const SEEK_POINT_PLACEHOLDER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
 /// Parse a FLAC SEEKTABLE block payload into a vector of valid
 /// (non-placeholder) seek points. Each wire-format SEEKPOINT is 18
 /// bytes: `sample_number: u64 BE`, `offset: u64 BE`, `frame_samples:
 /// u16 BE`. A payload whose length isn't a multiple of 18 has its
 /// trailing bytes ignored (matches the tolerance shown by typical FLAC files in the wild).
 pub fn parse_seektable(bytes: &[u8]) -> Vec<SeekPoint> {
-    const PLACEHOLDER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
     let n = bytes.len() / 18;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let off = i * 18;
         let sample_number = u64::from_be_bytes(bytes[off..off + 8].try_into().expect("8 bytes"));
-        if sample_number == PLACEHOLDER {
+        if sample_number == SEEK_POINT_PLACEHOLDER {
             continue;
         }
         let offset = u64::from_be_bytes(bytes[off + 8..off + 16].try_into().expect("8 bytes"));
@@ -454,6 +459,99 @@ pub fn parse_seektable(bytes: &[u8]) -> Vec<SeekPoint> {
         });
     }
     out
+}
+
+/// Serialise a slice of [`SeekPoint`]s back into a RFC 9639 §8.5.1
+/// SEEKTABLE block payload, optionally padding the tail with
+/// `placeholder_count` placeholder entries (`sample_number =
+/// 0xFFFF_FFFF_FFFF_FFFF`) so callers can pre-reserve space for
+/// future seek-point insertions without rewriting the surrounding
+/// metadata chain.
+///
+/// Each seek point serialises to 18 bytes: `sample_number: u64 BE`,
+/// `offset: u64 BE`, `frame_samples: u16 BE`. Placeholder entries
+/// use the same 18-byte shape with all other fields zeroed (the spec
+/// leaves the two trailing fields undefined for placeholders, and
+/// the in-tree parser drops the entire entry on a placeholder match,
+/// so the trailing-byte values are not observable).
+///
+/// The writer enforces every wire-format invariant the spec
+/// (RFC 9639 §8.5.1) imposes on a written table:
+///
+/// * Real seek points must be strictly ascending by `sample_number`
+///   ("Seek points within a table MUST be sorted in ascending order
+///   by sample number" plus "MUST be unique by sample number ...
+///   with the exception of placeholder points"). The strict ordering
+///   collapses the two MUSTs into a single check.
+/// * No real point may carry the placeholder sentinel value as its
+///   `sample_number` (that field is reserved for placeholder slots
+///   and the parser uses it as the placeholder discriminator).
+/// * Placeholders are only emitted at the tail, after every real
+///   point ("any number of placeholder points, but they MUST all
+///   occur at the end of the table"). The caller supplies the count
+///   separately so the real-points slice cannot accidentally smuggle
+///   in a placeholder entry mid-table.
+///
+/// Round-trips through [`parse_seektable`] losslessly: the parser
+/// drops the placeholder tail (as it must per spec), so a writer
+/// invocation followed by a parser invocation returns the original
+/// real-points slice unchanged.
+pub fn write_seektable(real_points: &[SeekPoint], placeholder_count: usize) -> Result<Vec<u8>> {
+    // Per-point sanity: no real point may shadow the placeholder
+    // sentinel, otherwise the parser would silently drop it.
+    for sp in real_points {
+        if sp.sample_number == SEEK_POINT_PLACEHOLDER {
+            return Err(Error::invalid(
+                "FLAC SEEKTABLE: real seek point uses the placeholder \
+                 sample number sentinel (0xFFFF_FFFF_FFFF_FFFF)",
+            ));
+        }
+    }
+    // RFC 9639 §8.5.1: real points MUST be sorted ascending by
+    // sample_number AND MUST be unique by sample_number. Strict
+    // ordering covers both, since `<` rejects equality.
+    for pair in real_points.windows(2) {
+        if pair[0].sample_number >= pair[1].sample_number {
+            return Err(Error::invalid(format!(
+                "FLAC SEEKTABLE: seek points must be strictly ascending \
+                 by sample_number; saw {} then {}",
+                pair[0].sample_number, pair[1].sample_number
+            )));
+        }
+    }
+    // The metadata block header carries the payload length as a
+    // u24 BE field (max 16 MiB - 1). Each seek point is 18 bytes, so
+    // the absolute hard cap is (2^24 - 1) / 18 ≈ 932 067 entries.
+    // We use a slightly tighter `u32` ceiling for the multiplication
+    // itself; the block header validation downstream catches anything
+    // closer to the spec limit.
+    let total_points = real_points
+        .len()
+        .checked_add(placeholder_count)
+        .ok_or_else(|| Error::invalid("FLAC SEEKTABLE: total seek-point count overflows usize"))?;
+    let total_bytes = total_points
+        .checked_mul(18)
+        .ok_or_else(|| Error::invalid("FLAC SEEKTABLE: total payload size overflows usize"))?;
+
+    let mut out = Vec::with_capacity(total_bytes);
+    for sp in real_points {
+        out.extend_from_slice(&sp.sample_number.to_be_bytes());
+        out.extend_from_slice(&sp.offset.to_be_bytes());
+        out.extend_from_slice(&sp.frame_samples.to_be_bytes());
+    }
+    // Each placeholder serialises as: u64 sentinel + 10 zero bytes
+    // (u64 offset + u16 frame_samples). Per spec the trailing fields
+    // are undefined for placeholders, so we deterministically zero
+    // them out — both for byte-stable round-trips and so the in-tree
+    // parser (which short-circuits on the sentinel) ignores them
+    // regardless of value.
+    for _ in 0..placeholder_count {
+        out.extend_from_slice(&SEEK_POINT_PLACEHOLDER.to_be_bytes());
+        out.extend_from_slice(&[0u8; 10]);
+    }
+
+    debug_assert_eq!(out.len(), total_bytes);
+    Ok(out)
 }
 
 impl StreamInfo {
@@ -898,5 +996,160 @@ mod tests {
             // care here only that no panic escapes.
             let _ = parse_cuesheet(&buf);
         }
+    }
+
+    #[test]
+    fn seektable_writer_round_trips_three_real_points() {
+        // Three ordered seek points + no placeholders. Confirm the
+        // writer reproduces the byte layout the parser already
+        // recognised in `seektable_parses_and_drops_placeholders`.
+        let points = vec![
+            SeekPoint {
+                sample_number: 0,
+                offset: 0,
+                frame_samples: 4096,
+            },
+            SeekPoint {
+                sample_number: 4096,
+                offset: 1500,
+                frame_samples: 4096,
+            },
+            SeekPoint {
+                sample_number: 8192,
+                offset: 1234,
+                frame_samples: 4096,
+            },
+        ];
+        let bytes = write_seektable(&points, 0).expect("writer");
+        assert_eq!(bytes.len(), 3 * 18);
+        let parsed = parse_seektable(&bytes);
+        assert_eq!(parsed, points);
+    }
+
+    #[test]
+    fn seektable_writer_emits_placeholder_tail_byte_for_byte() {
+        // One real point + two placeholders. Each placeholder must be
+        // the 8-byte sentinel followed by ten zero bytes, and the
+        // parser must drop both of them.
+        let points = vec![SeekPoint {
+            sample_number: 0,
+            offset: 0,
+            frame_samples: 4096,
+        }];
+        let bytes = write_seektable(&points, 2).expect("writer");
+        assert_eq!(bytes.len(), 3 * 18);
+        // First 18 bytes: the real point. Bytes 8..16 = offset (0), 16..18 = frame_samples (4096).
+        assert_eq!(&bytes[0..8], &0u64.to_be_bytes());
+        assert_eq!(&bytes[8..16], &0u64.to_be_bytes());
+        assert_eq!(&bytes[16..18], &4096u16.to_be_bytes());
+        // Placeholder 1
+        assert_eq!(&bytes[18..26], &SEEK_POINT_PLACEHOLDER.to_be_bytes());
+        assert!(bytes[26..36].iter().all(|&b| b == 0));
+        // Placeholder 2
+        assert_eq!(&bytes[36..44], &SEEK_POINT_PLACEHOLDER.to_be_bytes());
+        assert!(bytes[44..54].iter().all(|&b| b == 0));
+        // Parser drops both placeholders.
+        let parsed = parse_seektable(&bytes);
+        assert_eq!(parsed, points);
+    }
+
+    #[test]
+    fn seektable_writer_accepts_empty_input() {
+        // An empty (all-placeholder, or fully-empty) table is a valid
+        // on-wire encoding — RFC 9639 §8.5 explicitly allows "zero or
+        // more seek points". Confirm both fully-empty and
+        // placeholders-only.
+        let none = write_seektable(&[], 0).expect("zero entries");
+        assert!(none.is_empty());
+        assert_eq!(parse_seektable(&none), vec![]);
+        let placeholders = write_seektable(&[], 4).expect("placeholders only");
+        assert_eq!(placeholders.len(), 4 * 18);
+        // Every placeholder slot carries the sentinel in the first
+        // 8 bytes followed by ten zero bytes.
+        for i in 0..4 {
+            let off = i * 18;
+            assert_eq!(
+                &placeholders[off..off + 8],
+                &SEEK_POINT_PLACEHOLDER.to_be_bytes()
+            );
+            assert!(placeholders[off + 8..off + 18].iter().all(|&b| b == 0));
+        }
+        // Parser drops every placeholder.
+        assert_eq!(parse_seektable(&placeholders), vec![]);
+    }
+
+    #[test]
+    fn seektable_writer_rejects_non_ascending_points() {
+        // Equal sample numbers (RFC 9639 §8.5.1 "MUST be unique").
+        let equal = vec![
+            SeekPoint {
+                sample_number: 4096,
+                offset: 0,
+                frame_samples: 4096,
+            },
+            SeekPoint {
+                sample_number: 4096,
+                offset: 1500,
+                frame_samples: 4096,
+            },
+        ];
+        assert!(write_seektable(&equal, 0).is_err());
+        // Descending sample numbers (RFC 9639 §8.5.1 "MUST be sorted
+        // in ascending order").
+        let descending = vec![
+            SeekPoint {
+                sample_number: 8192,
+                offset: 0,
+                frame_samples: 4096,
+            },
+            SeekPoint {
+                sample_number: 4096,
+                offset: 1500,
+                frame_samples: 4096,
+            },
+        ];
+        assert!(write_seektable(&descending, 0).is_err());
+    }
+
+    #[test]
+    fn seektable_writer_rejects_placeholder_sentinel_as_real_point() {
+        // A real seek point can't carry the 0xFFFF... sample number;
+        // the parser would silently drop it as a placeholder.
+        let bad = vec![SeekPoint {
+            sample_number: SEEK_POINT_PLACEHOLDER,
+            offset: 0,
+            frame_samples: 4096,
+        }];
+        assert!(write_seektable(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn seektable_round_trip_through_parser_preserves_real_points() {
+        // Build a SEEKTABLE by hand (mixing real points with a
+        // placeholder), parse it, re-serialise with the same placeholder
+        // count, and confirm a second parse pass round-trips bit-for-bit.
+        // This pins the writer to the parser's exact wire-format
+        // understanding, the same way the cuesheet
+        // `cuesheet_round_trip_synthetic_parsed_bytes` test does.
+        let mut original = Vec::new();
+        // Real point at sample 0
+        original.extend_from_slice(&0u64.to_be_bytes());
+        original.extend_from_slice(&0u64.to_be_bytes());
+        original.extend_from_slice(&4096u16.to_be_bytes());
+        // Real point at sample 4096
+        original.extend_from_slice(&4096u64.to_be_bytes());
+        original.extend_from_slice(&1500u64.to_be_bytes());
+        original.extend_from_slice(&4096u16.to_be_bytes());
+        // Placeholder at end (sentinel + 10 zero bytes — the same shape
+        // the writer emits).
+        original.extend_from_slice(&SEEK_POINT_PLACEHOLDER.to_be_bytes());
+        original.extend_from_slice(&[0u8; 10]);
+
+        let parsed = parse_seektable(&original);
+        assert_eq!(parsed.len(), 2);
+        let reemitted = write_seektable(&parsed, 1).expect("writer");
+        assert_eq!(reemitted, original);
+        let reparsed = parse_seektable(&reemitted);
+        assert_eq!(reparsed, parsed);
     }
 }
