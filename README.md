@@ -109,26 +109,35 @@ non-Subset):
   (independent L/R, left-side, right-side, mid-side) per frame and
   picks the one that produces the smallest total subframe size.
 - **Predictors**: per subframe the encoder tries CONSTANT, FIXED
-  orders 0..=4, LPC orders 1..=12 (Levinson-Durbin on a Welch-windowed
-  autocorrelation) and VERBATIM, and keeps the smallest. RFC 9639
-  §9.2.6 permits orders up to 32; the gain curve flattens past order
-  ~12 while per-frame encode cost grows quadratically, so we cap at 12
-  as the conventional moderate-quality ceiling. Orders 9..=12 are
+  orders 0..=4, LPC orders 1..=12 and VERBATIM, and keeps the smallest.
+  RFC 9639 §9.2.6 permits orders up to 32; the gain curve flattens past
+  order ~12 while per-frame encode cost grows quadratically, so we cap
+  at 12 as the conventional moderate-quality ceiling. Orders 9..=12 are
   silently discarded when shorter taps already win, so the lift only
-  helps content with broader autocorrelation support. LPC coefficient
-  precision is **searched** per subframe: a block-size heuristic sets
-  the search ceiling (rising with `log2(block_len)`, clamped to the
-  legal `[5, 15]` window; RFC 9639 §9.2.6 forbids the 16-bit `0b1111`
-  encoding), and each LPC order is quantised and residual-coded at
-  every precision in a small window beneath that ceiling, keeping
-  whichever encodes fewest bits. Higher precision keeps coefficients
-  closer to their floating-point ideals and shrinks the residual, but
-  costs `order` extra bits per step; the flip point depends on the
-  signal, so the only reliable choice is to encode the candidates and
-  compare. The previous ceiling-only behaviour is always one of the
-  candidates, so the search can only tie or beat it. The output
-  remains fully valid and fully lossless — any compliant decoder
-  (including this crate's own) will recover the original PCM
+  helps content with broader autocorrelation support. For each LPC
+  order the encoder additionally **searches three analysis windows**
+  before Levinson-Durbin: Welch (centre-heavy parabola, the historical
+  default; strong on steady tonal content), Hann (low-side-lobe raised
+  cosine; better on signals with closely-spaced partials where Welch
+  leakage smears the autocorrelation) and a shallow Tukey (1/4)
+  (mostly-flat passband with light cosine edge ramps). The window has
+  **no on-wire footprint** — RFC 9639 only ties down the quantised
+  coefficients, precision, and shift, leaving the autocorrelation-to-
+  coefficient step (Acknowledgments) to the encoder — so trying several
+  windows and keeping the smallest result is a pure rate decision. LPC
+  coefficient precision is also searched per subframe: a block-size
+  heuristic sets the search ceiling (rising with `log2(block_len)`,
+  clamped to the legal `[5, 15]` window; RFC 9639 §9.2.6 forbids the
+  16-bit `0b1111` encoding), and each (window, order) pair is quantised
+  and residual-coded at every precision in a small window beneath the
+  ceiling, keeping whichever encodes fewest bits. Higher precision
+  keeps coefficients closer to their floating-point ideals and shrinks
+  the residual, but costs `precision` extra bits per coefficient; the
+  flip point depends on the signal, so the only reliable choice is to
+  encode the candidates and compare. The previous Welch-only behaviour
+  is always one of the candidates, so the search can only tie or beat
+  it. The output remains fully valid and fully lossless — any compliant
+  decoder (including this crate's own) will recover the original PCM
   bit-exactly.
 - **Wasted bits per sample**: detected per subframe (largest `k`
   such that every sample is divisible by `2^k`) and folded into the

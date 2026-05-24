@@ -67,6 +67,99 @@ const MIN_LPC_QLP_PRECISION: u32 = 5;
 /// content.
 const LPC_PRECISION_SEARCH_SPAN: u32 = 4;
 
+/// Analysis windows the encoder applies to a subframe before computing
+/// the autocorrelation that feeds Levinson-Durbin. RFC 9639 only ties
+/// down what reaches the bitstream — the quantised coefficients, the
+/// precision, and the shift — and explicitly notes (Acknowledgments,
+/// "Norman Levinson and James Durbin") that deriving the coefficients
+/// from the autocorrelation is an *encoder* concern. Which window
+/// tapers the signal before that autocorrelation is therefore a free
+/// analysis choice with **no** decoder-side footprint: the decoder
+/// never sees it. Different windows trade spectral leakage against
+/// retained edge energy, and the best one is signal-dependent, so the
+/// encoder computes coefficients under each, residual-codes them, and
+/// keeps whichever LPC subframe ends up smallest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApodizationWindow {
+    /// Parabolic taper `1 - x^2`. Cheap, smooth, retains a lot of centre
+    /// energy; the long-standing default for this encoder and a strong
+    /// all-rounder on steady tonal content.
+    Welch,
+    /// Raised-cosine `0.5 - 0.5*cos(2*pi*i/(N-1))`. Lower side lobes
+    /// than Welch, which suppresses spectral leakage on signals with
+    /// closely-spaced partials at the cost of more aggressive edge
+    /// attenuation.
+    Hann,
+    /// Tapered-cosine ("Tukey") with taper fraction `alpha`: a flat top
+    /// over the central `(1-alpha)` of the block with cosine ramps over
+    /// the outer `alpha`. With a small `alpha` it keeps almost the whole
+    /// block at full weight (good for transient-light blocks where edge
+    /// energy still matters) while smoothing the discontinuity at the
+    /// block boundary that an un-windowed autocorrelation would alias.
+    Tukey { alpha_num: u32, alpha_den: u32 },
+}
+
+/// The windows the per-subframe LPC search evaluates, in priority order
+/// (ties are broken toward the earlier entry, which keeps the historical
+/// Welch result when nothing beats it). Three windows with materially
+/// different leakage / edge-energy trade-offs cover the common cases
+/// without ballooning the per-frame solve count: Welch (centre-heavy,
+/// the prior default), Hann (low leakage), and a shallow Tukey(1/4)
+/// (mostly flat, light edge smoothing).
+const APODIZATION_WINDOWS: [ApodizationWindow; 3] = [
+    ApodizationWindow::Welch,
+    ApodizationWindow::Hann,
+    ApodizationWindow::Tukey {
+        alpha_num: 1,
+        alpha_den: 4,
+    },
+];
+
+impl ApodizationWindow {
+    /// Window weight at sample index `i` of an `n`-sample block. All
+    /// windows are symmetric and normalised to peak at 1.0 in the
+    /// centre, so they only re-weight the signal (Levinson-Durbin is
+    /// scale-invariant in the coefficients it produces). For `n <= 1`
+    /// every weight is 1.0 (degenerate block; the LPC path bails out
+    /// earlier anyway).
+    fn weight(self, i: usize, n: usize) -> f64 {
+        if n <= 1 {
+            return 1.0;
+        }
+        let last = (n - 1) as f64;
+        match self {
+            ApodizationWindow::Welch => {
+                let half = last / 2.0;
+                let x = (i as f64 - half) / (half + 1.0);
+                1.0 - x * x
+            }
+            ApodizationWindow::Hann => {
+                let t = i as f64 / last;
+                0.5 - 0.5 * (2.0 * std::f64::consts::PI * t).cos()
+            }
+            ApodizationWindow::Tukey {
+                alpha_num,
+                alpha_den,
+            } => {
+                let alpha = alpha_num as f64 / alpha_den as f64;
+                if alpha <= 0.0 {
+                    return 1.0; // rectangular
+                }
+                let alpha = alpha.min(1.0);
+                let t = i as f64 / last; // in [0, 1]
+                let edge = alpha / 2.0;
+                if t < edge {
+                    0.5 * (1.0 + (std::f64::consts::PI * (t / edge - 1.0)).cos())
+                } else if t <= 1.0 - edge {
+                    1.0
+                } else {
+                    0.5 * (1.0 + (std::f64::consts::PI * ((t - 1.0) / edge + 1.0)).cos())
+                }
+            }
+        }
+    }
+}
+
 /// Choose the upper bound on LPC coefficient precision for a subframe of
 /// `block_len` samples. A larger block amortises the per-coefficient
 /// storage cost over more residual samples, so it can afford — and
@@ -743,34 +836,51 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
 }
 
 /// Build the smallest LPC subframe for `samples` at the given `order`,
-/// searching the coefficient precision over a small window beneath the
-/// block-size heuristic and keeping whichever precision encodes fewest
-/// bits. Higher precision shrinks the residual (the quantised
-/// coefficients track their floating-point ideals more closely) but
-/// spends `precision` extra bits per coefficient; the flip point depends
-/// on the signal, so the only reliable choice is to encode the
-/// candidates and compare actual sizes. The Levinson-Durbin solve is
-/// done once and reused across every candidate precision — only the
-/// quantise + residual + write passes repeat. RFC 9639 §9.2.6.
+/// searching both the analysis window (Welch / Hann / Tukey) **and** the
+/// coefficient precision and keeping whichever combination encodes fewest
+/// bits.
+///
+/// The window is an encoder-only analysis choice with no decoder-side
+/// footprint (RFC 9639 ties down only the quantised coefficients,
+/// precision, and shift that reach the bitstream), so each window yields
+/// its own Levinson-Durbin solution; a window that better matches the
+/// signal's spectrum produces coefficients that predict more tightly and
+/// shrink the residual. Precision is then searched over a small window
+/// beneath the block-size heuristic: higher precision tracks the
+/// floating-point ideals more closely (smaller residual) but spends
+/// `precision` extra bits per coefficient, and the flip point is
+/// signal-dependent, so the only reliable choice is to encode the
+/// candidates and compare actual sizes. The Levinson-Durbin solve runs
+/// once per window and is reused across every candidate precision for
+/// that window — only the quantise + residual + write passes repeat.
+/// Ties break toward the earlier window in `APODIZATION_WINDOWS`, so the
+/// historical Welch result is preserved whenever nothing strictly beats
+/// it. RFC 9639 §9.2.6.
 fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Option<SubframePlan> {
     let n = samples.len();
     if n <= order {
         return None;
     }
-    let coeffs_f = levinson_durbin(samples, order)?;
     let ceiling = lpc_precision_for(n);
     let floor = ceiling.saturating_sub(LPC_PRECISION_SEARCH_SPAN);
     let floor = floor.max(MIN_LPC_QLP_PRECISION);
 
     let mut best: Option<SubframePlan> = None;
-    for precision in floor..=ceiling {
-        if let Some(plan) = encode_lpc_plan_at(samples, bps, order, wasted, &coeffs_f, precision) {
-            let better = match &best {
-                Some(b) => plan.bits < b.bits,
-                None => true,
-            };
-            if better {
-                best = Some(plan);
+    for &window in APODIZATION_WINDOWS.iter() {
+        let Some(coeffs_f) = levinson_durbin(samples, order, window) else {
+            continue;
+        };
+        for precision in floor..=ceiling {
+            if let Some(plan) =
+                encode_lpc_plan_at(samples, bps, order, wasted, &coeffs_f, precision)
+            {
+                let better = match &best {
+                    Some(b) => plan.bits < b.bits,
+                    None => true,
+                };
+                if better {
+                    best = Some(plan);
+                }
             }
         }
     }
@@ -1052,21 +1162,21 @@ fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
 /// (zero energy or non-finite intermediate values). The first
 /// coefficient corresponds to `samples[n-1]`, following FLAC's
 /// convention.
-fn levinson_durbin(samples: &[i32], order: usize) -> Option<Vec<f64>> {
+fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> Option<Vec<f64>> {
     let n = samples.len();
     if n <= order || order == 0 {
         return None;
     }
 
-    // Welch window — smooth enough to reduce spectral leakage while
-    // preserving enough energy in the centre that short blocks still
-    // produce stable coefficients.
+    // Taper the block with the requested analysis window before computing
+    // the autocorrelation. The window only re-weights the signal — it has
+    // no decoder-side footprint (the decoder reads quantised coefficients,
+    // never the window) — so trying several and keeping the smallest
+    // result is a pure rate optimisation. RFC 9639 leaves the
+    // autocorrelation-to-coefficient step to the encoder.
     let mut windowed: Vec<f64> = Vec::with_capacity(n);
-    let half = (n - 1) as f64 / 2.0;
     for (i, &s) in samples.iter().enumerate() {
-        let x = (i as f64 - half) / (half + 1.0);
-        let w = 1.0 - x * x;
-        windowed.push(s as f64 * w);
+        windowed.push(s as f64 * window.weight(i, n));
     }
 
     let mut autoc = vec![0.0f64; order + 1];
@@ -1583,13 +1693,17 @@ mod tests {
         let ceiling = lpc_precision_for(n);
         for samples in &signals {
             for order in 1..=MAX_LPC_ORDER.min(n - 1) {
-                let coeffs = match levinson_durbin(samples, order) {
+                // Old behaviour: a single plan at the heuristic precision
+                // under the historical Welch window.
+                let coeffs = match levinson_durbin(samples, order, ApodizationWindow::Welch) {
                     Some(c) => c,
                     None => continue,
                 };
-                // Old behaviour: a single plan at the heuristic precision.
                 let fixed = encode_lpc_plan_at(samples, 16, order, 0, &coeffs, ceiling);
-                // New behaviour: the precision search.
+                // New behaviour: the precision + window search. Because
+                // Welch is one of the searched windows and the heuristic
+                // ceiling is one of the searched precisions, the new plan
+                // can only ever tie or beat the Welch-at-ceiling plan.
                 let searched = encode_lpc_plan(samples, 16, order, 0);
                 match (fixed, searched) {
                     (Some(f), Some(s)) => assert!(
@@ -1635,7 +1749,11 @@ mod tests {
             samples.push(tone as i32 + noise);
         }
         let order = 12usize;
-        let coeffs = levinson_durbin(&samples, order).expect("coeffs");
+        // Pin this analysis to the historical Welch window so the
+        // precision-search assertion is independent of the window search;
+        // the driver may additionally pick a different window, which can
+        // only shrink the result further (asserted below).
+        let coeffs = levinson_durbin(&samples, order, ApodizationWindow::Welch).expect("coeffs");
         let ceiling = lpc_precision_for(n);
         let floor = ceiling
             .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
@@ -1644,8 +1762,7 @@ mod tests {
         let ceiling_plan = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, ceiling)
             .expect("ceiling plan")
             .bits;
-        // The minimum across the search window — what encode_lpc_plan
-        // ought to settle on for this order.
+        // The minimum across the precision window for the Welch coeffs.
         let mut window_min = u64::MAX;
         let mut window_argmin = ceiling;
         for p in floor..=ceiling {
@@ -1664,13 +1781,14 @@ mod tests {
             window_min < ceiling_plan,
             "search min {window_min} bits should beat the ceiling plan {ceiling_plan} bits"
         );
-        // And the driver actually returns that minimum for this order.
+        // The driver searches windows too, so its result is at most the
+        // Welch-window precision minimum (a different window may beat it).
         let driven = encode_lpc_plan(&samples, 16, order, 0)
             .expect("driven plan")
             .bits;
-        assert_eq!(
-            driven, window_min,
-            "encode_lpc_plan should return the window minimum"
+        assert!(
+            driven <= window_min,
+            "encode_lpc_plan {driven} bits should be <= the Welch-window minimum {window_min}"
         );
     }
 
@@ -1693,7 +1811,7 @@ mod tests {
             samples.push(v as i32);
         }
         let order = 8usize;
-        let coeffs = levinson_durbin(&samples, order).unwrap();
+        let coeffs = levinson_durbin(&samples, order, ApodizationWindow::Welch).unwrap();
 
         let residual_bits_at = |precision: u32| -> u64 {
             let (q, shift) = quantize_lpc(&coeffs, precision).unwrap();
@@ -1893,22 +2011,39 @@ mod tests {
             .map(|&v| v.clamp(-30_000.0, 30_000.0) as i32)
             .collect();
 
-        let mut best_low: u64 = u64::MAX;
-        for order in 1..=8usize {
-            if let Some(p) = encode_lpc_plan(&samples, 16, order, 0) {
-                best_low = best_low.min(p.bits);
+        // Isolate the order-cap question from the apodization-window
+        // search by pinning both order ranges to a single window (Welch).
+        // This is the same baseline this test used before the encoder
+        // grew a window search, so the AR(11) signal continues to
+        // demonstrate that orders 9..=12 strictly beat orders 1..=8 on
+        // content engineered to need a longer impulse response. The
+        // window search runs in addition on top in the production path,
+        // and can only shrink either side further (verified separately).
+        let welch_min_over = |orders: std::ops::RangeInclusive<usize>| -> u64 {
+            let mut best = u64::MAX;
+            for order in orders {
+                let Some(coeffs) = levinson_durbin(&samples, order, ApodizationWindow::Welch)
+                else {
+                    continue;
+                };
+                let ceiling = lpc_precision_for(n);
+                let floor = ceiling
+                    .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+                    .max(MIN_LPC_QLP_PRECISION);
+                for p in floor..=ceiling {
+                    if let Some(plan) = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, p) {
+                        best = best.min(plan.bits);
+                    }
+                }
             }
-        }
-        let mut best_high: u64 = u64::MAX;
-        for order in 9..=MAX_LPC_ORDER {
-            if let Some(p) = encode_lpc_plan(&samples, 16, order, 0) {
-                best_high = best_high.min(p.bits);
-            }
-        }
+            best
+        };
+        let best_low = welch_min_over(1..=8);
+        let best_high = welch_min_over(9..=MAX_LPC_ORDER);
         assert!(
             best_high < best_low,
-            "expected order 9..=12 to beat order 1..=8 on an AR(11) signal, \
-             got best_high={best_high} best_low={best_low}"
+            "expected order 9..=12 to beat order 1..=8 on an AR(11) signal \
+             (Welch-pinned baseline), got best_high={best_high} best_low={best_low}"
         );
     }
 
@@ -1967,5 +2102,195 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Apodization-window search.
+    // ------------------------------------------------------------------
+
+    /// Welch / Hann / Tukey weight curves are symmetric, peak at 1.0 in
+    /// the centre (or near it), and are non-negative on `[0, N-1]`. A
+    /// regression here would skew the autocorrelation and silently
+    /// distort the LPC coefficients.
+    #[test]
+    fn apodization_windows_are_well_formed() {
+        let n = 1024usize;
+        for window in APODIZATION_WINDOWS.iter().copied() {
+            for i in 0..n {
+                let w = window.weight(i, n);
+                assert!(
+                    w.is_finite() && (-1e-9..=1.0 + 1e-9).contains(&w),
+                    "{window:?} weight at {i}/{n} out of range: {w}"
+                );
+                // Symmetry: w[i] == w[N-1-i].
+                let mirror = window.weight(n - 1 - i, n);
+                assert!(
+                    (w - mirror).abs() < 1e-12,
+                    "{window:?} not symmetric at {i}: {w} vs {mirror}"
+                );
+            }
+            // Centre weight: Hann's `1 - cos(pi)` lands exactly on 1.0
+            // when N is even; Tukey's flat top is exactly 1.0; Welch
+            // peaks at `1 - (0.5 / (half + 1))^2` for an even-length
+            // block (the formula's denominator is `half + 1`, not
+            // `half`, to avoid zeroing the endpoints), which can sit a
+            // few ulp below 1.0 on a large block. The actual constraint
+            // is just "very near 1.0".
+            let centre = window.weight(n / 2, n);
+            assert!(
+                (centre - 1.0).abs() < 1e-3,
+                "{window:?} centre weight {centre} should be ~1.0"
+            );
+        }
+    }
+
+    /// Adding the window search to `encode_lpc_plan` must never inflate
+    /// the LPC subframe: Welch is in the search set and the historical
+    /// behaviour was Welch-only, so the new path can only tie or beat
+    /// the old per-order plan. Cross-checked across a variety of
+    /// signals and every LPC order.
+    #[test]
+    fn window_search_never_regresses_against_welch_only() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let mk = |a: f64, fa: f64, b: f64, fb: f64| -> Vec<i32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / sr as f64;
+                    let v = (t * fa * 2.0 * std::f64::consts::PI).sin() * a
+                        + (t * fb * 2.0 * std::f64::consts::PI).sin() * b;
+                    v as i32
+                })
+                .collect()
+        };
+        let signals = [
+            mk(20_000.0, 440.0, 0.0, 0.0),
+            mk(18_000.0, 523.25, 4_000.0, 1567.98),
+            mk(9_000.0, 110.0, 9_000.0, 6_000.0),
+            mk(15_000.0, 220.0, 8_000.0, 660.0),
+        ];
+
+        let welch_only_min = |samples: &[i32], order: usize| -> Option<u64> {
+            let coeffs = levinson_durbin(samples, order, ApodizationWindow::Welch)?;
+            let ceiling = lpc_precision_for(samples.len());
+            let floor = ceiling
+                .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+                .max(MIN_LPC_QLP_PRECISION);
+            let mut best = u64::MAX;
+            for p in floor..=ceiling {
+                if let Some(plan) = encode_lpc_plan_at(samples, 16, order, 0, &coeffs, p) {
+                    best = best.min(plan.bits);
+                }
+            }
+            (best != u64::MAX).then_some(best)
+        };
+
+        for samples in &signals {
+            for order in 1..=MAX_LPC_ORDER.min(n - 1) {
+                let Some(welch) = welch_only_min(samples, order) else {
+                    continue;
+                };
+                let searched = encode_lpc_plan(samples, 16, order, 0)
+                    .expect("driver plan exists where Welch plan does")
+                    .bits;
+                assert!(
+                    searched <= welch,
+                    "order {order}: window search {searched} bits > Welch-only {welch} bits"
+                );
+            }
+        }
+    }
+
+    /// A signal whose spectral leakage hurts the Welch autocorrelation
+    /// the most — closely-spaced partials near the block-rate
+    /// fundamental — should benefit from the lower-leakage Hann window.
+    /// We construct such a signal and assert the full window search
+    /// strictly beats the Welch-only baseline for at least one LPC
+    /// order, demonstrating the window search isn't a no-op.
+    #[test]
+    fn window_search_beats_welch_on_leakage_sensitive_signal() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        // Two partials so close in frequency they bleed into each
+        // other's autocorrelation bins under a centre-heavy Welch
+        // window. With a flatter-passband Hann window the leakage
+        // shrinks and the LPC fit tightens.
+        let mut samples: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = (t * 4000.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                + (t * 4050.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                + (t * 11_017.0 * 2.0 * std::f64::consts::PI).sin() * 4_000.0;
+            samples.push(v as i32);
+        }
+
+        let welch_only_min = |order: usize| -> Option<u64> {
+            let coeffs = levinson_durbin(&samples, order, ApodizationWindow::Welch)?;
+            let ceiling = lpc_precision_for(samples.len());
+            let floor = ceiling
+                .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+                .max(MIN_LPC_QLP_PRECISION);
+            let mut best = u64::MAX;
+            for p in floor..=ceiling {
+                if let Some(plan) = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, p) {
+                    best = best.min(plan.bits);
+                }
+            }
+            (best != u64::MAX).then_some(best)
+        };
+
+        // For each order, compare the window-search result to the
+        // Welch-only minimum; at least one order must strictly win.
+        let mut any_strict_win = false;
+        let mut welch_total: u64 = 0;
+        let mut search_total: u64 = 0;
+        for order in 1..=MAX_LPC_ORDER {
+            let Some(welch) = welch_only_min(order) else {
+                continue;
+            };
+            let searched = encode_lpc_plan(&samples, 16, order, 0)
+                .expect("driver plan exists")
+                .bits;
+            welch_total += welch;
+            search_total += searched;
+            if searched < welch {
+                any_strict_win = true;
+            }
+        }
+        assert!(
+            any_strict_win,
+            "window search did not beat Welch-only on any order \
+             (welch_total={welch_total}, search_total={search_total}) — \
+             apodization search isn't being exercised by this signal"
+        );
+        assert!(
+            search_total < welch_total,
+            "window search summed across orders ({search_total}) did not beat \
+             Welch-only ({welch_total}) on leakage-sensitive content"
+        );
+    }
+
+    /// `best_subframe` integrates the window search through the full
+    /// per-channel-assignment pipeline. Encoding a stereo signal whose
+    /// frame-level encode benefits from the window search must still
+    /// round-trip bit-exactly through this crate's own decoder — the
+    /// search is a pure rate optimisation, never a correctness change.
+    #[test]
+    fn apodization_search_roundtrip_full_frame() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        // Same leakage-sensitive content, stereo with a slight L/R
+        // amplitude differential so channel decorrelation is also in
+        // play. The point is end-to-end bit-exactness.
+        let mut l: Vec<i32> = Vec::with_capacity(n);
+        let mut r: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let v = (t * 4000.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                + (t * 4050.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0;
+            l.push(v as i32);
+            r.push((v * 0.87) as i32);
+        }
+        roundtrip(vec![l, r], sr, 16);
     }
 }

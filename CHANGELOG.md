@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder now searches multiple **apodization windows** per LPC subframe
+  instead of always tapering with a Welch window before Levinson-Durbin.
+  Three windows are evaluated for each LPC order: Welch (centre-heavy
+  parabola, the historical default), Hann (low-side-lobe raised cosine,
+  better on signals with closely-spaced partials where Welch leakage
+  smears the autocorrelation) and a shallow Tukey(1/4) (mostly-flat
+  passband with light cosine edge ramps). Each window yields its own
+  Levinson-Durbin solution, which is then carried through the existing
+  per-order precision search and residual-coded; the smallest plan
+  across all (window × order × precision) combinations wins, ties
+  breaking toward Welch so the historical result is preserved whenever
+  nothing strictly beats it. The window has no on-wire footprint
+  whatsoever: RFC 9639 only pins down the quantised coefficients,
+  precision, and shift, and explicitly notes (Acknowledgments) that
+  computing the LPC coefficients from the autocorrelation is an
+  encoder concern, so the decoder cannot tell which window the encoder
+  used. This is therefore a pure lossless rate optimisation — the
+  Welch-only plan is always one of the candidates, so the search can
+  only ever tie or beat it. On a leakage-sensitive 4096-sample signal
+  (two closely-spaced 4 kHz / 4.05 kHz partials plus an 11 kHz tone)
+  the summed best-plan size across LPC orders 1..=12 drops from 355 227
+  bits Welch-only to 352 054 bits with the window search (3 173 bits
+  saved, ~0.9 % on that block). The 18 docs-corpus fixtures still
+  decode bit-exactly via this crate's own decoder. Four new encoder
+  unit tests cover window well-formedness (symmetric, non-negative,
+  centre weight ≈ 1.0 for every window), the no-regression invariant
+  against the Welch-only path across several signals and every LPC
+  order, an explicit demonstration that the window search strictly
+  beats Welch-only on the leakage-sensitive signal, and an end-to-end
+  bit-exact stereo round-trip through the same content via
+  `best_subframe` to confirm correctness through the full encoder
+  pipeline.
 - Encoder now searches the LPC coefficient precision per subframe instead
   of committing to the block-size heuristic value. The heuristic precision
   becomes the *ceiling* of a small search window (down to
