@@ -211,8 +211,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CUESHEET is non-fatal — the demuxer drops it and returns an empty
   chapter list, so existing CUESHEET-less files keep working
   unchanged.
-- `fuzz/` cargo-fuzz scaffold with three targets:
+- `fuzz/` cargo-fuzz scaffold with four targets:
   - `panic_free_decode` (panic-freedom of the demuxer + decoder pipeline)
+  - `decode` (sibling-shape, mirrors `oxideav-tta`/`oxideav-bmp`/
+    `oxideav-qoi`: one entry that funnels arbitrary bytes through
+    every pure-`Result` metadata parser — `BlockHeader::parse`,
+    `StreamInfo::parse`, `parse_seektable`, `parse_cuesheet`,
+    `parse_frame_header` — and the full demux+decode pipeline;
+    seeded from the 18 `docs/audio/flac/fixtures/` files so
+    libFuzzer starts with real-coverage input. 60-second local
+    run hit ~60 k execs / 0 crashes / 0 OOMs with coverage
+    reaching `CueSheetTrack` drop glue.)
   - `roundtrip` (random PCM through encoder→decoder, expect bit-exact)
   - `flac_oracle_decode` (cross-validate decoded PCM against
     libavcodec's FLAC decoder, loaded via `libloading`)

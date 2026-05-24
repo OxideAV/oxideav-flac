@@ -203,6 +203,37 @@ non-Subset):
   silently corrupt the table on the next parse pass. Round-trips
   through `parse_seektable` byte-for-byte.
 
+## Fuzzing
+
+`fuzz/` carries four `cargo-fuzz` targets that all share the same
+panic-freedom contract — every public surface must return a `Result`
+on malformed input, never panic, abort, or OOM:
+
+- **`panic_free_decode`** — feeds arbitrary bytes through the
+  container demuxer and, separately, through the raw decoder with a
+  synthetic STREAMINFO header (so the decoder is configured but the
+  packet bytes are attacker-controlled).
+- **`decode`** — sibling-shape (mirrors `oxideav-tta` /
+  `oxideav-bmp` / `oxideav-qoi`): one entry that funnels each input
+  through every pure-`Result` metadata parser
+  (`metadata::BlockHeader::parse`, `metadata::StreamInfo::parse`,
+  `metadata::parse_seektable`, `metadata::parse_cuesheet`,
+  `frame::parse_frame_header`) and the full demux+decode pipeline.
+  Cheap per iteration; seeded from the 18 `docs/audio/flac/fixtures/`
+  files so libFuzzer starts with real-coverage input.
+- **`roundtrip`** — random PCM → encoder → decoder, asserting
+  bit-exact recovery (FLAC is lossless).
+- **`flac_oracle_decode`** — uses the encoder to synthesise a valid
+  FLAC stream, then cross-decodes through both `oxideav-flac` and
+  `libavcodec` (loaded via `libloading`); requires no `*-sys`
+  dependency and skips silently when the system library is absent.
+
+Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
+historical wins from the harnesses include the
+`subframe::decode_subframe` bps-bound fix (`bps == 0 / bps > 32` now
+returns `Error::Unsupported` instead of panicking inside
+`BitReader::read_i32`).
+
 ## Codec / container IDs
 
 - Codec: `"flac"`; accepted sample formats `U8`, `S16`, `S24`, `S32`.

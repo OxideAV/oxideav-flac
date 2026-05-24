@@ -75,3 +75,17 @@ name = "flac_oracle_decode"
 path = "fuzz_targets/flac_oracle_decode.rs"
 test = false
 doc = false
+
+# Target 4: panic-free decode entry, sibling-shape (ico/qoi/bmp/tta).
+# A single libfuzzer entry that funnels arbitrary bytes through every
+# pure-`Result` public parser (`BlockHeader::parse`,
+# `StreamInfo::parse`, `parse_seektable`, `parse_cuesheet`,
+# `parse_frame_header`) AND the full demux+decode pipeline. Overlaps
+# with `panic_free_decode` on the pipeline path but covers the
+# direct-API parsers it didn't reach. Cheap per iteration so the
+# scheduler can keep it warm alongside the heavier targets.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
