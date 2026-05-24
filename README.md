@@ -116,15 +116,20 @@ non-Subset):
   as the conventional moderate-quality ceiling. Orders 9..=12 are
   silently discarded when shorter taps already win, so the lift only
   helps content with broader autocorrelation support. LPC coefficient
-  precision is chosen per subframe from the block size — a larger
-  block amortises the coefficient cost over more residual samples, so
-  it earns more precision (rising with `log2(block_len)`, clamped to
-  the legal `[5, 15]` window; RFC 9639 §9.2.6 forbids the 16-bit
-  `0b1111` encoding). The default 4096-sample frame quantises at the
-  15-bit ceiling, keeping coefficients closer to their floating-point
-  ideals and shrinking the residual. The output remains fully valid
-  and fully lossless — any compliant decoder (including this crate's
-  own) will recover the original PCM bit-exactly.
+  precision is **searched** per subframe: a block-size heuristic sets
+  the search ceiling (rising with `log2(block_len)`, clamped to the
+  legal `[5, 15]` window; RFC 9639 §9.2.6 forbids the 16-bit `0b1111`
+  encoding), and each LPC order is quantised and residual-coded at
+  every precision in a small window beneath that ceiling, keeping
+  whichever encodes fewest bits. Higher precision keeps coefficients
+  closer to their floating-point ideals and shrinks the residual, but
+  costs `order` extra bits per step; the flip point depends on the
+  signal, so the only reliable choice is to encode the candidates and
+  compare. The previous ceiling-only behaviour is always one of the
+  candidates, so the search can only tie or beat it. The output
+  remains fully valid and fully lossless — any compliant decoder
+  (including this crate's own) will recover the original PCM
+  bit-exactly.
 - **Wasted bits per sample**: detected per subframe (largest `k`
   such that every sample is divisible by `2^k`) and folded into the
   spec's wasted-bits unary header. This shaves the trailing-zero

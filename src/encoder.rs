@@ -2,10 +2,12 @@
 //!
 //! Produces valid FLAC streams that decode bit-exactly via any compliant
 //! decoder. Per-subframe the encoder tries CONSTANT, FIXED orders 0..=4,
-//! LPC orders 1..=8 and VERBATIM, and picks the smallest. LPC coefficient
-//! precision is chosen per subframe from the block size (larger blocks
-//! amortise the coefficient cost, so they get more precision, up to the
-//! spec's 15-bit ceiling). For stereo
+//! LPC orders 1..=12 and VERBATIM, and picks the smallest. Each LPC order
+//! additionally searches the coefficient precision over a small window
+//! beneath a block-size-derived ceiling (larger blocks amortise the
+//! coefficient cost, so the ceiling rises with `log2(block_len)` up to
+//! the spec's 15-bit limit) and keeps whichever precision encodes fewest
+//! bits. For stereo
 //! inputs it evaluates independent L/R alongside the three decorrelated
 //! layouts (left-side, right-side, mid-side) and keeps the smallest
 //! total. Each subframe's residual is partitioned-Rice coded with a full
@@ -49,14 +51,32 @@ const MAX_LPC_QLP_PRECISION: u32 = 15;
 /// quantisation error tends to swell the residual faster than the
 /// coefficient field shrinks.
 const MIN_LPC_QLP_PRECISION: u32 = 5;
+/// How many precisions below the block-size heuristic the per-subframe
+/// search will additionally evaluate. The heuristic value is the
+/// search window's *ceiling* (the conservative "as much precision as
+/// the block can amortise" choice), and the search tries each precision
+/// down to `heuristic - LPC_PRECISION_SEARCH_SPAN`, clamped at
+/// `MIN_LPC_QLP_PRECISION`. RFC 9639 §9.2.6 leaves the precision a free
+/// encoder parameter (it is written verbatim into `qlp_precis` and read
+/// back at that width), so picking it per subframe is purely a
+/// rate decision: a coefficient field that buys more residual reduction
+/// than its extra bits cost is kept, otherwise a narrower field wins.
+/// A span of 4 keeps the extra encode work bounded (at most five
+/// quantise+residual passes per LPC order) while covering the band where
+/// the coefficient-vs-residual trade-off actually flips for typical
+/// content.
+const LPC_PRECISION_SEARCH_SPAN: u32 = 4;
 
-/// Choose the LPC coefficient precision for a subframe of `block_len`
-/// samples. A larger block amortises the per-coefficient storage cost
-/// over more residual samples, so it can afford — and benefits from —
-/// higher precision; a short block keeps precision low so the warm-up
-/// plus coefficient overhead doesn't dominate. The precision rises with
-/// `log2(block_len)` and is clamped to the legal `[MIN, MAX]` window.
-/// RFC 9639 §9.2.6 caps the on-wire precision at 15.
+/// Choose the upper bound on LPC coefficient precision for a subframe of
+/// `block_len` samples. A larger block amortises the per-coefficient
+/// storage cost over more residual samples, so it can afford — and
+/// usually benefits from — higher precision; a short block keeps
+/// precision low so the warm-up plus coefficient overhead doesn't
+/// dominate. The precision rises with `log2(block_len)` and is clamped
+/// to the legal `[MIN, MAX]` window. RFC 9639 §9.2.6 caps the on-wire
+/// precision at 15. This is the *ceiling* of the per-subframe search in
+/// `encode_lpc_plan`, which may settle on a lower value if it encodes
+/// smaller.
 fn lpc_precision_for(block_len: usize) -> u32 {
     // `bits` ≈ floor(log2(block_len)); a 4096-sample block gives 12,
     // which lands precision at 15 (the legal ceiling). Tiny blocks
@@ -722,14 +742,56 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
     ))
 }
 
+/// Build the smallest LPC subframe for `samples` at the given `order`,
+/// searching the coefficient precision over a small window beneath the
+/// block-size heuristic and keeping whichever precision encodes fewest
+/// bits. Higher precision shrinks the residual (the quantised
+/// coefficients track their floating-point ideals more closely) but
+/// spends `precision` extra bits per coefficient; the flip point depends
+/// on the signal, so the only reliable choice is to encode the
+/// candidates and compare actual sizes. The Levinson-Durbin solve is
+/// done once and reused across every candidate precision — only the
+/// quantise + residual + write passes repeat. RFC 9639 §9.2.6.
 fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Option<SubframePlan> {
     let n = samples.len();
     if n <= order {
         return None;
     }
     let coeffs_f = levinson_durbin(samples, order)?;
-    let precision = lpc_precision_for(n);
-    let (qcoeffs, qlp_shift) = quantize_lpc(&coeffs_f, precision)?;
+    let ceiling = lpc_precision_for(n);
+    let floor = ceiling.saturating_sub(LPC_PRECISION_SEARCH_SPAN);
+    let floor = floor.max(MIN_LPC_QLP_PRECISION);
+
+    let mut best: Option<SubframePlan> = None;
+    for precision in floor..=ceiling {
+        if let Some(plan) = encode_lpc_plan_at(samples, bps, order, wasted, &coeffs_f, precision) {
+            let better = match &best {
+                Some(b) => plan.bits < b.bits,
+                None => true,
+            };
+            if better {
+                best = Some(plan);
+            }
+        }
+    }
+    best
+}
+
+/// Build one LPC subframe at a fixed coefficient `precision` from
+/// already-computed floating-point coefficients `coeffs_f`. Returns
+/// `None` if the coefficients can't be quantised at this precision or a
+/// residual overflows the 32-bit signed window required by RFC 9639
+/// §9.2.7.
+fn encode_lpc_plan_at(
+    samples: &[i32],
+    bps: u32,
+    order: usize,
+    wasted: u32,
+    coeffs_f: &[f64],
+    precision: u32,
+) -> Option<SubframePlan> {
+    let n = samples.len();
+    let (qcoeffs, qlp_shift) = quantize_lpc(coeffs_f, precision)?;
 
     let mut residuals = Vec::with_capacity(n - order);
     for i in order..n {
@@ -1494,6 +1556,124 @@ mod tests {
         assert_eq!(lpc_precision_for(1), MIN_LPC_QLP_PRECISION);
     }
 
+    /// The per-subframe precision search must never produce a larger LPC
+    /// plan than the previous fixed-heuristic-precision behaviour: the
+    /// heuristic precision is the search window's ceiling and is always
+    /// one of the candidates, so the search can only tie it or beat it.
+    /// We assert this for every LPC order across a handful of signals.
+    #[test]
+    fn precision_search_never_regresses_against_fixed_heuristic() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let mk = |a: f64, fa: f64, b: f64, fb: f64| -> Vec<i32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f64 / sr as f64;
+                    let v = (t * fa * 2.0 * std::f64::consts::PI).sin() * a
+                        + (t * fb * 2.0 * std::f64::consts::PI).sin() * b;
+                    v as i32
+                })
+                .collect()
+        };
+        let signals = [
+            mk(20_000.0, 440.0, 0.0, 0.0),
+            mk(18_000.0, 523.25, 4_000.0, 1567.98),
+            mk(9_000.0, 110.0, 9_000.0, 6_000.0),
+        ];
+        let ceiling = lpc_precision_for(n);
+        for samples in &signals {
+            for order in 1..=MAX_LPC_ORDER.min(n - 1) {
+                let coeffs = match levinson_durbin(samples, order) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                // Old behaviour: a single plan at the heuristic precision.
+                let fixed = encode_lpc_plan_at(samples, 16, order, 0, &coeffs, ceiling);
+                // New behaviour: the precision search.
+                let searched = encode_lpc_plan(samples, 16, order, 0);
+                match (fixed, searched) {
+                    (Some(f), Some(s)) => assert!(
+                        s.bits <= f.bits,
+                        "order {order}: search {} bits > fixed-heuristic {} bits",
+                        s.bits,
+                        f.bits
+                    ),
+                    (None, _) => {} // heuristic plan itself failed; nothing to compare
+                    (Some(_), None) => {
+                        panic!("search returned None where the heuristic plan exists")
+                    }
+                }
+            }
+        }
+    }
+
+    /// A signal whose LPC residual is dominated by quantisation noise
+    /// (low-amplitude content where the coefficient field is a large
+    /// fraction of the subframe) lets a *narrower* precision win: the
+    /// few residual bits saved by the extra precision don't cover the
+    /// `order` extra coefficient bits per step. The search must find that
+    /// narrower precision and beat the heuristic-ceiling plan strictly.
+    #[test]
+    fn precision_search_beats_ceiling_on_coefficient_dominated_subframe() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        // Low-amplitude noisy-ish content: a quiet tone plus a small
+        // deterministic perturbation so the residual floor is set by
+        // quantisation rather than by a clean predictor fit. With the
+        // residual nearly incompressible, fatter coefficients are pure
+        // overhead.
+        let mut samples: Vec<i32> = Vec::with_capacity(n);
+        let mut state: u32 = 0x1234_5678;
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            let tone = (t * 300.0 * 2.0 * std::f64::consts::PI).sin() * 40.0;
+            // xorshift LCG perturbation, ±3 LSB.
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let noise = (state % 7) as i32 - 3;
+            samples.push(tone as i32 + noise);
+        }
+        let order = 12usize;
+        let coeffs = levinson_durbin(&samples, order).expect("coeffs");
+        let ceiling = lpc_precision_for(n);
+        let floor = ceiling
+            .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+            .max(MIN_LPC_QLP_PRECISION);
+
+        let ceiling_plan = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, ceiling)
+            .expect("ceiling plan")
+            .bits;
+        // The minimum across the search window — what encode_lpc_plan
+        // ought to settle on for this order.
+        let mut window_min = u64::MAX;
+        let mut window_argmin = ceiling;
+        for p in floor..=ceiling {
+            if let Some(plan) = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, p) {
+                if plan.bits < window_min {
+                    window_min = plan.bits;
+                    window_argmin = p;
+                }
+            }
+        }
+        assert!(
+            window_argmin < ceiling,
+            "expected a sub-ceiling precision to win; argmin was {window_argmin} (ceiling {ceiling})"
+        );
+        assert!(
+            window_min < ceiling_plan,
+            "search min {window_min} bits should beat the ceiling plan {ceiling_plan} bits"
+        );
+        // And the driver actually returns that minimum for this order.
+        let driven = encode_lpc_plan(&samples, 16, order, 0)
+            .expect("driven plan")
+            .bits;
+        assert_eq!(
+            driven, window_min,
+            "encode_lpc_plan should return the window minimum"
+        );
+    }
+
     /// Quantising at higher precision keeps the coefficients closer to
     /// their floating-point ideals, which shrinks the residual. For a
     /// clean predictable signal the residual saving should outweigh the
@@ -1539,9 +1719,12 @@ mod tests {
         );
     }
 
-    /// An LPC subframe encoded for a 4096-sample block must declare the
-    /// heuristic's precision (15) on the wire, read its coefficients at
-    /// that width, and still decode bit-exactly. This guards the
+    /// An LPC subframe encoded for a 4096-sample block must declare a
+    /// precision inside the legal search window on the wire, read its
+    /// coefficients at that width, and still decode bit-exactly. The
+    /// precision is no longer fixed to the heuristic ceiling — the
+    /// per-subframe search may settle lower — so we assert it lands in
+    /// the search band and never the forbidden `0b1111`. This guards the
     /// encoder/decoder agreement on the now-variable `qlp_precis` field.
     #[test]
     fn adaptive_precision_lpc_roundtrips_at_full_block() {
@@ -1554,8 +1737,8 @@ mod tests {
                 + (t * 1046.5 * 2.0 * std::f64::consts::PI).sin() * 7_000.0;
             samples.push(v as i32);
         }
-        // Confirm the chosen subframe is actually LPC at the full
-        // precision the heuristic picks for this block size.
+        // Confirm the chosen subframe is actually LPC and declares a
+        // precision the search is allowed to pick.
         let plan = best_subframe(&samples, 16).unwrap();
         // type byte: bit0=pad, bits1..7 = type code. LPC is 0b1xxxxx.
         let type_code = (plan.payload[0] >> 1) & 0x3F;
@@ -1563,7 +1746,49 @@ mod tests {
             type_code & 0b100000 != 0,
             "expected an LPC subframe for a predictable tone, got type {type_code:#08b}"
         );
+        // The on-wire precision must sit in the legal search band:
+        // [ceiling - span, ceiling], clamped to MIN, never 0b1111.
+        let ceiling = lpc_precision_for(n);
+        let floor = ceiling
+            .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+            .max(MIN_LPC_QLP_PRECISION);
+        let declared = declared_lpc_precision(&plan, 16, 0);
+        assert!(
+            (floor..=ceiling).contains(&declared),
+            "declared precision {declared} outside search band [{floor}, {ceiling}]"
+        );
+        assert!(declared < 16, "declared the forbidden precision 0b1111");
         roundtrip(vec![samples], sr, 16);
+    }
+
+    /// Decode the 4-bit `qlp_precis` field (stored as precision-1) from a
+    /// finished LPC `SubframePlan`. Walks the same prelude the encoder
+    /// wrote: 1 pad bit, 6 type bits, the wasted-bits unary group, then
+    /// `bps * order` warm-up bits, landing on the 4-bit precision field.
+    fn declared_lpc_precision(plan: &SubframePlan, bps: u32, wasted: u32) -> u32 {
+        let bytes = &plan.payload;
+        let read_bit = |pos: usize| -> u32 { (bytes[pos / 8] as u32 >> (7 - (pos % 8))) & 1 };
+        let read_bits = |start: usize, count: u32| -> u32 {
+            let mut v = 0u32;
+            for i in 0..count {
+                v = (v << 1) | read_bit(start + i as usize);
+            }
+            v
+        };
+        // 1 pad + 6 type bits.
+        let type_code = read_bits(1, 6);
+        // LPC: type is 0b1xxxxx, order-1 in the low 5 bits.
+        let order = (type_code & 0x1F) + 1;
+        // Wasted-bits group: 1 flag, plus `wasted` unary bits if nonzero.
+        let mut pos = 7;
+        let flag = read_bit(pos);
+        pos += 1;
+        if flag == 1 {
+            pos += wasted as usize; // unary group is exactly `wasted` bits.
+        }
+        // Warm-up samples, then the 4-bit precision field.
+        pos += (bps * order) as usize;
+        read_bits(pos, 4) + 1
     }
 
     /// Round-trip a stereo block engineered to favour partitioning: the

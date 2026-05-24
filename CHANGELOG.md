@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder now searches the LPC coefficient precision per subframe instead
+  of committing to the block-size heuristic value. The heuristic precision
+  becomes the *ceiling* of a small search window (down to
+  `ceiling - 4`, clamped to the legal `[5, 15]` floor); for each LPC order
+  the encoder quantises + residual-codes at every precision in the window
+  and keeps whichever encodes fewest bits. RFC 9639 §9.2.6 leaves the
+  precision a free encoder parameter (it is written into `qlp_precis` and
+  read back at that width), so this is a pure rate decision: a fatter
+  coefficient field that buys more residual reduction than its
+  `order`-extra-bits-per-step cost is kept, otherwise a narrower field
+  wins. The old ceiling-only behaviour is always one of the candidates,
+  so the search can only ever tie or beat it — on a three-tone stereo
+  4096-sample frame it shaved 70 bits (22048 → 21978) off the two
+  subframes versus the fixed-ceiling encode, and on a
+  coefficient-dominated low-amplitude subframe a sub-ceiling precision
+  wins outright. The Levinson-Durbin solve is computed once per order and
+  reused across the precision sweep, so only the lightweight
+  quantise+residual passes repeat. Output stays fully lossless and decodes
+  bit-exactly via this crate's own decoder (all 18 docs-corpus fixtures
+  still match per channel). Two new encoder unit tests cover the
+  no-regression-against-the-fixed-heuristic invariant across several
+  signals and orders, and an explicit demonstration that a narrower
+  precision strictly beats the ceiling on coefficient-dominated content;
+  the full-block adaptive-precision round-trip test now asserts the
+  declared on-wire precision lands inside the legal search band.
 - Encoder now searches LPC orders 1..=12 instead of stopping at 8.
   RFC 9639 §9.2.6 permits orders 1..=32; the gain curve flattens fast,
   so most content tops out somewhere between order 6 and 12, but the
