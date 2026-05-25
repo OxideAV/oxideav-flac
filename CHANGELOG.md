@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Criterion benchmarks** under `benches/{decode,encode,roundtrip}.rs`
+  for the FLAC encoder, decoder and full encode + decode roundtrip
+  paths. Each harness drives the public
+  `oxideav_flac::encoder::make_encoder` / `decoder::make_decoder` trait
+  objects (no internal-helper access) against deterministic xorshift-
+  synthesised PCM across four scenarios — mono S16 44.1 kHz 1 s, stereo
+  S16 44.1 kHz 1 s, stereo S24 48 kHz 0.5 s, and 6-channel S16 48 kHz
+  0.25 s — so future encoder rounds (e.g. partition-order early-exit,
+  apodization-window picker, LPC precision search heuristic) have a
+  baseline to A/B against without rerunning the entire docs corpus.
+  No committed fixture files; each scenario is self-contained and the
+  roundtrip bench additionally asserts the recovered byte count
+  matches the input so a state-machine drift would surface as a panic
+  in the bench output rather than silent miscompression. Run with
+  `cargo bench -p oxideav-flac --bench {decode,encode,roundtrip}`.
+  Pattern mirrors the cinepak (r126) and tta (r127) bench harnesses
+  so the per-codec numbers are directly comparable across the
+  workspace.
+
 ### Changed
 
 - Encoder now searches multiple **apodization windows** per LPC subframe

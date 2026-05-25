@@ -234,6 +234,33 @@ historical wins from the harnesses include the
 returns `Error::Unsupported` instead of panicking inside
 `BitReader::read_i32`).
 
+## Benchmarks
+
+`benches/` carries three `criterion` harnesses that drive the public
+`oxideav_flac::encoder::make_encoder` / `decoder::make_decoder` trait
+objects against deterministic xorshift-synthesised PCM. They exist so
+future encoder rounds (partition-order early-exit, apodization-window
+picker, LPC-precision search heuristic) have a stable baseline to
+A/B against without rerunning the full docs corpus:
+
+- **`encode`** — four scenarios (mono S16 44.1 kHz 1 s, stereo S16
+  44.1 kHz 1 s, stereo S24 48 kHz 0.5 s, 6-channel S16 48 kHz 0.25 s)
+  covering the heaviest encoder path: CONSTANT + FIXED 0..=4 + LPC
+  1..=12 + VERBATIM with per-subframe LPC-precision and apodization-
+  window search plus 0..=8 partition-order Rice search.
+- **`decode`** — same four scenarios on the decode-only side (the
+  encode step is outside the timed region; only `send_packet ->
+  receive_frame` is measured).
+- **`roundtrip`** — encode + decode back-to-back, with each iteration
+  asserting that the recovered byte count equals the input so a
+  state-machine drift would surface as a `panic!` in the bench
+  output rather than silent miscompression.
+
+No committed fixture files; PCM is synthesised in-bench. Run with
+`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip}`.
+The shape mirrors the cinepak / tta bench harnesses so numbers are
+directly comparable across the workspace.
+
 ## Codec / container IDs
 
 - Codec: `"flac"`; accepted sample formats `U8`, `S16`, `S24`, `S32`.
