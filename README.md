@@ -261,6 +261,52 @@ No committed fixture files; PCM is synthesised in-bench. Run with
 The shape mirrors the cinepak / tta bench harnesses so numbers are
 directly comparable across the workspace.
 
+## Profiling
+
+`examples/profile_flac.rs` is a flat measure-this-thing driver suited
+for `samply`, `perf record`, and `cargo flamegraph`. Criterion's
+warm-up + sampling layers + estimator math show up in a sampling
+profile and bury the real codec hot paths; the example is one
+`Instant::now()` / `elapsed()` pair around a fixed-iteration loop so
+the profile is dominated by encoder / decoder cost itself. Same four
+scenarios as the benches (mono S16 44.1 kHz 1 s, stereo S16 44.1 kHz
+1 s, stereo S24 48 kHz 0.5 s, 6-channel S16 48 kHz 0.25 s) so the
+profile output and bench numbers correspond.
+
+Usage:
+
+```text
+cargo run --example profile_flac --release -- <mode> [<iters>]
+# modes: encode | decode | roundtrip | all (default)
+```
+
+Driving it under `samply`:
+
+```text
+samply record -- ./target/release/examples/profile_flac encode 30
+samply record -- ./target/release/examples/profile_flac decode 100
+```
+
+Reference numbers on an M-series laptop (release build, default
+iteration count, single run — absolute MiB/s will vary by host but
+the encode-vs-decode shape is stable):
+
+| Path / scenario                          |  ms/iter |   MiB/s | Realtime |
+| ---------------------------------------- | -------: | ------: | -------: |
+| `decode    mono/s16/44k1/1s`             |     0.45 |   ~190  |  ~2230x  |
+| `decode    stereo/s16/44k1/1s`           |     1.10 |   ~150  |   ~910x  |
+| `decode    stereo/s24/48k/500ms`         |     0.67 |   ~205  |   ~745x  |
+| `decode    6ch/s16/48k/250ms`            |     0.74 |   ~190  |   ~340x  |
+| `encode    mono/s16/44k1/1s`             |     1468 |   ~0.06 |    0.7x  |
+| `encode    stereo/s16/44k1/1s`           |     5815 |   ~0.03 |    0.2x  |
+| `encode    stereo/s24/48k/500ms`         |     3708 |   ~0.04 |    0.1x  |
+| `encode    6ch/s16/48k/250ms`            |     2283 |   ~0.06 |    0.1x  |
+
+The decode path is comfortably realtime by orders of magnitude; the
+encode path's exhaustive LPC + apodization + partition-order search
+is the obvious next optimisation target (the per-subframe search
+trifecta noted in `benches/encode.rs`).
+
 ## Codec / container IDs
 
 - Codec: `"flac"`; accepted sample formats `U8`, `S16`, `S24`, `S32`.

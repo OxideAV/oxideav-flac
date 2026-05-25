@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Profiling driver** at `examples/profile_flac.rs` — a flat
+  `Instant::now()` / `elapsed()` measure-this-thing harness for
+  `samply` / `perf record` / `cargo flamegraph`. Criterion's warm-up
+  + sampling layers + estimator math dominate sampling profiles and
+  bury the real codec hot paths; this driver runs a fixed iteration
+  count over the same four scenarios the Criterion benches use
+  (mono S16 44.1 kHz 1 s, stereo S16 44.1 kHz 1 s, stereo S24 48 kHz
+  0.5 s, 6-channel S16 48 kHz 0.25 s), prints per-iteration ms +
+  MiB/s + realtime ratio, and (for encode) the achieved compression
+  ratio. Modes: `encode` / `decode` / `roundtrip` / `all`. Confirms
+  the workspace-wide pattern from the bench output: decode is
+  hundreds-of-x realtime (~190 MiB/s on a modern laptop), encode is
+  sub-realtime stereo (~0.04 MiB/s) — the per-subframe LPC +
+  apodization + partition-order search is the obvious next
+  optimisation target. PCM is synthesised in-driver from the same
+  deterministic xorshift32 seed the benches use; no fixture files.
 - **Criterion benchmarks** under `benches/{decode,encode,roundtrip}.rs`
   for the FLAC encoder, decoder and full encode + decode roundtrip
   paths. Each harness drives the public
