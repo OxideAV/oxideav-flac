@@ -1132,26 +1132,130 @@ fn raw_bits_needed(residuals: &[i32]) -> u32 {
     max_bits.min(32)
 }
 
+/// Score one Rice parameter `k` against `residuals` (already converted
+/// to their unsigned zigzag form by the caller). Returns the total bit
+/// count for the entire partition under that `k`. Aborts the inner sum
+/// as soon as it exceeds `best_bits`, matching the original brute-force
+/// implementation's early-exit shape so the closed-form estimate path
+/// never picks a `k` worse than the brute-force path would have.
+#[inline(always)]
+fn rice_cost_for_k(zigzag: &[u32], k: u32, best_bits: u64) -> u64 {
+    let n = zigzag.len() as u64;
+    let mut total: u64 = n * (1 + k as u64);
+    if total >= best_bits {
+        return total;
+    }
+    for &u in zigzag {
+        total += (u >> k) as u64;
+        if total >= best_bits {
+            return total;
+        }
+    }
+    total
+}
+
+/// Pick the Rice parameter `k` in `0..=k_max` that minimises the total
+/// bit cost of coding `residuals` as `unary(zigzag(r) >> k) || raw(k)`.
+/// RFC 9639 §9.2.5.
+///
+/// For residuals approximately Laplace-distributed (the working
+/// assumption for predictor-residual coding), the bit-optimal Rice
+/// parameter is `k ≈ floor(log2(E[|r|]))`, derivable from the partition
+/// payload `N * (1 + k) + (sum_u >> k)`: differentiating with respect to
+/// `k` and setting to zero gives `2^k ≈ sum_u / N` (within the floor /
+/// ceil rounding ambiguity). So instead of scoring every `k` in
+/// `0..=k_max` (up to 31 passes per partition), this implementation
+/// computes that estimate once from the unsigned sum, scores a small
+/// `[k_est-2 .. k_est+3]` window around it, and only extends past either
+/// end when the window's chosen edge could plausibly still improve.
+///
+/// Safety net: if the estimate-window's choice is at the lower boundary
+/// (k_est-2, where the brute-force scan might have found a strictly
+/// smaller k=0 cost on a degenerate, heavily-clipped residual block),
+/// we extend downward to 0 — and likewise upward toward `k_max` when
+/// the window's pick lands at the top. The aggregate score function is
+/// strictly unimodal in `k` for any non-empty residual block (cost is
+/// linear in `k` plus a sum-of-shifts term that is monotonically
+/// non-increasing), so the local minimum within the window plus
+/// directional extension is also the global minimum — the same `k` the
+/// brute-force loop would have returned, just at a fraction of the work.
 fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     if residuals.is_empty() {
         return (0, 0);
     }
-    let mut best_k = 0u32;
-    let mut best_bits = u64::MAX;
-    for k in 0..=k_max {
-        let mut total: u64 = 0;
-        for &r in residuals {
-            let u = zigzag_encode(r) as u64;
-            total += (u >> k) + 1 + k as u64;
-            if total >= best_bits {
-                break;
-            }
+    // Zigzag once instead of `k_max + 1` times inside the inner loop.
+    // For the typical partition (16..=1024 i32 residuals) the temporary
+    // Vec stays well inside cache, and removing the redundant work
+    // dominates the small allocation overhead.
+    let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+    let n = zigzag.len() as u64;
+    let sum_u: u64 = zigzag.iter().map(|&u| u as u64).sum();
+
+    // Closed-form estimate: `k_est = floor(log2(sum_u / n))`. The `sum_u
+    // == 0` case is the all-zero (post-predictor) partition where the
+    // optimal `k` is 0 — short-circuit so we don't run msb(0).
+    let k_est: u32 = if sum_u == 0 {
+        0
+    } else {
+        let mean_u = sum_u / n;
+        if mean_u == 0 {
+            0
+        } else {
+            // msb(mean_u) = 63 - leading_zeros; convert to u32.
+            63u32.saturating_sub(mean_u.leading_zeros())
         }
-        if total < best_bits {
-            best_bits = total;
+    };
+
+    // Centre the search window on the estimate, clamped to the legal
+    // `[0, k_max]` range. ±2 around the estimate is enough to absorb
+    // the floor / ceil rounding ambiguity in the closed-form derivation
+    // for the realistic Laplace assumption; the directional extension
+    // below recovers the remaining edge cases. When `k_est` falls
+    // outside `[0, k_max]` entirely (huge mean for the method-0
+    // `k_max = 14` partition, say) we still want the loop body to run
+    // at least once so `best_bits` becomes finite before the
+    // extension fires.
+    let lo = k_est.saturating_sub(2).min(k_max);
+    let hi = (k_est + 3).min(k_max);
+
+    let mut best_k = lo;
+    let mut best_bits = u64::MAX;
+    for k in lo..=hi {
+        let cost = rice_cost_for_k(&zigzag, k, best_bits);
+        if cost < best_bits {
+            best_bits = cost;
             best_k = k;
         }
     }
+
+    // The cost as a function of `k` is unimodal (linear `k` term plus a
+    // monotone-decreasing sum-of-shifts term). If the chosen `k` sits at
+    // the window edge, the true optimum could be further in that
+    // direction — walk outward while we keep improving. We never step
+    // past `k_max`, which is the spec-imposed parameter ceiling.
+    if best_k == lo && lo > 0 {
+        for k in (0..lo).rev() {
+            let cost = rice_cost_for_k(&zigzag, k, best_bits);
+            if cost < best_bits {
+                best_bits = cost;
+                best_k = k;
+            } else {
+                break;
+            }
+        }
+    }
+    if best_k == hi && hi < k_max {
+        for k in (hi + 1)..=k_max {
+            let cost = rice_cost_for_k(&zigzag, k, best_bits);
+            if cost < best_bits {
+                best_bits = cost;
+                best_k = k;
+            } else {
+                break;
+            }
+        }
+    }
+
     (best_bits, best_k)
 }
 
@@ -1629,6 +1733,119 @@ mod tests {
             emitted.div_ceil(8) as usize,
             "bit accounting mismatch: reported {emitted} bits"
         );
+    }
+
+    /// `best_rice_params` is a hot-path estimate-window optimisation
+    /// over an originally-brute-force `for k in 0..=k_max` scan. Its
+    /// safety net (extend outward when the chosen `k` sits at a window
+    /// edge) plus the convexity of `cost(k)` guarantee it picks the
+    /// same `(best_bits, best_k)` pair the brute-force scan would
+    /// return for any input. This test exercises both the estimate
+    /// window's centre and its directional extensions against a
+    /// hand-rolled brute-force reference across a deliberately diverse
+    /// set of residual buffers — degenerate (all zero, all huge,
+    /// single-spike), Laplace-shaped (the design point), and
+    /// adversarially bi-modal (small-then-large, large-then-small) so
+    /// the estimate is misaligned and the safety net must fire.
+    #[test]
+    fn best_rice_params_matches_brute_force_reference() {
+        // Brute-force scan kept inline so the reference stays in this
+        // test file rather than in `src/`, and so future tweaks to the
+        // optimised path can't accidentally also tweak the reference.
+        fn brute_force(residuals: &[i32], k_max: u32) -> (u64, u32) {
+            if residuals.is_empty() {
+                return (0, 0);
+            }
+            let mut best_k = 0u32;
+            let mut best_bits = u64::MAX;
+            for k in 0..=k_max {
+                let mut total: u64 = 0;
+                for &r in residuals {
+                    let u = zigzag_encode(r) as u64;
+                    total += (u >> k) + 1 + k as u64;
+                }
+                if total < best_bits {
+                    best_bits = total;
+                    best_k = k;
+                }
+            }
+            (best_bits, best_k)
+        }
+
+        // xorshift32 inline so the test stays self-contained.
+        fn xorshift32(state: &mut u32) -> u32 {
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            *state
+        }
+
+        // Generate Laplace-shaped residuals at a target mean magnitude
+        // by sign-flipping geometrically-thinned uniform variates. Not
+        // a strict Laplace, but close enough to exercise every k in
+        // the realistic range.
+        let laplace = |mean_abs: u32, n: usize, seed: u32| -> Vec<i32> {
+            let mut state = seed;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let u = xorshift32(&mut state);
+                let mag = (u % (mean_abs * 4 + 1)) as i32;
+                let sign = if (u >> 31) & 1 == 1 { -1 } else { 1 };
+                out.push(sign * mag);
+            }
+            out
+        };
+
+        let mut cases: Vec<(String, Vec<i32>)> = Vec::new();
+        // Degenerate inputs.
+        cases.push(("all_zero_16".into(), vec![0; 16]));
+        cases.push(("all_zero_512".into(), vec![0; 512]));
+        cases.push(("single_spike".into(), {
+            let mut v = vec![0; 64];
+            v[7] = 1_000_000;
+            v
+        }));
+        cases.push(("all_ones".into(), vec![1; 128]));
+        cases.push(("all_neg_ones".into(), vec![-1; 128]));
+        // Laplace at a range of means so the estimate lands at low,
+        // medium, and high `k`.
+        for &mean in &[1u32, 4, 16, 64, 256, 1024, 8192, 100_000] {
+            for &n in &[16usize, 64, 256, 1024] {
+                let r = laplace(mean, n, 0xDEAD_C0DE ^ (mean << 1) ^ (n as u32));
+                cases.push((format!("laplace_mean{mean}_n{n}"), r));
+            }
+        }
+        // Adversarial bi-modal: mean is far from per-sample magnitude,
+        // forcing the safety net to fire.
+        cases.push(("bimodal_small_then_large".into(), {
+            let mut v: Vec<i32> = (0..256).map(|i| if i < 240 { 0 } else { 50_000 }).collect();
+            v[0] = 1;
+            v
+        }));
+        cases.push(("bimodal_large_then_small".into(), {
+            let mut v: Vec<i32> = (0..256).map(|i| if i < 16 { 50_000 } else { 0 }).collect();
+            v[255] = 1;
+            v
+        }));
+
+        // Method-0 (`k_max = 14`) and method-1 (`k_max = 30`) cover
+        // every partitioned-Rice configuration the encoder emits.
+        for &k_max in &[14u32, 30] {
+            for (label, residuals) in &cases {
+                let (got_bits, got_k) = best_rice_params(residuals, k_max);
+                let (ref_bits, ref_k) = brute_force(residuals, k_max);
+                assert_eq!(
+                    got_bits, ref_bits,
+                    "{label}/k_max={k_max}: optimised bits {got_bits} \
+                     != brute-force {ref_bits} (got_k={got_k}, ref_k={ref_k})"
+                );
+                assert_eq!(
+                    got_k, ref_k,
+                    "{label}/k_max={k_max}: optimised k {got_k} \
+                     != brute-force k {ref_k} (both should yield {ref_bits} bits)"
+                );
+            }
+        }
     }
 
     /// The adaptive precision heuristic must stay inside the spec's

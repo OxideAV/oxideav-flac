@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`best_rice_params` now estimates the optimal Rice parameter from
+  the partition's mean absolute residual instead of brute-forcing every
+  `k` in `0..=k_max` (up to 31 passes).** RFC 9639 §9.2.5 defines the
+  payload of a Rice-coded partition as `N * (1 + k) + (sum_u >> k)`
+  where `sum_u` is the sum of zigzag-encoded residuals. Differentiating
+  with respect to `k` and setting to zero gives `2^k ≈ sum_u / N`, so a
+  single closed-form `k_est = floor(log2(sum_u / N))` plus a small
+  `[k_est-2 .. k_est+3]` evaluation window — extended outward only when
+  the chosen `k` lands at a window edge — provably yields the same
+  `(best_bits, best_k)` pair the brute-force scan would have returned
+  (cost in `k` is convex: linear `k` term + monotone-decreasing
+  sum-of-shifts term). The zigzag values are also now computed once
+  per partition into a small temporary `Vec<u32>` and reused across
+  every candidate `k`, instead of being recomputed inside the inner
+  scoring loop. Net effect on the encode benches (Apple M-class
+  hardware, four-scenario coverage from r128) — output is
+  byte-for-byte identical to the previous brute-force implementation,
+  enforced by a new `best_rice_params_matches_brute_force_reference`
+  regression test that compares the two on degenerate, Laplace-shaped,
+  and adversarial-bimodal inputs across both partitioned-Rice methods:
+  - mono S16 44.1 kHz 1 s: **1.456 s → 315.5 ms (4.62× faster, 273 KiB/s)**
+  - stereo S16 44.1 kHz 1 s: **5.802 s → 1.245 s (4.66× faster, 138 KiB/s)**
+  - stereo S24 48 kHz 0.5 s: **3.684 s → 622.0 ms (5.92× faster, 226 KiB/s)**
+  - 6-ch S16 48 kHz 0.25 s: **2.263 s → 474.1 ms (4.77× faster, 297 KiB/s)**
+  This is round 143's depth-mode profile delta against the round 128
+  baseline; numbers from `cargo bench -p oxideav-flac --bench encode`.
+
 ### Added
 
 - **Profiling driver** at `examples/profile_flac.rs` — a flat

@@ -297,15 +297,24 @@ the encode-vs-decode shape is stable):
 | `decode    stereo/s16/44k1/1s`           |     1.10 |   ~150  |   ~910x  |
 | `decode    stereo/s24/48k/500ms`         |     0.67 |   ~205  |   ~745x  |
 | `decode    6ch/s16/48k/250ms`            |     0.74 |   ~190  |   ~340x  |
-| `encode    mono/s16/44k1/1s`             |     1468 |   ~0.06 |    0.7x  |
-| `encode    stereo/s16/44k1/1s`           |     5815 |   ~0.03 |    0.2x  |
-| `encode    stereo/s24/48k/500ms`         |     3708 |   ~0.04 |    0.1x  |
-| `encode    6ch/s16/48k/250ms`            |     2283 |   ~0.06 |    0.1x  |
+| `encode    mono/s16/44k1/1s`             |      316 |   ~0.27 |    3.2x  |
+| `encode    stereo/s16/44k1/1s`           |     1245 |   ~0.14 |    0.8x  |
+| `encode    stereo/s24/48k/500ms`         |      622 |   ~0.22 |    0.8x  |
+| `encode    6ch/s16/48k/250ms`            |      474 |   ~0.29 |    0.5x  |
 
-The decode path is comfortably realtime by orders of magnitude; the
-encode path's exhaustive LPC + apodization + partition-order search
-is the obvious next optimisation target (the per-subframe search
-trifecta noted in `benches/encode.rs`).
+The decode path is comfortably realtime by orders of magnitude. The
+encode path is now mono-realtime (3.2x) and within a small factor of
+realtime for stereo / multichannel — round 143's closed-form Rice
+parameter estimate (see `best_rice_params` in `src/encoder.rs`) cut
+the per-partition cost by ~4.6×–6× over the previous brute-force
+`for k in 0..=k_max` scan with byte-identical output (regression-
+tested in `encoder::tests::best_rice_params_matches_brute_force_reference`).
+The remaining encode cost lives in the per-subframe LPC + apodization
+window search, with each surviving LPC subframe still iterating
+0..=8 partition orders × 2 Rice methods — the next optimisation
+opportunity is likely cached residual statistics across partition
+orders (the higher-order partitions are sub-sums of the lower-order
+ones).
 
 ## Codec / container IDs
 
