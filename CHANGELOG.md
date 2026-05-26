@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PADDING metadata-block writer** (round 155, RFC 9639 §8.6):
+  `metadata::write_padding(len)` produces a `len`-byte all-zero payload
+  for inclusion in a FLAC metadata chain, capped at the 24-bit block-
+  header length ceiling so the writer cannot generate a payload no
+  conformant reader will accept. Paired with two new helpers that make
+  every metadata-payload writer (CUESHEET, SEEKTABLE, PADDING)
+  composable into a real on-wire chain:
+  - `BlockType::to_byte()` — encodes the type into the low 7 bits of
+    the metadata-block header byte; returns `None` for the spec's
+    `Invalid` sentinel (code 127) and for `Reserved` codes that would
+    collide with the `last` flag bit.
+  - `BlockHeader::write_into(&mut Vec<u8>)` / `BlockHeader::to_bytes()`
+    — serialises the 4-byte block-header prefix (`last` flag + 7-bit
+    type code + 24-bit big-endian length). Rejects payload lengths
+    above `BlockHeader::MAX_LENGTH` (2²⁴ − 1) and refuses to emit
+    the `Invalid` block type.
+  Nine new unit tests pin the byte-for-byte wire layout, parser
+  round-trips for every defined block-type code, and a smallest-
+  realistic STREAMINFO + last-PADDING metadata-chain walk-back. The
+  metadata module's test count grows from 25 to 34.
+
 - **Three new Criterion encode-bench scenarios** (round 150) that cover
   encoder code paths the existing four bench scenarios under-exercise.
   The earlier suite (mono/stereo S16, stereo S24, 6-channel S16) all

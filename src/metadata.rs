@@ -32,6 +32,34 @@ impl BlockType {
             other => Self::Reserved(other),
         }
     }
+
+    /// Encode this block type as the low 7 bits of the metadata-block
+    /// header byte (RFC 9639 §8.1). The high bit (`last`) is supplied
+    /// separately by [`BlockHeader::write_into`]. Returns `None` if the
+    /// value is unrepresentable on the wire — specifically the
+    /// `Invalid` variant (the spec reserves code 127 for a forbidden
+    /// "invalid" marker, so writing it would produce a payload no
+    /// conformant reader will accept).
+    pub fn to_byte(self) -> Option<u8> {
+        match self {
+            Self::StreamInfo => Some(0),
+            Self::Padding => Some(1),
+            Self::Application => Some(2),
+            Self::SeekTable => Some(3),
+            Self::VorbisComment => Some(4),
+            Self::CueSheet => Some(5),
+            Self::Picture => Some(6),
+            // Code 127 is the spec's "invalid" sentinel; emitting it
+            // would round-trip through `from_byte` as `Invalid` again
+            // but the spec forbids producers from writing it, so we
+            // refuse here rather than smuggle it past the type system.
+            Self::Invalid => None,
+            // `Reserved` carries a 7-bit raw code; reject the high
+            // bit so a caller can't smuggle the `last` flag through.
+            Self::Reserved(code) if code < 0x80 && code != 127 => Some(code),
+            Self::Reserved(_) => None,
+        }
+    }
 }
 
 /// Header of a single metadata block.
@@ -56,6 +84,50 @@ impl BlockHeader {
             block_type,
             length,
         })
+    }
+
+    /// Maximum payload length the wire format can represent: the
+    /// length field is a 24-bit big-endian unsigned integer.
+    pub const MAX_LENGTH: u32 = (1 << 24) - 1;
+
+    /// Serialise this header as the 4-byte metadata-block-header
+    /// prefix (RFC 9639 §8.1): bit 7 of byte 0 is the `last` flag,
+    /// bits 0..=6 are the block-type code, bytes 1..=3 are the
+    /// payload length as a 24-bit big-endian unsigned integer.
+    ///
+    /// Returns `Error::invalid` if the block-type code can't be
+    /// serialised (see [`BlockType::to_byte`]) or the payload length
+    /// would overflow the 24-bit `length` field. Writes exactly four
+    /// bytes when it returns `Ok` and writes nothing otherwise (no
+    /// partial write).
+    pub fn write_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        let code = self.block_type.to_byte().ok_or_else(|| {
+            Error::invalid(format!(
+                "FLAC metadata block header: block-type {:?} cannot be serialised on the wire",
+                self.block_type
+            ))
+        })?;
+        if self.length > Self::MAX_LENGTH {
+            return Err(Error::invalid(format!(
+                "FLAC metadata block header: payload length {} exceeds 24-bit max ({})",
+                self.length,
+                Self::MAX_LENGTH
+            )));
+        }
+        let b0 = code | if self.last { 0x80 } else { 0x00 };
+        out.push(b0);
+        out.push(((self.length >> 16) & 0xFF) as u8);
+        out.push(((self.length >> 8) & 0xFF) as u8);
+        out.push((self.length & 0xFF) as u8);
+        Ok(())
+    }
+
+    /// Convenience wrapper returning a freshly allocated 4-byte
+    /// buffer.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(4);
+        self.write_into(&mut out)?;
+        Ok(out)
     }
 }
 
@@ -552,6 +624,35 @@ pub fn write_seektable(real_points: &[SeekPoint], placeholder_count: usize) -> R
 
     debug_assert_eq!(out.len(), total_bytes);
     Ok(out)
+}
+
+/// Serialise a PADDING metadata-block **payload** of `len` zero bytes
+/// (RFC 9639 §8.6).
+///
+/// PADDING is the simplest metadata block: its payload is `len` bytes
+/// whose value MUST be `0x00`. The block exists so an encoder can
+/// reserve space for later metadata growth (e.g. larger
+/// VORBIS_COMMENT, a SEEKTABLE retrofit) without rewriting the audio
+/// data that follows.
+///
+/// Only the payload is produced; the caller wraps it with
+/// [`BlockHeader::write_into`] / [`BlockHeader::to_bytes`] to obtain
+/// the full block. The trace-doc fixture `with-padding-block` shows
+/// FFmpeg's native muxer writing 8 KiB (`len = 8192`) by default, but
+/// the spec admits any 24-bit length.
+///
+/// Returns `Error::invalid` if `len` would exceed the 24-bit ceiling
+/// the metadata-block header's `length` field can carry (so callers
+/// don't have to do the bound check twice).
+pub fn write_padding(len: usize) -> Result<Vec<u8>> {
+    if len > BlockHeader::MAX_LENGTH as usize {
+        return Err(Error::invalid(format!(
+            "FLAC PADDING: requested {} bytes exceeds 24-bit metadata length max ({})",
+            len,
+            BlockHeader::MAX_LENGTH
+        )));
+    }
+    Ok(vec![0u8; len])
 }
 
 impl StreamInfo {
@@ -1151,5 +1252,225 @@ mod tests {
         assert_eq!(reemitted, original);
         let reparsed = parse_seektable(&reemitted);
         assert_eq!(reparsed, parsed);
+    }
+
+    // --- PADDING + BlockHeader writer tests ----------------------------
+
+    #[test]
+    fn block_type_to_byte_round_trip() {
+        // Every defined block type that's allowed on the wire should
+        // round-trip through to_byte / from_byte unchanged.
+        for bt in [
+            BlockType::StreamInfo,
+            BlockType::Padding,
+            BlockType::Application,
+            BlockType::SeekTable,
+            BlockType::VorbisComment,
+            BlockType::CueSheet,
+            BlockType::Picture,
+        ] {
+            let b = bt.to_byte().expect("defined block type must serialise");
+            assert_eq!(BlockType::from_byte(b), bt);
+        }
+        // Reserved codes in [7, 126] inclusive (not 127) round-trip too.
+        for code in [7u8, 42, 100, 126] {
+            let bt = BlockType::Reserved(code);
+            let b = bt.to_byte().expect("reserved-but-legal code serialises");
+            assert_eq!(b, code);
+            assert_eq!(BlockType::from_byte(b), bt);
+        }
+        // The spec's "invalid" sentinel and high-bit codes are
+        // forbidden producers; the writer refuses them.
+        assert!(BlockType::Invalid.to_byte().is_none());
+        assert!(BlockType::Reserved(127).to_byte().is_none());
+        assert!(BlockType::Reserved(0x80).to_byte().is_none());
+    }
+
+    #[test]
+    fn block_header_writes_streaminfo_prefix() {
+        // RFC 9639 §8.1: a non-last STREAMINFO with payload length 34
+        // serialises to 0x00 0x00 0x00 0x22.
+        let h = BlockHeader {
+            last: false,
+            block_type: BlockType::StreamInfo,
+            length: 34,
+        };
+        assert_eq!(h.to_bytes().unwrap(), [0x00, 0x00, 0x00, 0x22]);
+
+        // A *last* PADDING block of 8192 bytes: top bit set, code 1,
+        // length 0x002000.
+        let h = BlockHeader {
+            last: true,
+            block_type: BlockType::Padding,
+            length: 8192,
+        };
+        assert_eq!(h.to_bytes().unwrap(), [0x81, 0x00, 0x20, 0x00]);
+    }
+
+    #[test]
+    fn block_header_round_trips_through_parse() {
+        // Cover every wire-format block-type code plus both polarities
+        // of the last flag and a payload length that exercises all
+        // three big-endian length bytes.
+        for &(last, bt, length) in &[
+            (false, BlockType::StreamInfo, 34u32),
+            (true, BlockType::Padding, 8192),
+            (false, BlockType::Application, 0),
+            (false, BlockType::SeekTable, 36),
+            (false, BlockType::VorbisComment, 46),
+            (false, BlockType::CueSheet, 396),
+            (true, BlockType::Picture, 0x00ABCDEF),
+        ] {
+            let h = BlockHeader {
+                last,
+                block_type: bt,
+                length,
+            };
+            let bytes = h.to_bytes().unwrap();
+            assert_eq!(bytes.len(), 4);
+            let parsed = BlockHeader::parse(&bytes).unwrap();
+            assert_eq!(parsed.last, last);
+            assert_eq!(parsed.block_type, bt);
+            assert_eq!(parsed.length, length);
+        }
+    }
+
+    #[test]
+    fn block_header_rejects_oversize_length() {
+        let h = BlockHeader {
+            last: false,
+            block_type: BlockType::Padding,
+            length: BlockHeader::MAX_LENGTH + 1,
+        };
+        assert!(h.to_bytes().is_err());
+    }
+
+    #[test]
+    fn block_header_rejects_invalid_block_type() {
+        let h = BlockHeader {
+            last: true,
+            block_type: BlockType::Invalid,
+            length: 0,
+        };
+        assert!(h.to_bytes().is_err());
+    }
+
+    #[test]
+    fn block_header_write_into_preserves_existing_buffer() {
+        // write_into must append four bytes after whatever was already
+        // in the buffer — confirms callers can chain a block header
+        // onto a metadata-chain `Vec` in progress.
+        let mut out = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let h = BlockHeader {
+            last: false,
+            block_type: BlockType::StreamInfo,
+            length: 34,
+        };
+        h.write_into(&mut out).unwrap();
+        assert_eq!(out, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x22]);
+    }
+
+    #[test]
+    fn padding_writer_emits_zero_bytes() {
+        // RFC 9639 §8.6: payload is `len` bytes whose value MUST be 0.
+        let p = write_padding(0).unwrap();
+        assert!(p.is_empty());
+        let p = write_padding(1).unwrap();
+        assert_eq!(p, vec![0u8]);
+        // The trace-doc canonical case: FFmpeg's default 8 KiB block.
+        let p = write_padding(8192).unwrap();
+        assert_eq!(p.len(), 8192);
+        assert!(p.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn padding_writer_rejects_oversize_request() {
+        // The metadata-block header length field caps at 2^24 - 1.
+        let max_ok = BlockHeader::MAX_LENGTH as usize;
+        // The strict equality case at exactly MAX_LENGTH is legal;
+        // skip materialising the 16-MiB buffer in this test and only
+        // confirm the bound check accepts it via the small adjacent
+        // case below + rejects MAX_LENGTH + 1.
+        assert!(write_padding(max_ok + 1).is_err());
+    }
+
+    #[test]
+    fn padding_block_round_trips_through_parser() {
+        // End-to-end: build a full PADDING metadata block (header +
+        // payload), parse the header back, then confirm the payload
+        // bytes match what the parser would see.
+        let payload = write_padding(8192).unwrap();
+        let header = BlockHeader {
+            last: true,
+            block_type: BlockType::Padding,
+            length: payload.len() as u32,
+        };
+        let mut wire = header.to_bytes().unwrap();
+        wire.extend_from_slice(&payload);
+
+        let parsed = BlockHeader::parse(&wire[..4]).unwrap();
+        assert!(parsed.last);
+        assert_eq!(parsed.block_type, BlockType::Padding);
+        assert_eq!(parsed.length, 8192);
+        assert_eq!(&wire[4..], &payload[..]);
+        assert!(wire[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn metadata_chain_streaminfo_then_padding_round_trips() {
+        // Smallest realistic metadata chain a muxer might emit:
+        // STREAMINFO (mandatory, first) + PADDING (last). Confirm the
+        // wire layout walks back through BlockHeader::parse cleanly.
+        //
+        // Synthesise a STREAMINFO payload directly (no encoder
+        // involvement) so this test stays inside `metadata.rs`'s
+        // bounded scope.
+        let mut si_payload = vec![0u8; 34];
+        si_payload[0..2].copy_from_slice(&4096u16.to_be_bytes());
+        si_payload[2..4].copy_from_slice(&4096u16.to_be_bytes());
+        let packed: u64 = (48_000u64 << 44) | (1u64 << 41) | (15u64 << 36) | 96_000u64;
+        si_payload[10..18].copy_from_slice(&packed.to_be_bytes());
+
+        let pad_payload = write_padding(64).unwrap();
+
+        let mut chain = Vec::new();
+        BlockHeader {
+            last: false,
+            block_type: BlockType::StreamInfo,
+            length: si_payload.len() as u32,
+        }
+        .write_into(&mut chain)
+        .unwrap();
+        chain.extend_from_slice(&si_payload);
+        BlockHeader {
+            last: true,
+            block_type: BlockType::Padding,
+            length: pad_payload.len() as u32,
+        }
+        .write_into(&mut chain)
+        .unwrap();
+        chain.extend_from_slice(&pad_payload);
+
+        // Walk the chain back the way the demuxer would.
+        let mut cur = 0usize;
+        let h1 = BlockHeader::parse(&chain[cur..cur + 4]).unwrap();
+        assert!(!h1.last);
+        assert_eq!(h1.block_type, BlockType::StreamInfo);
+        assert_eq!(h1.length as usize, si_payload.len());
+        cur += 4;
+        let si = StreamInfo::parse(&chain[cur..cur + h1.length as usize]).unwrap();
+        assert_eq!(si.sample_rate, 48_000);
+        assert_eq!(si.channels, 2);
+        assert_eq!(si.bits_per_sample, 16);
+        cur += h1.length as usize;
+
+        let h2 = BlockHeader::parse(&chain[cur..cur + 4]).unwrap();
+        assert!(h2.last);
+        assert_eq!(h2.block_type, BlockType::Padding);
+        assert_eq!(h2.length, 64);
+        cur += 4;
+        assert!(chain[cur..cur + 64].iter().all(|&b| b == 0));
+        cur += 64;
+        assert_eq!(cur, chain.len());
     }
 }

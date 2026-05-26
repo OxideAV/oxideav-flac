@@ -202,6 +202,18 @@ non-Subset):
   real point that shadows the placeholder sentinel — both would
   silently corrupt the table on the next parse pass. Round-trips
   through `parse_seektable` byte-for-byte.
+- **PADDING writer + composable block-header serialiser**:
+  `metadata::write_padding(len)` returns a `len`-byte all-zero
+  payload per RFC 9639 §8.6, capped at the 24-bit block-header
+  length ceiling. The companion `BlockType::to_byte()` +
+  `BlockHeader::write_into` / `BlockHeader::to_bytes` helpers
+  serialise the 4-byte metadata-block prefix (1-bit `last` flag +
+  7-bit type code + 24-bit big-endian length per RFC 9639 §8.1), so
+  callers can wrap a CUESHEET / SEEKTABLE / PADDING payload into a
+  full on-wire block in one chained `Vec` append. The header
+  serialiser refuses to emit the spec's `Invalid` sentinel (code
+  127) and rejects payload lengths above `BlockHeader::MAX_LENGTH`
+  (`2^24 - 1`).
 
 ## Fuzzing
 
