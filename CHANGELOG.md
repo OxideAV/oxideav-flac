@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Committed CPU flamegraphs** under `profile/` (round 147 depth-mode
+  profile run): `encode.svg`, `decode.svg`, `roundtrip.svg` plus the
+  matching `*.folded` folded-stack text inputs so future
+  rounds can A/B their changes against a stable visual baseline
+  without re-discovering the capture recipe. The driver is the
+  existing `examples/profile_flac.rs` (round 137); the new artefacts
+  are an `samply --unstable-presymbolicate` capture on macOS arm64
+  converted to folded stacks via the committed
+  `profile/samply_to_folded.py` helper, then rendered to SVG with
+  `inferno-flamegraph`. Headline finding:
+  `oxideav_flac::encoder::best_partition` (the per-subframe Rice
+  partition-order search introduced in round 129; `src/encoder.rs:976`)
+  is **~61 % of encode self-samples** (83 717 / 137 548), with
+  allocator paths (`_xzm_free`, `xzm_malloc`, `__bzero`)
+  contributing another ~7 %. Reusing a single residual `Vec<i32>`
+  buffer across subframes / candidate plans is the obvious next
+  encoder optimisation handle. Decode-side self-samples are
+  dominated entirely by `<FlacDecoder>::receive_frame` with no
+  measurable hot inner — the decode path is already
+  hundreds-of-x realtime per the round 137 reference numbers and
+  further gains would have to come from SIMD on the LPC restore
+  loop rather than algorithmic changes. See `profile/README.md`
+  for the full recipe + reproduction notes.
+
 ### Changed
 
 - **`best_rice_params` now estimates the optimal Rice parameter from

@@ -287,6 +287,17 @@ samply record -- ./target/release/examples/profile_flac encode 30
 samply record -- ./target/release/examples/profile_flac decode 100
 ```
 
+`profile/` carries committed SVG flamegraphs (`encode.svg`,
+`decode.svg`, `roundtrip.svg`) plus the matching folded-stack
+inputs from a round-147 capture on macOS arm64 — see
+`profile/README.md` for the full recipe + reproduction notes. The
+captured profile pins `oxideav_flac::encoder::best_partition`
+(the per-subframe Rice partition-order search introduced in round
+129) at ~61 % of encode self-samples; the obvious next encoder
+optimisation handle is reusing a single residual `Vec<i32>`
+buffer across subframes / candidate plans (allocator paths
+contribute another ~10 % to encode wall time).
+
 Reference numbers on an M-series laptop (release build, default
 iteration count, single run — absolute MiB/s will vary by host but
 the encode-vs-decode shape is stable):
