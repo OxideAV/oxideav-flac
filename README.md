@@ -243,11 +243,19 @@ future encoder rounds (partition-order early-exit, apodization-window
 picker, LPC-precision search heuristic) have a stable baseline to
 A/B against without rerunning the full docs corpus:
 
-- **`encode`** — four scenarios (mono S16 44.1 kHz 1 s, stereo S16
-  44.1 kHz 1 s, stereo S24 48 kHz 0.5 s, 6-channel S16 48 kHz 0.25 s)
-  covering the heaviest encoder path: CONSTANT + FIXED 0..=4 + LPC
-  1..=12 + VERBATIM with per-subframe LPC-precision and apodization-
-  window search plus 0..=8 partition-order Rice search.
+- **`encode`** — seven scenarios. The original four (round 128) cover
+  the heaviest encoder path against tone-plus-noise content: mono S16
+  44.1 kHz 1 s, stereo S16 44.1 kHz 1 s, stereo S24 48 kHz 0.5 s,
+  6-channel S16 48 kHz 0.25 s; each exercises CONSTANT + FIXED 0..=4 +
+  LPC 1..=12 + VERBATIM with per-subframe LPC-precision and apodization-
+  window search plus 0..=8 partition-order Rice search. Round 150 added
+  three further scenarios that target code paths the original four
+  bypass: `mono/s24/48k/500ms` (single-channel wide-sample without the
+  stereo decorrelation search), `mono/wasted_bits/s16/44k1/1s` (16-bit
+  container with an 8-bit effective range, exercising the wasted-bits
+  detector + narrowed-bps subframe path) and `mono/constant/s16/44k1/1s`
+  (DC content, short-circuiting each subframe to CONSTANT — a
+  regression guard for per-frame setup work).
 - **`decode`** — same four scenarios on the decode-only side (the
   encode step is outside the timed region; only `send_packet ->
   receive_frame` is measured).
@@ -312,6 +320,9 @@ the encode-vs-decode shape is stable):
 | `encode    stereo/s16/44k1/1s`           |     1245 |   ~0.14 |    0.8x  |
 | `encode    stereo/s24/48k/500ms`         |      622 |   ~0.22 |    0.8x  |
 | `encode    6ch/s16/48k/250ms`            |      474 |   ~0.29 |    0.5x  |
+| `encode    mono/s24/48k/500ms`           |      160 |   ~0.43 |    3.1x  |
+| `encode    mono/wasted/s16/44k1/1s`      |      368 |   ~0.23 |    2.7x  |
+| `encode    mono/constant/s16/44k1/1s`    |    0.246 |   ~340  |   ~4060x |
 
 The decode path is comfortably realtime by orders of magnitude. The
 encode path is now mono-realtime (3.2x) and within a small factor of
@@ -325,7 +336,15 @@ window search, with each surviving LPC subframe still iterating
 0..=8 partition orders × 2 Rice methods — the next optimisation
 opportunity is likely cached residual statistics across partition
 orders (the higher-order partitions are sub-sums of the lower-order
-ones).
+ones). Round 150 attempted the obvious "reuse residual `Vec<i32>`
+scratch across plans" follow-up the r147 profile suggested and
+measured a ~10 % regression on macOS arm64: the system allocator's
+small-bin caching already serves the small per-plan allocations
+effectively, and the threading overhead (a `&mut Scratch` plumbed
+through every plan call) costs more than it saves. The reuse cure
+was empirically worse than the disease; a Linux-target rerun under a
+different allocator may flip that conclusion. See `CHANGELOG.md`
+"Round 150 investigated …" for the full A/B record.
 
 ## Codec / container IDs
 

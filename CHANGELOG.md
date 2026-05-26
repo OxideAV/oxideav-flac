@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Three new Criterion encode-bench scenarios** (round 150) that cover
+  encoder code paths the existing four bench scenarios under-exercise.
+  The earlier suite (mono/stereo S16, stereo S24, 6-channel S16) all
+  feed tone-plus-noise content into the default 4096-sample block path,
+  which means the LPC + partition search dominates every measurement
+  and any change to the wasted-bits / CONSTANT-subframe / single-channel-
+  wide-sample code paths is invisible. The additions:
+  - `encode_mono_s24_48k_500ms` — 0.5 s of mono S24 at 48 kHz. Isolates
+    single-channel wide-sample cost without the stereo decorrelation
+    search of the existing `stereo_s24` scenario. Round-150 measurement:
+    160 ms/iter (~430 KiB/s) — roughly half the stereo S24 cost, as
+    expected for one channel without the four-way assignment search.
+  - `encode_mono_wasted_bits_s16_44k1_1s` — 1 s of mono S16 whose
+    samples carry only an 8-bit effective range (every low 8 bits are
+    zero). Exercises the wasted-bits detector + narrowed-bps subframe
+    path. Round-150 measurement: 368 ms/iter (~234 KiB/s); slower than
+    the regular mono S16 scenario because the narrowed bps still leaves
+    the full LPC + partition search in play.
+  - `encode_mono_constant_s16_44k1_1s` — 1 s of mono DC content.
+    Short-circuits each block to a CONSTANT subframe, so the bench
+    measures per-block driver overhead (de-interleave, MD5 feed,
+    frame header walk) without any LPC / partition cost. Round-150
+    measurement: 246 µs/iter (~340 MiB/s) — a four-order-of-magnitude
+    delta vs the LPC-heavy scenarios that flags the CONSTANT
+    short-circuit as a regression-test target should a future round
+    inadvertently lose it.
+
+### Notes
+
+- **Round 150 investigated the round-147 follow-up suggestion** to
+  reuse a single residual `Vec<i32>` scratch across subframes /
+  candidate plans in `FlacEncoder::encode_ready_frames`. The
+  refactor (thread a per-encoder `Scratch { residuals, zigzag, … }`
+  through `encode_frame`, `best_subframe`, `encode_fixed_plan`,
+  `encode_lpc_plan_at`, `encode_rice_residual`, `best_partition`)
+  was implemented end-to-end with byte-for-byte identical output
+  verification across all four `examples/profile_flac.rs` scenarios
+  (`profile_flac encode 3` shows the same packet byte count and
+  fnv64 hash before vs after). The bench result was a **~10 %
+  regression** on every scenario (mono S16 290 → 322 ms, stereo S16
+  1150 → 1290 ms, stereo S24 593 → 666 ms, 6-channel 443 → 499 ms).
+  Two simpler variants — a partition-choice cache that skipped the
+  duplicate `best_partition` work in the emission loop, and a single-
+  pass `zigzag + sum_u` fold in `best_rice_params` — were also tried
+  and produced the same direction of regression. The proximate
+  cause: macOS libmalloc's small-bin caching makes the existing
+  `Vec::with_capacity(small)` calls effectively a freelist pop, and
+  the threading overhead (`std::mem::take` + restore + capacity-
+  checked `push` in place of `iter().map().collect()`) costs more
+  than the allocator paths the flamegraph attributed to the inner
+  loops. The two-pass `collect` + `iter().sum()` shape is also
+  auto-vectorised by rustc 1.95, which a hand-rolled single-pass
+  loop appears to defeat. None of these changes shipped — the
+  encoder is unchanged structurally. The r147 finding about
+  allocator self-samples remains, but the eliminate-the-allocations
+  cure is empirically worse than the disease on macOS arm64 with
+  the current rustc; a future Linux-target run may reverse this
+  conclusion (different allocator, different cost shape).
+
 - **Committed CPU flamegraphs** under `profile/` (round 147 depth-mode
   profile run): `encode.svg`, `decode.svg`, `roundtrip.svg` plus the
   matching `*.folded` folded-stack text inputs so future
