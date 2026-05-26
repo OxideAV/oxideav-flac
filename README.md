@@ -158,6 +158,16 @@ non-Subset):
   into the block at `flush()` time, along with the observed min/max
   frame size and the total sample count. Fetch the final
   `enc.output_params().extradata` after flushing to feed a muxer.
+- **PADDING reservation**: `encoder::make_encoder_with_options(params,
+  FlacEncoderOptions { padding_bytes: Some(n), .. })` chains a
+  `n`-byte all-zero PADDING block (RFC 9639 §8.6, last-flagged) after
+  STREAMINFO in the produced `extradata`. The default factory
+  (`make_encoder`) keeps the historical "STREAMINFO is the only block"
+  output. Reserved PADDING lets downstream tools rewrite metadata
+  (tag edits, cuesheet edits) in place without having to shift the
+  audio frame bytes. The bound check happens at construction time —
+  requesting more than `BlockHeader::MAX_LENGTH` (2²⁴ − 1) returns
+  `Error::invalid` before any encode work runs.
 
 ## Native container
 

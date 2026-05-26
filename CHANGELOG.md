@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PADDING reservation in the encoder** (round 158, RFC 9639 §8.6):
+  new `encoder::FlacEncoderOptions` (`#[non_exhaustive]`) with a
+  `padding_bytes: Option<usize>` field and a new factory
+  `encoder::make_encoder_with_options(params, options)` that wires
+  the round-155 `metadata::write_padding` payload writer + the
+  composable `BlockHeader::write_into` header serialiser into the
+  encoder. When `padding_bytes` is `Some(n)`, the produced
+  `extradata` is `STREAMINFO(non-last) + PADDING(last, length=n,
+  all-zero)` instead of the previous `STREAMINFO(last)` chain;
+  reserved PADDING lets downstream tools rewrite tags / cuesheets in
+  place without shifting the audio frame bytes. The bound check
+  happens at construction time — a request above
+  `BlockHeader::MAX_LENGTH` (2²⁴ − 1) returns `Error::invalid`
+  immediately rather than panicking inside `flush`. The default
+  `make_encoder(params)` factory now delegates to
+  `make_encoder_with_options(params, FlacEncoderOptions::default())`,
+  which is observationally identical to the pre-round-158 behaviour
+  (the default has `padding_bytes: None`, so the 38-byte
+  STREAMINFO-only chain is preserved byte-for-byte). Six new tests
+  in `encoder::tests` pin:
+    * the default factory still emits the exact 38-byte
+      STREAMINFO-only chain (no silent regression for existing
+      callers);
+    * the opt-in chain is well-formed (STREAMINFO non-last header,
+      last-flagged PADDING header, payload length matches
+      `padding_bytes`, payload is all-zero) — both for an 8 KiB
+      reservation (FFmpeg's documented default) and a 0-byte
+      reservation (still a legal PADDING block);
+    * the post-flush STREAMINFO rebuild after real PCM input
+      preserves the PADDING tail and only rewrites the STREAMINFO
+      payload (MD5, min/max frame size, total sample count);
+    * the chain walks back through the same `BlockHeader::parse`
+      loop the demuxer uses to read metadata from a `.flac` file —
+      so an encoder-emitted PADDING block round-trips through the
+      crate's own demuxer;
+    * an oversize PADDING request fails at construction time with
+      a clear "padding_bytes / 24-bit max" error message rather
+      than panicking later.
+  Encoder test count grows from 28 to 34 (lib test total 74 → 80).
+
 - **PADDING metadata-block writer** (round 155, RFC 9639 §8.6):
   `metadata::write_padding(len)` produces a `len`-byte all-zero payload
   for inclusion in a FLAC metadata chain, capped at the 24-bit block-

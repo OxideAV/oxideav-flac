@@ -25,7 +25,34 @@ use oxideav_core::{
 use crate::bits_ext::BitWriterExt;
 use crate::crc;
 use crate::md5::Md5;
+use crate::metadata::{write_padding, BlockHeader, BlockType};
 use oxideav_core::bits::BitWriter;
+
+/// Caller-supplied tuning knobs for [`make_encoder_with_options`]. All
+/// fields default to "match the historical `make_encoder` behaviour", so
+/// constructing the default and passing it in is observationally
+/// identical to calling `make_encoder` directly.
+///
+/// The struct is `#[non_exhaustive]` so additions in later rounds (e.g.
+/// per-frame block-size override, LPC-order cap) don't break existing
+/// callers; build one with `FlacEncoderOptions::default()` and mutate
+/// the fields you want to set.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct FlacEncoderOptions {
+    /// Reserve `n` bytes of PADDING (RFC 9639 §8.6) after STREAMINFO in
+    /// the produced `extradata` metadata chain. `None` (the default)
+    /// emits STREAMINFO as the last and only metadata block — the
+    /// historical pre-round-158 behaviour. `Some(n)` emits STREAMINFO
+    /// with `last=false`, then a `n`-byte all-zero PADDING block with
+    /// `last=true`, letting downstream tools (taggers, cuesheet tools)
+    /// rewrite metadata in place without having to shift the audio
+    /// frames. Capped at `BlockHeader::MAX_LENGTH` (2^24 − 1) — a
+    /// larger value would overflow the 24-bit length field, so
+    /// `make_encoder_with_options` returns `Error::invalid` rather
+    /// than silently truncating.
+    pub padding_bytes: Option<usize>,
+}
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 /// Highest LPC order the encoder will try. The decoder (and RFC 9639
@@ -180,6 +207,17 @@ fn lpc_precision_for(block_len: usize) -> u32 {
 }
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    make_encoder_with_options(params, FlacEncoderOptions::default())
+}
+
+/// Same as [`make_encoder`] but accepts a [`FlacEncoderOptions`] for
+/// caller-tunable knobs (padding reservation, future LPC / block-size
+/// overrides). `make_encoder` is a thin wrapper that passes
+/// `FlacEncoderOptions::default()` through.
+pub fn make_encoder_with_options(
+    params: &CodecParameters,
+    options: FlacEncoderOptions,
+) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("FLAC encoder: missing channels"))?;
@@ -202,8 +240,19 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     if !(1..=8).contains(&channels) {
         return Err(Error::invalid("FLAC encoder: channels must be 1..=8"));
     }
+    // Validate padding length up front so the failure point is
+    // construction, not the first call to `flush`.
+    if let Some(n) = options.padding_bytes {
+        if n > BlockHeader::MAX_LENGTH as usize {
+            return Err(Error::invalid(format!(
+                "FLAC encoder: padding_bytes {} exceeds 24-bit metadata length max ({})",
+                n,
+                BlockHeader::MAX_LENGTH
+            )));
+        }
+    }
 
-    let extradata = build_streaminfo_metadata_block(
+    let extradata = build_extradata(
         DEFAULT_BLOCK_SIZE,
         sample_rate,
         channels as u8,
@@ -212,7 +261,8 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         0,
         0,
         &[0u8; 16],
-    );
+        options.padding_bytes,
+    )?;
 
     let mut output_params = params.clone();
     output_params.media_type = MediaType::Audio;
@@ -238,10 +288,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         min_frame_size: u32::MAX,
         max_frame_size: 0,
         eof: false,
+        padding_bytes: options.padding_bytes,
     }))
 }
 
-/// Build a full METADATA_BLOCK (header + STREAMINFO payload) marked as LAST.
+/// Build a full METADATA_BLOCK (header + STREAMINFO payload).
+///
+/// `last` controls the high bit of the block-type byte: `true` marks
+/// STREAMINFO as the final block in the chain (the historical
+/// behaviour when no extra metadata blocks follow); `false` lets
+/// callers chain additional blocks (PADDING, etc.) afterwards.
 ///
 /// Spec-defined fields (min/max frame size, total_samples, md5) are
 /// populated from live stats once encoding has finished; the initial
@@ -257,9 +313,12 @@ fn build_streaminfo_metadata_block(
     max_frame_size: u32,
     total_samples: u64,
     md5: &[u8; 16],
+    last: bool,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 34);
-    out.push(0x80);
+    // Block-header byte 0: high bit = `last`, low 7 bits = STREAMINFO
+    // type code (0).
+    out.push(if last { 0x80 } else { 0x00 });
     out.push(0x00);
     out.push(0x00);
     out.push(0x22);
@@ -281,6 +340,53 @@ fn build_streaminfo_metadata_block(
     out
 }
 
+/// Build the full `extradata` metadata chain the encoder hands the
+/// muxer: STREAMINFO, optionally followed by a `last`-flagged PADDING
+/// block. When `padding_bytes` is `None`, STREAMINFO carries the
+/// `last` flag itself and the chain stops there — byte-identical to
+/// the pre-round-158 behaviour. When `padding_bytes` is `Some(n)`,
+/// STREAMINFO is non-last and a `n`-byte all-zero PADDING block with
+/// `last=true` follows. The PADDING payload comes from
+/// [`metadata::write_padding`] so the same bound check that protects
+/// the standalone writer also protects callers that route through the
+/// encoder.
+#[allow(clippy::too_many_arguments)]
+fn build_extradata(
+    block_size: u32,
+    sample_rate: u32,
+    channels: u8,
+    bps: u8,
+    min_frame_size: u32,
+    max_frame_size: u32,
+    total_samples: u64,
+    md5: &[u8; 16],
+    padding_bytes: Option<usize>,
+) -> Result<Vec<u8>> {
+    let last_streaminfo = padding_bytes.is_none();
+    let mut out = build_streaminfo_metadata_block(
+        block_size,
+        sample_rate,
+        channels,
+        bps,
+        min_frame_size,
+        max_frame_size,
+        total_samples,
+        md5,
+        last_streaminfo,
+    );
+    if let Some(n) = padding_bytes {
+        let payload = write_padding(n)?;
+        let header = BlockHeader {
+            last: true,
+            block_type: BlockType::Padding,
+            length: payload.len() as u32,
+        };
+        header.write_into(&mut out)?;
+        out.extend_from_slice(&payload);
+    }
+    Ok(out)
+}
+
 struct FlacEncoder {
     output_params: CodecParameters,
     sample_format: SampleFormat,
@@ -298,6 +404,10 @@ struct FlacEncoder {
     min_frame_size: u32,
     max_frame_size: u32,
     eof: bool,
+    /// Number of PADDING bytes to reserve after STREAMINFO in the
+    /// final `extradata` chain. `None` means no PADDING block — the
+    /// pre-round-158 behaviour. See [`FlacEncoderOptions::padding_bytes`].
+    padding_bytes: Option<usize>,
 }
 
 impl FlacEncoder {
@@ -432,6 +542,9 @@ impl FlacEncoder {
 
     /// Rebuild STREAMINFO in `output_params.extradata` using live stats.
     /// Called once from `flush` after all frames have been emitted.
+    /// When `padding_bytes` was set on construction, the rebuilt chain
+    /// preserves the trailing PADDING block — the bound check happened
+    /// at construction time, so the rebuild is infallible here.
     fn finalize_streaminfo(&mut self) {
         let md5_bytes = std::mem::take(&mut self.md5).finalize();
         let min_frame_size = if self.min_frame_size == u32::MAX {
@@ -439,7 +552,10 @@ impl FlacEncoder {
         } else {
             self.min_frame_size
         };
-        self.output_params.extradata = build_streaminfo_metadata_block(
+        // `build_extradata` only returns Err if PADDING was set above
+        // BlockHeader::MAX_LENGTH; we already rejected that at
+        // construction time, so this can't fail here.
+        self.output_params.extradata = build_extradata(
             self.block_size,
             self.sample_rate,
             self.channels as u8,
@@ -448,7 +564,9 @@ impl FlacEncoder {
             self.max_frame_size,
             self.total_samples,
             &md5_bytes,
-        );
+            self.padding_bytes,
+        )
+        .expect("padding_bytes already validated at encoder construction");
     }
 }
 
@@ -1402,6 +1520,7 @@ mod tests {
             0,
             0,
             &[0u8; 16],
+            true,
         ));
         for f in &all_frames {
             stream.extend_from_slice(f);
@@ -1419,6 +1538,7 @@ mod tests {
             0,
             0,
             &[0u8; 16],
+            true,
         );
         let mut dec = decoder::make_decoder(&params).unwrap();
 
@@ -2509,5 +2629,208 @@ mod tests {
             r.push((v * 0.87) as i32);
         }
         roundtrip(vec![l, r], sr, 16);
+    }
+
+    // --- PADDING-aware encoder options (round 158) -----------------------
+    //
+    // `FlacEncoderOptions::padding_bytes = Some(n)` instructs the
+    // encoder to mark its STREAMINFO non-last and append a `n`-byte
+    // PADDING block as the last metadata in the chain. The default
+    // `None` preserves the historical "STREAMINFO is the only and last
+    // block" extradata. These tests pin both:
+    //   * that the default factory still produces the exact 38-byte
+    //     STREAMINFO-only chain (no silent regression for existing
+    //     callers);
+    //   * that the opt-in chain is well-formed (STREAMINFO non-last
+    //     + last-flagged PADDING + correct payload length + all-zero
+    //     payload) and walks back through the demuxer's block parser;
+    //   * that the post-flush rebuild keeps the PADDING block and only
+    //     rewrites the STREAMINFO payload (MD5 + frame-size + total
+    //     sample count);
+    //   * that an oversize padding request fails at construction time
+    //     rather than panicking inside `flush` or producing a header
+    //     no conformant reader will accept.
+
+    fn build_audio_params(channels: u16, sample_rate: u32, fmt: SampleFormat) -> CodecParameters {
+        let mut p = CodecParameters::audio(CodecId::new("flac"));
+        p.channels = Some(channels);
+        p.sample_rate = Some(sample_rate);
+        p.sample_format = Some(fmt);
+        p
+    }
+
+    #[test]
+    fn make_encoder_default_emits_streaminfo_only_extradata() {
+        let p = build_audio_params(2, 48_000, SampleFormat::S16);
+        let enc = make_encoder(&p).unwrap();
+        let extradata = &enc.output_params().extradata;
+        // STREAMINFO is 4-byte header + 34-byte payload = 38 bytes.
+        // No trailing PADDING block in the default case.
+        assert_eq!(extradata.len(), 38);
+        // Block-header byte 0: high bit (last) set, low 7 bits = 0
+        // (STREAMINFO).
+        assert_eq!(extradata[0], 0x80);
+    }
+
+    #[test]
+    fn make_encoder_with_padding_appends_last_padding_block() {
+        let p = build_audio_params(2, 48_000, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            padding_bytes: Some(8192),
+        };
+        let enc = make_encoder_with_options(&p, opts).unwrap();
+        let extradata = &enc.output_params().extradata;
+        // STREAMINFO header (4) + payload (34) + PADDING header (4) +
+        // PADDING payload (8192).
+        assert_eq!(extradata.len(), 4 + 34 + 4 + 8192);
+        // STREAMINFO is now non-last (high bit clear).
+        assert_eq!(extradata[0], 0x00);
+        // STREAMINFO header: parse it back through BlockHeader.
+        let si_hdr = BlockHeader::parse(&extradata[..4]).unwrap();
+        assert!(!si_hdr.last);
+        assert_eq!(si_hdr.block_type, BlockType::StreamInfo);
+        assert_eq!(si_hdr.length, 34);
+        // Walk to PADDING header.
+        let pad_off = 4 + 34;
+        let pad_hdr = BlockHeader::parse(&extradata[pad_off..pad_off + 4]).unwrap();
+        assert!(pad_hdr.last);
+        assert_eq!(pad_hdr.block_type, BlockType::Padding);
+        assert_eq!(pad_hdr.length, 8192);
+        // PADDING payload must be all zeros per RFC 9639 §8.6.
+        assert!(extradata[pad_off + 4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn make_encoder_with_zero_padding_emits_empty_padding_block() {
+        // A zero-byte PADDING block is spec-legal (length=0 is a
+        // perfectly representable 24-bit value). The chain becomes
+        // STREAMINFO(non-last) + PADDING(last, length=0) = 38 + 4 = 42 bytes.
+        let p = build_audio_params(1, 44_100, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            padding_bytes: Some(0),
+        };
+        let enc = make_encoder_with_options(&p, opts).unwrap();
+        let extradata = &enc.output_params().extradata;
+        assert_eq!(extradata.len(), 4 + 34 + 4);
+        let si_hdr = BlockHeader::parse(&extradata[..4]).unwrap();
+        assert!(!si_hdr.last);
+        let pad_hdr = BlockHeader::parse(&extradata[38..42]).unwrap();
+        assert!(pad_hdr.last);
+        assert_eq!(pad_hdr.block_type, BlockType::Padding);
+        assert_eq!(pad_hdr.length, 0);
+    }
+
+    #[test]
+    fn make_encoder_rejects_oversize_padding_request() {
+        let p = build_audio_params(2, 48_000, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            // 2^24 = MAX_LENGTH + 1; just over the wire limit.
+            padding_bytes: Some(BlockHeader::MAX_LENGTH as usize + 1),
+        };
+        let result = make_encoder_with_options(&p, opts);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("padding_bytes above the 24-bit length max must fail at construction time")
+            }
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("padding_bytes") && msg.contains("24-bit"),
+            "error message should mention padding_bytes and the 24-bit cap: {msg}"
+        );
+    }
+
+    #[test]
+    fn make_encoder_with_padding_flush_preserves_padding_block() {
+        // End-to-end: feed real PCM, flush, and verify the final
+        // extradata still carries the PADDING tail with the STREAMINFO
+        // payload now populated with live MD5 / min/max frame size /
+        // total samples. The post-flush rebuild must not drop or
+        // corrupt the PADDING block.
+        let sr = 44_100u32;
+        let n = 4096usize;
+        let mut pcm = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let v = ((i as f64 / sr as f64 * 440.0 * 2.0 * std::f64::consts::PI).sin() * 20_000.0)
+                as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            padding_bytes: Some(1024),
+        };
+        let mut enc = make_encoder_with_options(&p, opts).unwrap();
+        let af = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm],
+        };
+        enc.send_frame(&Frame::Audio(af)).unwrap();
+        enc.flush().unwrap();
+        // Drain pending packets (we don't need to inspect them; the
+        // STREAMINFO rebuild only happens after `flush` is called).
+        while enc.receive_packet().is_ok() {}
+
+        let extradata = &enc.output_params().extradata;
+        assert_eq!(extradata.len(), 4 + 34 + 4 + 1024);
+        // STREAMINFO is still non-last.
+        let si_hdr = BlockHeader::parse(&extradata[..4]).unwrap();
+        assert!(!si_hdr.last);
+        assert_eq!(si_hdr.length, 34);
+        // STREAMINFO payload now carries real stats. MD5 (last 16
+        // bytes of the 34-byte payload) is non-zero on real PCM
+        // input — the post-flush rebuild populated it.
+        let md5_off = 4 + 34 - 16;
+        let md5 = &extradata[md5_off..md5_off + 16];
+        assert!(md5.iter().any(|&b| b != 0), "MD5 should be populated");
+        // PADDING tail intact: last-flagged, length=1024, all zeros.
+        let pad_hdr = BlockHeader::parse(&extradata[4 + 34..4 + 34 + 4]).unwrap();
+        assert!(pad_hdr.last);
+        assert_eq!(pad_hdr.block_type, BlockType::Padding);
+        assert_eq!(pad_hdr.length, 1024);
+        assert!(extradata[4 + 34 + 4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn extradata_chain_with_padding_walks_through_block_parser() {
+        // The chain produced by the encoder must be walkable by the
+        // exact same BlockHeader::parse loop the demuxer uses to read
+        // metadata from a .flac file. This is the regression guard for
+        // future changes to `build_extradata`.
+        let p = build_audio_params(2, 48_000, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            padding_bytes: Some(256),
+        };
+        let enc = make_encoder_with_options(&p, opts).unwrap();
+        let extradata = &enc.output_params().extradata;
+        let mut cursor = 0usize;
+        let mut seen_streaminfo = false;
+        let mut seen_padding = false;
+        loop {
+            let hdr = BlockHeader::parse(&extradata[cursor..cursor + 4]).unwrap();
+            cursor += 4;
+            match hdr.block_type {
+                BlockType::StreamInfo => {
+                    seen_streaminfo = true;
+                    assert!(
+                        !hdr.last,
+                        "STREAMINFO must not be last when padding follows"
+                    );
+                }
+                BlockType::Padding => {
+                    seen_padding = true;
+                    assert!(hdr.last, "PADDING is the chain's last block");
+                }
+                other => panic!("unexpected block type in chain: {other:?}"),
+            }
+            cursor += hdr.length as usize;
+            if hdr.last {
+                break;
+            }
+        }
+        assert!(seen_streaminfo);
+        assert!(seen_padding);
+        assert_eq!(cursor, extradata.len(), "chain must be fully consumed");
     }
 }
