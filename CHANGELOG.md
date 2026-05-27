@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PICTURE typed accessor + writer** (round 163, RFC 9639 §8.8):
+  `metadata::parse_picture` and `metadata::write_picture` round-trip a
+  PICTURE block payload through a typed `Picture` struct that carries
+  every field RFC 9639 §8.8 / Table 12 defines —
+  `picture_type: u32`, `mime_type: String`, `description: String`,
+  the four informational fields `width` / `height` / `depth` /
+  `colour_count` (all `u32`), and `data: Vec<u8>`. The container's
+  pre-round-163 inline parser had two surface bugs that the typed
+  parser fixes: (a) it silently dropped 16 bytes of pixel metadata
+  (skipping past `width / height / depth / colour_count` with
+  `i += 16`) so callers could never inspect those fields, and (b) it
+  used `from_utf8(...).unwrap_or("")` on the mime / description
+  fields so an attacker-controlled non-UTF-8 byte sequence would
+  round-trip through an empty string. The typed parser enforces the
+  §8.8 printable-ASCII rule on `mime_type` (rejects any byte outside
+  `0x20..=0x7E`, including the special-cased `-->` URI sentinel
+  which passes by construction), enforces strict UTF-8 on
+  `description`, and rejects every truncation site (declared mime /
+  description / data lengths that overshoot the payload). The
+  container's `parse_flac_picture_block` now delegates to the typed
+  parser before projecting onto the framework's narrower
+  `AttachedPicture` accessor, so the demuxer inherits all of those
+  fixes without changing its public surface. The writer round-trips
+  through `parse_picture` byte-for-byte, accepts the spec-mandated
+  all-zero pixel-fields shape for vector images, preserves the full
+  32-bit `picture_type` (so a producer that smuggled a non-APIC code
+  through gets it back unchanged on the next read), and refuses
+  invalid mime bytes / oversized strings before emitting any output.
+  Twelve new unit tests in `metadata::tests` pin the round-trip
+  behaviour (JPEG front cover, indexed-GIF colour palette, vector
+  SVG with zero pixel fields, `-->` URI sentinel), the strict
+  parser checks (non-printable mime byte, invalid-UTF-8 description,
+  truncation at every internal field boundary, oversize mime /
+  data lengths, random-input panic-freedom) and the full-u32
+  picture-type preservation. Lib test count grows from 80 to 92.
+
 - **PADDING reservation in the encoder** (round 158, RFC 9639 §8.6):
   new `encoder::FlacEncoderOptions` (`#[non_exhaustive]`) with a
   `padding_bytes: Option<usize>` field and a new factory

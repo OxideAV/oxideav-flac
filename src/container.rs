@@ -19,8 +19,8 @@ use oxideav_core::{Demuxer, Muxer, ReadSeek, WriteSeek};
 
 use crate::frame::{parse_frame_header, FrameHeader};
 use crate::metadata::{
-    parse_cuesheet, parse_seektable, BlockHeader, BlockType, CueSheet, SeekPoint, StreamInfo as Si,
-    FLAC_MAGIC,
+    parse_cuesheet, parse_picture, parse_seektable, BlockHeader, BlockType, CueSheet, SeekPoint,
+    StreamInfo as Si, FLAC_MAGIC,
 };
 
 pub fn register(reg: &mut oxideav_core::ContainerRegistry) {
@@ -184,51 +184,34 @@ fn open_demuxer(
     }))
 }
 
-/// Parse a FLAC `METADATA_BLOCK_PICTURE` payload (block type 6). The
-/// wire format is shared with the base64 Vorbis-comment variant; the
-/// only difference is that the Vorbis version is base64-wrapped.
+/// Parse a FLAC `METADATA_BLOCK_PICTURE` payload (block type 6) and
+/// project it onto the framework's `AttachedPicture` surface (which
+/// carries the four fields every container shares — mime, picture
+/// type, description, raw data — but not the four FLAC-specific
+/// informational fields).
+///
+/// The wire-format parsing is delegated to
+/// [`crate::metadata::parse_picture`], which captures the full RFC
+/// 9639 §8.8 layout including width / height / depth / colour_count.
+/// The pre-round-163 inline parser had two surface bugs the typed
+/// parser fixes: it silently dropped 16 bytes of pixel-metadata, and
+/// it used `from_utf8(...).unwrap_or("")` on the mime / description
+/// fields so an attacker-controlled payload with non-UTF-8 bytes
+/// would round-trip through an empty string. The typed parser rejects
+/// both cases instead (mime: printable-ASCII enforcement per spec;
+/// description: strict UTF-8 per spec).
+///
+/// Returns `None` on a malformed PICTURE block — matching the
+/// pre-round-163 demuxer's non-fatal behaviour (a bad PICTURE block
+/// is dropped rather than failing the whole demux). A future
+/// container revision could surface the underlying `Error` instead.
 fn parse_flac_picture_block(buf: &[u8]) -> Option<AttachedPicture> {
-    let mut i = 0usize;
-    fn read_u32(buf: &[u8], i: &mut usize) -> Option<u32> {
-        if *i + 4 > buf.len() {
-            return None;
-        }
-        let v = u32::from_be_bytes([buf[*i], buf[*i + 1], buf[*i + 2], buf[*i + 3]]);
-        *i += 4;
-        Some(v)
-    }
-    let type_raw = read_u32(buf, &mut i)?;
-    let mime_len = read_u32(buf, &mut i)? as usize;
-    if i + mime_len > buf.len() {
-        return None;
-    }
-    let mime_type = std::str::from_utf8(&buf[i..i + mime_len])
-        .unwrap_or("")
-        .to_string();
-    i += mime_len;
-    let desc_len = read_u32(buf, &mut i)? as usize;
-    if i + desc_len > buf.len() {
-        return None;
-    }
-    let description = std::str::from_utf8(&buf[i..i + desc_len])
-        .unwrap_or("")
-        .to_string();
-    i += desc_len;
-    // Width, height, depth, colour count — skip: 4 × u32.
-    if i + 16 > buf.len() {
-        return None;
-    }
-    i += 16;
-    let data_len = read_u32(buf, &mut i)? as usize;
-    if i + data_len > buf.len() {
-        return None;
-    }
-    let data = buf[i..i + data_len].to_vec();
+    let pic = parse_picture(buf).ok()?;
     Some(AttachedPicture {
-        mime_type,
-        picture_type: PictureType::from_u8((type_raw & 0xFF) as u8),
-        description,
-        data,
+        mime_type: pic.mime_type,
+        picture_type: PictureType::from_u8((pic.picture_type & 0xFF) as u8),
+        description: pic.description,
+        data: pic.data,
     })
 }
 

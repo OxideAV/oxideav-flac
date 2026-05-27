@@ -5,7 +5,11 @@
 //!
 //! - The **container** parses `fLaC` magic + metadata blocks and emits one
 //!   packet per FLAC frame, scanning CRC-verified sync codes to find frame
-//!   boundaries. A muxer is also provided for round-trip encoding.
+//!   boundaries. PICTURE blocks (RFC 9639 §8.8) are surfaced through the
+//!   framework `AttachedPicture` accessor and additionally available in
+//!   typed form (with width / height / depth / colour_count) via
+//!   `metadata::parse_picture`. A muxer is also provided for round-trip
+//!   encoding.
 //! - The **codec** (id `flac`) ships both a spec-complete decoder (all
 //!   subframe types, all residual partition methods, 8/12/16/20/24/32 bps,
 //!   up to 8 channels, stereo decorrelation) and a working pure-Rust

@@ -655,6 +655,240 @@ pub fn write_padding(len: usize) -> Result<Vec<u8>> {
     Ok(vec![0u8; len])
 }
 
+/// Parsed PICTURE metadata block contents (RFC 9639 §8.8).
+///
+/// FLAC reuses the ID3v2 `APIC` taxonomy for `picture_type` (so the
+/// numeric value is shared across MP3 / FLAC / Ogg / MP4 cover-art
+/// surfaces), but on-wire the FLAC layout uses 4-byte length-prefixed
+/// strings instead of ID3v2's NUL-delimited strings, and additionally
+/// stores width / height / depth / colour_count metadata that ID3v2
+/// does not carry.
+///
+/// The four "informational" fields (`width`, `height`, `depth`,
+/// `colour_count`) are RFC 9639 §8.8 / RFC 9639 Table 12 fields that
+/// applications MUST NOT use for decoding the picture itself, but MAY
+/// use to pick between multiple picture blocks (e.g. preferring the
+/// front cover at a particular resolution) without first decoding the
+/// image. Renderers can use them to lay out a placeholder before the
+/// image decoder finishes. Per spec, a picture that has no concept of
+/// a given field — vector images, for example, have no width or
+/// height in pixels — sets that field to zero; the parser preserves
+/// the zero verbatim and the writer accepts it.
+///
+/// `colour_count` is meaningful only for indexed-colour formats
+/// (GIF, paletted PNG); non-indexed pictures store 0 per spec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picture {
+    /// Picture type code (ID3v2 APIC taxonomy). On the wire this is
+    /// a 32-bit unsigned integer; in practice only the low 8 bits
+    /// matter (the ID3v2 table only allocates 21 values, all <= 0x14),
+    /// but the writer round-trips the full 32-bit value so a producer
+    /// can re-emit a payload they parsed without surprising the next
+    /// reader. Out-of-range codes are still legal on the wire — the
+    /// spec only forbids the writer from inventing codes it didn't
+    /// receive.
+    pub picture_type: u32,
+    /// IANA media type (`"image/jpeg"`, `"image/png"`, ...) or the
+    /// special sentinel `"-->"`, meaning `data` is a URI string
+    /// pointing at the image rather than the image bytes themselves
+    /// (RFC 9639 §8.8 plus [RFC3986]). MUST be printable ASCII
+    /// (`0x20..=0x7E`); the parser enforces this and the writer
+    /// rejects strings that fail the same check.
+    pub mime_type: String,
+    /// Free-form UTF-8 description supplied by the tagger. Often
+    /// empty.
+    pub description: String,
+    /// Picture width in pixels (informational). Zero when the format
+    /// has no concept of pixel width (vector images).
+    pub width: u32,
+    /// Picture height in pixels (informational). Zero when the
+    /// format has no concept of pixel height.
+    pub height: u32,
+    /// Colour depth in bits per pixel (informational). Zero when
+    /// unknown.
+    pub depth: u32,
+    /// For indexed-colour pictures, the number of colours used.
+    /// Zero for non-indexed pictures (RGB photographs, ...) per
+    /// spec.
+    pub colour_count: u32,
+    /// The picture payload bytes — the raw encoded image when
+    /// `mime_type != "-->"`, or the URI bytes when `mime_type ==
+    /// "-->"`. Not interpreted by this crate; downstream image
+    /// decoders consume this as-is.
+    pub data: Vec<u8>,
+}
+
+/// Parse a FLAC PICTURE block payload (RFC 9639 §8.8 Table 12).
+///
+/// Wire layout (all integers big-endian unsigned):
+///
+/// ```text
+///   u32   picture type (Table 13)
+///   u32   mime length (N1)
+///   u8*N1 mime string (ASCII 0x20..=0x7E or "-->" URI sentinel)
+///   u32   description length (N2)
+///   u8*N2 description (UTF-8)
+///   u32   width  (informational, 0 if unknown / N/A)
+///   u32   height (informational, 0 if unknown / N/A)
+///   u32   depth  (informational, 0 if unknown)
+///   u32   colour count (informational, 0 for non-indexed)
+///   u32   picture data length (N3)
+///   u8*N3 picture data (or URI bytes when mime == "-->")
+/// ```
+///
+/// The parser rejects:
+/// * any payload whose length is too short to read the entire
+///   declared structure (`Error::NeedMore`-style truncation reported
+///   as `Error::invalid` with an explicit overrun message);
+/// * any mime-type string containing a byte outside the printable
+///   ASCII range `0x20..=0x7E` (per RFC 9639 §8.8: "this field MUST
+///   be in printable ASCII characters");
+/// * any mime-type or description length that overflows the
+///   remaining payload — protects against a hostile producer that
+///   declares a 4 GiB string inside a payload bounded by the 16 MiB
+///   block-header ceiling.
+///
+/// Note that the description is parsed with `from_utf8` rather than
+/// `from_utf8_lossy`: the spec mandates UTF-8 and we surface invalid
+/// UTF-8 as an error rather than silently replacing bad sequences
+/// with `U+FFFD`. The container's older inline parser used
+/// `from_utf8(...).unwrap_or("")` which silently dropped both the
+/// pixel-metadata block and any non-UTF-8 description; the typed
+/// parser surfaces both issues to the caller.
+pub fn parse_picture(bytes: &[u8]) -> Result<Picture> {
+    fn need(bytes: &[u8], i: usize, n: usize, what: &str) -> Result<()> {
+        if i.checked_add(n).map_or(true, |end| end > bytes.len()) {
+            return Err(Error::invalid(format!(
+                "FLAC PICTURE: payload truncated reading {what} \
+                 (need {n} bytes at offset {i}, have {})",
+                bytes.len()
+            )));
+        }
+        Ok(())
+    }
+    fn read_u32(bytes: &[u8], i: &mut usize, what: &str) -> Result<u32> {
+        need(bytes, *i, 4, what)?;
+        let v = u32::from_be_bytes([bytes[*i], bytes[*i + 1], bytes[*i + 2], bytes[*i + 3]]);
+        *i += 4;
+        Ok(v)
+    }
+
+    let mut i = 0usize;
+    let picture_type = read_u32(bytes, &mut i, "picture type")?;
+    let mime_len = read_u32(bytes, &mut i, "mime length")? as usize;
+    need(bytes, i, mime_len, "mime string")?;
+    let mime_slice = &bytes[i..i + mime_len];
+    for &b in mime_slice {
+        if !(0x20..=0x7E).contains(&b) {
+            return Err(Error::invalid(format!(
+                "FLAC PICTURE: mime byte 0x{b:02X} outside printable ASCII (0x20..=0x7E)"
+            )));
+        }
+    }
+    let mime_type = std::str::from_utf8(mime_slice)
+        .expect("printable ASCII is valid UTF-8")
+        .to_string();
+    i += mime_len;
+
+    let desc_len = read_u32(bytes, &mut i, "description length")? as usize;
+    need(bytes, i, desc_len, "description string")?;
+    let description = std::str::from_utf8(&bytes[i..i + desc_len])
+        .map_err(|e| Error::invalid(format!("FLAC PICTURE: description not valid UTF-8: {e}")))?
+        .to_string();
+    i += desc_len;
+
+    let width = read_u32(bytes, &mut i, "width")?;
+    let height = read_u32(bytes, &mut i, "height")?;
+    let depth = read_u32(bytes, &mut i, "depth")?;
+    let colour_count = read_u32(bytes, &mut i, "colour count")?;
+
+    let data_len = read_u32(bytes, &mut i, "data length")? as usize;
+    need(bytes, i, data_len, "picture data")?;
+    let data = bytes[i..i + data_len].to_vec();
+
+    Ok(Picture {
+        picture_type,
+        mime_type,
+        description,
+        width,
+        height,
+        depth,
+        colour_count,
+        data,
+    })
+}
+
+/// Serialise a [`Picture`] back into a RFC 9639 §8.8 PICTURE block
+/// payload. Round-trips through [`parse_picture`] byte-for-byte.
+///
+/// The writer enforces every invariant the parser checks for, before
+/// emitting any bytes:
+///
+/// * `mime_type` must be printable ASCII (`0x20..=0x7E`) — the spec
+///   requires this and our own parser would reject the output
+///   otherwise. The "-->" URI sentinel satisfies the check and is
+///   accepted as-is; in that case `data` is the URI bytes rather
+///   than image bytes.
+/// * `mime_type` length must fit a `u32` (always true on
+///   64-bit platforms within usize, but checked anyway for clarity).
+/// * `description` is written as its UTF-8 byte representation; any
+///   `String` is valid UTF-8 by Rust's type invariants, so no
+///   additional check is needed here.
+/// * `data.len()` must fit a `u32`.
+///
+/// Returns `Error::invalid` on any of those failures. The resulting
+/// payload may still exceed the metadata-block-header's 24-bit
+/// length ceiling (`BlockHeader::MAX_LENGTH`); the wrapping
+/// [`BlockHeader::write_into`] call catches that downstream so we
+/// don't duplicate the check here.
+pub fn write_picture(pic: &Picture) -> Result<Vec<u8>> {
+    if pic.mime_type.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "FLAC PICTURE: mime string length {} exceeds u32",
+            pic.mime_type.len()
+        )));
+    }
+    for &b in pic.mime_type.as_bytes() {
+        if !(0x20..=0x7E).contains(&b) {
+            return Err(Error::invalid(format!(
+                "FLAC PICTURE: mime byte 0x{b:02X} outside printable ASCII (0x20..=0x7E)"
+            )));
+        }
+    }
+    if pic.description.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "FLAC PICTURE: description length {} exceeds u32",
+            pic.description.len()
+        )));
+    }
+    if pic.data.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "FLAC PICTURE: data length {} exceeds u32",
+            pic.data.len()
+        )));
+    }
+
+    let total = 4 // picture type
+        + 4 + pic.mime_type.len()
+        + 4 + pic.description.len()
+        + 4 + 4 + 4 + 4 // width/height/depth/colour_count
+        + 4 + pic.data.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&pic.picture_type.to_be_bytes());
+    out.extend_from_slice(&(pic.mime_type.len() as u32).to_be_bytes());
+    out.extend_from_slice(pic.mime_type.as_bytes());
+    out.extend_from_slice(&(pic.description.len() as u32).to_be_bytes());
+    out.extend_from_slice(pic.description.as_bytes());
+    out.extend_from_slice(&pic.width.to_be_bytes());
+    out.extend_from_slice(&pic.height.to_be_bytes());
+    out.extend_from_slice(&pic.depth.to_be_bytes());
+    out.extend_from_slice(&pic.colour_count.to_be_bytes());
+    out.extend_from_slice(&(pic.data.len() as u32).to_be_bytes());
+    out.extend_from_slice(&pic.data);
+    debug_assert_eq!(out.len(), total);
+    Ok(out)
+}
+
 impl StreamInfo {
     /// Parse a STREAMINFO block. The block payload is exactly 34 bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -1472,5 +1706,282 @@ mod tests {
         assert!(chain[cur..cur + 64].iter().all(|&b| b == 0));
         cur += 64;
         assert_eq!(cur, chain.len());
+    }
+
+    // -----------------------------------------------------------------
+    // PICTURE block (RFC 9639 §8.8) — typed parser + writer.
+    // -----------------------------------------------------------------
+
+    /// Hand-roll the §8.8 wire payload so the parser test isn't
+    /// circular with the writer. Encoding follows Table 12 byte-for-
+    /// byte; widths/heights/depth/colour_count are caller-supplied so
+    /// the helper can build both "pixel image" and "vector image"
+    /// shapes (the latter with all four pixel fields set to zero per
+    /// spec).
+    #[allow(clippy::too_many_arguments)]
+    fn synth_picture_payload(
+        picture_type: u32,
+        mime: &[u8],
+        description: &[u8],
+        width: u32,
+        height: u32,
+        depth: u32,
+        colour_count: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&picture_type.to_be_bytes());
+        out.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        out.extend_from_slice(mime);
+        out.extend_from_slice(&(description.len() as u32).to_be_bytes());
+        out.extend_from_slice(description);
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&depth.to_be_bytes());
+        out.extend_from_slice(&colour_count.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn picture_parses_front_cover_jpeg() {
+        // Picture type 3 = "Cover (front)". A 4-byte JPEG-SOI-ish
+        // payload is enough to exercise the data-length field; the
+        // parser doesn't decode the image so any bytes will do.
+        let payload = synth_picture_payload(
+            3,
+            b"image/jpeg",
+            "Cover".as_bytes(),
+            640,
+            480,
+            24,
+            0,
+            &[0xFF, 0xD8, 0xFF, 0xE0],
+        );
+        let pic = parse_picture(&payload).expect("parse");
+        assert_eq!(pic.picture_type, 3);
+        assert_eq!(pic.mime_type, "image/jpeg");
+        assert_eq!(pic.description, "Cover");
+        assert_eq!(pic.width, 640);
+        assert_eq!(pic.height, 480);
+        assert_eq!(pic.depth, 24);
+        assert_eq!(pic.colour_count, 0);
+        assert_eq!(pic.data, vec![0xFF, 0xD8, 0xFF, 0xE0]);
+    }
+
+    #[test]
+    fn picture_round_trip_byte_for_byte() {
+        // Build the payload by hand, parse it, re-emit it, and confirm
+        // the writer reproduces the exact same bytes. This pins the
+        // writer to the parser's understanding of the wire format.
+        let original = synth_picture_payload(
+            3,
+            b"image/png",
+            "Front cover".as_bytes(),
+            1000,
+            1000,
+            32,
+            0,
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A],
+        );
+        let pic = parse_picture(&original).expect("parse");
+        let reemitted = write_picture(&pic).expect("write");
+        assert_eq!(original, reemitted);
+    }
+
+    #[test]
+    fn picture_round_trip_vector_zero_pixel_fields() {
+        // RFC 9639 §8.8: "If a picture has no concept for any of these
+        // fields (e.g., vector images may not have a height or width
+        // in pixels) or the content of any field is unknown, the
+        // affected fields MUST be set to zero." Make sure the writer
+        // accepts that shape and the parser preserves the zeros.
+        let pic = Picture {
+            picture_type: 0x00, // "Other"
+            mime_type: "image/svg+xml".into(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+            colour_count: 0,
+            data: b"<svg/>".to_vec(),
+        };
+        let bytes = write_picture(&pic).expect("write");
+        let parsed = parse_picture(&bytes).expect("parse");
+        assert_eq!(parsed, pic);
+    }
+
+    #[test]
+    fn picture_round_trip_indexed_gif_colour_count() {
+        // GIF carries a palette; colour_count is non-zero. Round-trip
+        // confirms the field survives both directions.
+        let pic = Picture {
+            picture_type: 0x03,
+            mime_type: "image/gif".into(),
+            description: "Animated cover".into(),
+            width: 320,
+            height: 240,
+            depth: 8,
+            colour_count: 256,
+            data: b"GIF89a".to_vec(),
+        };
+        let bytes = write_picture(&pic).expect("write");
+        let parsed = parse_picture(&bytes).expect("parse");
+        assert_eq!(parsed, pic);
+        assert_eq!(parsed.colour_count, 256);
+    }
+
+    #[test]
+    fn picture_round_trip_uri_sentinel() {
+        // The "-->" mime sentinel signals that `data` is a URI rather
+        // than image bytes. The parser must accept it (it's printable
+        // ASCII) and the writer must round-trip it unchanged.
+        let pic = Picture {
+            picture_type: 0x00,
+            mime_type: "-->".into(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+            colour_count: 0,
+            data: b"https://example.invalid/cover.jpg".to_vec(),
+        };
+        let bytes = write_picture(&pic).expect("write");
+        let parsed = parse_picture(&bytes).expect("parse");
+        assert_eq!(parsed, pic);
+    }
+
+    #[test]
+    fn picture_rejects_non_printable_mime_byte() {
+        // 0x01 violates "MUST be in printable ASCII characters
+        // 0x20-0x7E"; both parser and writer must reject it.
+        let mut payload = synth_picture_payload(3, b"image/jpeg", b"", 1, 1, 24, 0, b"\xFF");
+        // Corrupt the mime byte at offset 4 (picture_type:4 + mime_len:4 = 8).
+        payload[8] = 0x01;
+        assert!(parse_picture(&payload).is_err());
+
+        let pic = Picture {
+            picture_type: 0,
+            mime_type: "\x01bad".into(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+            colour_count: 0,
+            data: Vec::new(),
+        };
+        assert!(write_picture(&pic).is_err());
+    }
+
+    #[test]
+    fn picture_rejects_invalid_utf8_description() {
+        // The description field is mandated UTF-8 (§8.8). Synthesise a
+        // payload whose description bytes are invalid UTF-8 (a lone
+        // 0x80 continuation byte) and confirm the parser rejects it.
+        let payload = synth_picture_payload(
+            0,
+            b"image/jpeg",
+            &[0x80, 0x80, 0x80],
+            0,
+            0,
+            0,
+            0,
+            b"\xFF\xD8",
+        );
+        assert!(parse_picture(&payload).is_err());
+    }
+
+    #[test]
+    fn picture_rejects_truncated_payloads_at_every_field_boundary() {
+        // Build a full payload then truncate at every internal
+        // boundary; every truncation must produce Err (no panics, no
+        // partial reads).
+        let full = synth_picture_payload(
+            3,
+            b"image/jpeg",
+            b"Cover",
+            640,
+            480,
+            24,
+            0,
+            &[0xFF, 0xD8, 0xFF, 0xE0],
+        );
+        for cut in 0..full.len() {
+            let slice = &full[..cut];
+            assert!(
+                parse_picture(slice).is_err(),
+                "truncation at {cut} bytes should have failed"
+            );
+        }
+        // The full payload itself parses cleanly.
+        assert!(parse_picture(&full).is_ok());
+    }
+
+    #[test]
+    fn picture_rejects_oversize_mime_length() {
+        // Declare a 4 GiB-1 mime length inside a 16-byte payload. The
+        // length read succeeds but the bounds check on the string read
+        // must reject before we attempt a 4 GiB slice / allocation.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes()); // picture_type
+        payload.extend_from_slice(&u32::MAX.to_be_bytes()); // mime_len
+        let err = parse_picture(&payload).expect_err("must reject");
+        // Sanity: the error mentions the truncation site so a debug
+        // user can find the offending field.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mime string") || msg.contains("truncated"),
+            "error should mention mime string truncation: {msg}"
+        );
+    }
+
+    #[test]
+    fn picture_rejects_oversize_data_length() {
+        // All earlier fields read cleanly; the data-length field
+        // declares more bytes than remain. Must reject without
+        // panicking or over-reading.
+        let payload = synth_picture_payload(3, b"image/jpeg", b"", 1, 1, 24, 0, b"abc");
+        // Replace the data length (last u32 before the actual data
+        // bytes) with 0xFFFF_FFFF.
+        let data_len_off = payload.len() - 3 - 4; // 3 bytes data + 4-byte length
+        let mut bad = payload.clone();
+        bad[data_len_off..data_len_off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_picture(&bad).is_err());
+    }
+
+    #[test]
+    fn picture_does_not_panic_on_random_input() {
+        // Sweep a handful of unstructured payload shapes; every
+        // outcome must be either Ok or Err (no panic).
+        for len in [0usize, 1, 4, 16, 40, 128] {
+            let buf = vec![0xABu8; len];
+            let _ = parse_picture(&buf);
+        }
+        // Also try a payload whose every field declares the same
+        // legal-but-large length; with len = 1024 the mime_len of
+        // 0xABABABAB will definitely overshoot, so this must Err.
+        let _ = parse_picture(&vec![0xABu8; 1024]);
+    }
+
+    #[test]
+    fn picture_writer_preserves_full_u32_picture_type() {
+        // The §8.8 picture_type field is a u32 on the wire. Even if
+        // only the low 8 bits map to ID3v2's APIC taxonomy, a producer
+        // that smuggles a non-standard high-bit value through MUST
+        // get the exact bits back on the next read.
+        let pic = Picture {
+            picture_type: 0xDEAD_BEEF,
+            mime_type: "image/jpeg".into(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+            colour_count: 0,
+            data: Vec::new(),
+        };
+        let bytes = write_picture(&pic).expect("write");
+        let parsed = parse_picture(&bytes).expect("parse");
+        assert_eq!(parsed.picture_type, 0xDEAD_BEEF);
     }
 }

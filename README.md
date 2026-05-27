@@ -212,6 +212,27 @@ non-Subset):
   real point that shadows the placeholder sentinel — both would
   silently corrupt the table on the next parse pass. Round-trips
   through `parse_seektable` byte-for-byte.
+- **PICTURE typed accessor + writer**: `metadata::parse_picture` and
+  `metadata::write_picture` round-trip a RFC 9639 §8.8 PICTURE block
+  payload through a typed `Picture` struct that carries every field
+  the spec defines — `picture_type`, `mime_type`, `description`, the
+  four informational fields (`width`, `height`, `depth`,
+  `colour_count`), and the raw `data` bytes. The container demuxer
+  internally projects onto the framework's narrower `AttachedPicture`
+  (which has no pixel-metadata slots) via the typed parser; callers
+  who need width / height / depth / colour_count read the block
+  payload from the demuxer's preserved metadata-chain extradata and
+  feed it to `parse_picture` directly. The pre-round-163 inline
+  parser silently dropped the 16 bytes of pixel metadata and used
+  `from_utf8(...).unwrap_or("")` on the mime / description fields so
+  a payload with non-UTF-8 bytes round-tripped through an empty
+  string; the typed parser enforces both the §8.8 printable-ASCII
+  rule on mime and strict UTF-8 on description. The writer accepts
+  the spec-mandated zero-fields shape for vector images, preserves
+  the full 32-bit `picture_type` (so a producer that smuggled a
+  non-APIC code through gets it back on the next read) and rejects
+  the `-->` URI sentinel only when its bytes happen to be
+  non-printable (which they aren't).
 - **PADDING writer + composable block-header serialiser**:
   `metadata::write_padding(len)` returns a `len`-byte all-zero
   payload per RFC 9639 §8.6, capped at the 24-bit block-header
