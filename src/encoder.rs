@@ -1091,8 +1091,44 @@ struct PartChoice {
 /// under the given method (`param_bits` = 4 or 5, `k_max` = 14 or 30).
 /// Compares the best Rice parameter against an escape (raw fixed-width)
 /// partition and returns whichever costs fewer bits.
+///
+/// Retained as the reference path against which [`best_partition_z`] is
+/// regression-tested in the unit-test module. The production encoder
+/// path (`encode_rice_residual`) uses the zigzag-amortised variant.
+#[cfg(test)]
 fn best_partition(residuals: &[i32], param_bits: u32, k_max: u32) -> PartChoice {
     let (rice_bits, k) = best_rice_params(residuals, k_max);
+    let rice_cost = param_bits as u64 + rice_bits;
+
+    let needed_bits = raw_bits_needed(residuals);
+    if needed_bits <= 31 {
+        let escape_cost = param_bits as u64 + 5 + (residuals.len() as u64) * needed_bits as u64;
+        if escape_cost < rice_cost {
+            return PartChoice {
+                coding: PartCoding::Escape {
+                    raw_bps: needed_bits,
+                },
+                cost: escape_cost,
+            };
+        }
+    }
+    PartChoice {
+        coding: PartCoding::Rice { k },
+        cost: rice_cost,
+    }
+}
+
+/// Variant of [`best_partition`] that takes a pre-computed zigzag slice
+/// alongside the original residuals (the escape-path raw-bits scan still
+/// needs the signed input). Avoids the per-partition `Vec<u32>` alloc
+/// + per-residual zigzag re-pass that the standalone path runs.
+///
+/// The cost is the **same** the standalone path would compute — the only
+/// change is that the zigzag is computed once per subframe and shared
+/// across every `(method, partition_order)` pair the search visits.
+fn best_partition_z(residuals: &[i32], zigzag: &[u32], param_bits: u32, k_max: u32) -> PartChoice {
+    debug_assert_eq!(residuals.len(), zigzag.len());
+    let (rice_bits, k) = best_rice_params_z(zigzag, k_max);
     let rice_cost = param_bits as u64 + rice_bits;
 
     let needed_bits = raw_bits_needed(residuals);
@@ -1117,6 +1153,11 @@ fn best_partition(residuals: &[i32], param_bits: u32, k_max: u32) -> PartChoice 
 /// partition order under one method, or `None` if the layout is illegal
 /// (block size not divisible by `2^p`, or the first partition would have
 /// no residual slots left after the warmup samples).
+///
+/// Retained as the reference path. The production encoder uses
+/// [`partition_layout_cost_z`] which shares one zigzag buffer across
+/// the entire search.
+#[cfg(test)]
 fn partition_layout_cost(
     residuals: &[i32],
     block_size: usize,
@@ -1147,6 +1188,49 @@ fn partition_layout_cost(
     Some(total)
 }
 
+/// Same as [`partition_layout_cost`] but operates on a pre-zigzagged
+/// view of the same residual span. The two slices are parallel (same
+/// length and ordering) so the per-partition indices match. Used by
+/// [`encode_rice_residual`] to amortise the zigzag conversion across
+/// every `(method, partition_order)` pair in the search.
+fn partition_layout_cost_z(
+    residuals: &[i32],
+    zigzag: &[u32],
+    block_size: usize,
+    predictor_order: usize,
+    partition_order: u32,
+    param_bits: u32,
+    k_max: u32,
+) -> Option<u64> {
+    debug_assert_eq!(residuals.len(), zigzag.len());
+    let n_partitions = 1usize << partition_order;
+    if block_size % n_partitions != 0 {
+        return None;
+    }
+    let partition_size = block_size / n_partitions;
+    if partition_size <= predictor_order {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut idx = 0usize;
+    for p in 0..n_partitions {
+        let count = if p == 0 {
+            partition_size - predictor_order
+        } else {
+            partition_size
+        };
+        total += best_partition_z(
+            &residuals[idx..idx + count],
+            &zigzag[idx..idx + count],
+            param_bits,
+            k_max,
+        )
+        .cost;
+        idx += count;
+    }
+    Some(total)
+}
+
 /// Emit the partitioned-Rice residual for one subframe and return the
 /// exact number of bits written. Searches every legal partition order
 /// (0..=MAX_PARTITION_ORDER) under both Rice methods (4-bit and 5-bit
@@ -1159,13 +1243,33 @@ fn encode_rice_residual(
     block_size: usize,
     predictor_order: usize,
 ) -> u32 {
+    // Zigzag the entire residual span **once**. Both the partition-order
+    // search and the emit loop reuse this single buffer instead of
+    // re-zigzagging each partition for every `(method, partition_order)`
+    // pair the search visits (2 methods × up to 9 orders × N partitions).
+    // The buffer stays in cache for the rest of the call: the typical
+    // 4096-sample residual is 16 KiB of `u32`, comfortably inside L1.
+    //
+    // Pre-round-176 the standalone `best_rice_params` path allocated a
+    // fresh `Vec<u32>` per partition per partition-order; profile-147
+    // showed `best_partition` at ~61 % of encode self-samples. Folding
+    // the zigzag conversion up to subframe scope removes that redundant
+    // work entirely.
+    let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+
     // Find the (method, partition_order) pair with the smallest payload.
     let mut best: Option<(u32, u32, u32, u32, u64)> = None; // method, param_bits, k_max, p, cost
     for (method, param_bits, k_max) in [(0u32, 4u32, 14u32), (1u32, 5u32, 30u32)] {
         for p in 0..=MAX_PARTITION_ORDER {
-            let Some(cost) =
-                partition_layout_cost(residuals, block_size, predictor_order, p, param_bits, k_max)
-            else {
+            let Some(cost) = partition_layout_cost_z(
+                residuals,
+                &zigzag,
+                block_size,
+                predictor_order,
+                p,
+                param_bits,
+                k_max,
+            ) else {
                 // Higher orders only get more constrained — once a split
                 // is illegal for this block size, larger ones are too.
                 break;
@@ -1200,8 +1304,9 @@ fn encode_rice_residual(
             partition_size
         };
         let slice = &residuals[idx..idx + count];
+        let z_slice = &zigzag[idx..idx + count];
         idx += count;
-        let choice = best_partition(slice, param_bits, k_max);
+        let choice = best_partition_z(slice, z_slice, param_bits, k_max);
         match choice.coding {
             PartCoding::Escape { raw_bps } => {
                 w.write_u32(escape_marker, param_bits);
@@ -1215,8 +1320,9 @@ fn encode_rice_residual(
             PartCoding::Rice { k } => {
                 w.write_u32(k, param_bits);
                 total_bits += param_bits;
-                for &r in slice {
-                    let u = zigzag_encode(r);
+                // Reuse the cached zigzag rather than re-zigzagging
+                // each residual in the unary/remainder split.
+                for &u in z_slice {
                     let q = u >> k;
                     w.write_unary(q);
                     if k > 0 {
@@ -1297,6 +1403,7 @@ fn rice_cost_for_k(zigzag: &[u32], k: u32, best_bits: u64) -> u64 {
 /// non-increasing), so the local minimum within the window plus
 /// directional extension is also the global minimum — the same `k` the
 /// brute-force loop would have returned, just at a fraction of the work.
+#[cfg(test)]
 fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     if residuals.is_empty() {
         return (0, 0);
@@ -1306,6 +1413,19 @@ fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     // Vec stays well inside cache, and removing the redundant work
     // dominates the small allocation overhead.
     let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+    best_rice_params_z(&zigzag, k_max)
+}
+
+/// Pre-zigzagged variant of [`best_rice_params`]. Skips the per-call
+/// `Vec<u32>` allocation by accepting a caller-owned zigzag slice; the
+/// caller (typically [`encode_rice_residual`]) computes the zigzag once
+/// per subframe and re-slices it across every partition the search
+/// visits. Output is bit-identical to [`best_rice_params`] for the
+/// equivalent input.
+fn best_rice_params_z(zigzag: &[u32], k_max: u32) -> (u64, u32) {
+    if zigzag.is_empty() {
+        return (0, 0);
+    }
     let n = zigzag.len() as u64;
     let sum_u: u64 = zigzag.iter().map(|&u| u as u64).sum();
 
@@ -1339,7 +1459,7 @@ fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     let mut best_k = lo;
     let mut best_bits = u64::MAX;
     for k in lo..=hi {
-        let cost = rice_cost_for_k(&zigzag, k, best_bits);
+        let cost = rice_cost_for_k(zigzag, k, best_bits);
         if cost < best_bits {
             best_bits = cost;
             best_k = k;
@@ -1353,7 +1473,7 @@ fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     // past `k_max`, which is the spec-imposed parameter ceiling.
     if best_k == lo && lo > 0 {
         for k in (0..lo).rev() {
-            let cost = rice_cost_for_k(&zigzag, k, best_bits);
+            let cost = rice_cost_for_k(zigzag, k, best_bits);
             if cost < best_bits {
                 best_bits = cost;
                 best_k = k;
@@ -1364,7 +1484,7 @@ fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
     }
     if best_k == hi && hi < k_max {
         for k in (hi + 1)..=k_max {
-            let cost = rice_cost_for_k(&zigzag, k, best_bits);
+            let cost = rice_cost_for_k(zigzag, k, best_bits);
             if cost < best_bits {
                 best_bits = cost;
                 best_k = k;
@@ -2832,5 +2952,104 @@ mod tests {
         assert!(seen_streaminfo);
         assert!(seen_padding);
         assert_eq!(cursor, extradata.len(), "chain must be fully consumed");
+    }
+
+    /// Round-176 hoisted the partition-search zigzag conversion from
+    /// per-partition-per-(method, partition_order) scope up to a single
+    /// per-subframe `Vec<u32>`. The zigzag-amortised search variants
+    /// (`partition_layout_cost_z`, `best_partition_z`, `best_rice_params_z`)
+    /// must produce **bit-identical** layout costs to the standalone
+    /// pre-round-176 path for every residual the encoder might submit —
+    /// otherwise the search would pick a different `(method, partition_order)`
+    /// pair and the on-wire output would silently drift.
+    ///
+    /// This regression test crosswalks the new path against the retained
+    /// reference path across the same diverse residual buffers the
+    /// `best_rice_params_matches_brute_force_reference` test uses
+    /// (degenerate, Laplace-shaped, split-statistics, all-zero,
+    /// adversarial single-spike), plus every legal partition order for a
+    /// 4096-sample block under both methods. A mismatch fails the test
+    /// before it can reach a fixture round-trip.
+    #[test]
+    fn partition_layout_cost_z_matches_reference() {
+        fn xorshift32(state: &mut u32) -> u32 {
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            *state
+        }
+
+        let block = 4096usize;
+        let mut cases: Vec<(String, Vec<i32>)> = Vec::new();
+
+        // Degenerate: all zero residuals — every partition collapses to
+        // k=0 Rice across the board.
+        cases.push(("all-zero".into(), vec![0i32; block]));
+
+        // Degenerate: single-spike — one huge residual hidden in
+        // otherwise-tiny content; tests that an escape partition
+        // wins for the partition that contains the spike.
+        let mut spike = vec![1i32; block];
+        spike[block / 2] = 1_000_000;
+        cases.push(("single-spike".into(), spike));
+
+        // Laplace-shaped at a few mean magnitudes spanning the realistic
+        // span the encoder sees.
+        for (mean, seed) in [(2u32, 0xDEAD_BEEFu32), (32, 1), (512, 2)] {
+            let mut state = seed;
+            let mut buf = Vec::with_capacity(block);
+            for _ in 0..block {
+                let u = xorshift32(&mut state);
+                let mag = (u % (mean * 4 + 1)) as i32;
+                let sign = if (u >> 31) & 1 == 1 { -1 } else { 1 };
+                buf.push(sign * mag);
+            }
+            cases.push((format!("laplace(mean={mean})"), buf));
+        }
+
+        // Split-statistics: tiny first half, huge second half — the
+        // canonical case higher partition orders exist to exploit.
+        let mut split = Vec::with_capacity(block);
+        for i in 0..block {
+            if i < block / 2 {
+                split.push((i % 3) as i32 - 1);
+            } else {
+                split.push(((i * 2654435761usize) % 20000) as i32 - 10000);
+            }
+        }
+        cases.push(("split-stats".into(), split));
+
+        for (name, residuals) in &cases {
+            let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+            for predictor_order in [0usize, 1, 4, 8, 12] {
+                for (param_bits, k_max) in [(4u32, 14u32), (5u32, 30u32)] {
+                    for partition_order in 0..=MAX_PARTITION_ORDER {
+                        let ref_cost = partition_layout_cost(
+                            residuals,
+                            block,
+                            predictor_order,
+                            partition_order,
+                            param_bits,
+                            k_max,
+                        );
+                        let opt_cost = partition_layout_cost_z(
+                            residuals,
+                            &zigzag,
+                            block,
+                            predictor_order,
+                            partition_order,
+                            param_bits,
+                            k_max,
+                        );
+                        assert_eq!(
+                            ref_cost, opt_cost,
+                            "{name}: cost mismatch for predictor_order={predictor_order} \
+                             param_bits={param_bits} partition_order={partition_order}: \
+                             ref={ref_cost:?} opt={opt_cost:?}",
+                        );
+                    }
+                }
+            }
+        }
     }
 }

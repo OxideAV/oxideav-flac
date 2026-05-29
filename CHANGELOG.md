@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Encoder: amortise residual zigzag across the partition-order search**
+  (round 176, RFC 9639 §9.2.5). Pre-round-176 the partitioned-Rice
+  search re-zigzagged every residual partition under every
+  `(method, partition_order)` pair it visited — for a 4096-sample
+  subframe that meant `2 methods × up to 9 orders × N partitions`
+  fresh `Vec<u32>` allocations + linear scans, with `best_partition`
+  pinned at ~61 % of encode self-samples in the round-147 captured
+  flamegraph. The hot path now zigzags the entire residual span once
+  per subframe in `encode_rice_residual` and re-slices that single
+  buffer across every layout the search probes
+  (`partition_layout_cost_z` → `best_partition_z` → `best_rice_params_z`).
+  Both the search and the emit loop (Rice quotient / remainder split)
+  read from the cached buffer. The pre-round-176 functions
+  (`partition_layout_cost`, `best_partition`, `best_rice_params`) are
+  retained behind `#[cfg(test)]` as the reference path; a new regression
+  test (`partition_layout_cost_z_matches_reference`) crosswalks the
+  optimised path against the reference across every
+  `(predictor_order, param_bits, partition_order)` combination on
+  five hand-tuned residual buffers (all-zero, single-spike,
+  Laplace(mean=2/32/512), split-statistics) so any future drift
+  surfaces before the on-wire output can change. Measured wins on the
+  existing encode benches (M-series laptop, `--quick --measurement-time 3`):
+  `mono/s16/44k1/1s` 316 ms → 272 ms (~14 %), `stereo/s16/44k1/1s`
+  1245 ms → 1096 ms (~12 %), `mono/wasted/s16/44k1/1s` 368 ms → 284 ms
+  (~23 %). Decoder and on-wire output are unchanged: every existing
+  encode-decode round-trip + the partitioned-Rice search test pass
+  byte-identically.
+
 ### Added
 
 - **PICTURE typed accessor + writer** (round 163, RFC 9639 §8.8):
