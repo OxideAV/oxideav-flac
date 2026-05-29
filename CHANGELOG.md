@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Encoder: subframe-scoped prefix-sum + raw-bits tables for the
+  partitioned-Rice search** (round 186, RFC 9639 §9.2.5). Pre-round-186
+  the per-partition `sum_u` reduction inside `best_rice_params_z` (the
+  input to the closed-form `k_est` derivation) and the per-partition
+  `raw_bits_needed` scan inside `best_partition_z` (the escape-cost
+  test) both re-walked the partition slice on every
+  `(method, partition_order)` pair the search visited — for a 4096-sample
+  subframe, that's 2 methods × up to 9 orders × N partitions = up to
+  ~1000 redundant linear scans per subframe. Round 186 folds both
+  scans up to **once per subframe**: a `zigzag_prefix[i] = sum(zigzag[0..i])`
+  table reduces any partition's `sum_u` to a single subtraction
+  (`prefix[end] - prefix[start]`), and a per-sample `raw_bits[i]: u8`
+  table replaces the escape path's `leading_zeros`-on-i32 inner with
+  a max over a precomputed `u8` slice. The `rice_cost_for_k` walks
+  still run per candidate `k` — that's the inherent cost of scoring
+  a Rice parameter — but every other per-partition O(n) pass is
+  removed from the hot path. The pre-round-186 functions
+  (`partition_layout_cost_z`, `best_partition_z`, `best_rice_params_z`,
+  `raw_bits_needed`) are retained behind `#[cfg(test)]` as the
+  reference path; the existing `partition_layout_cost_z_matches_reference`
+  regression test now crosswalks **both** the round-176 `_z` path and
+  the round-186 `_zp` path against the standalone `partition_layout_cost`
+  reference across all five existing residual cases (all-zero,
+  single-spike, three Laplace means, split-statistics) plus a new
+  `edge-i32-bounds` case that probes `raw_bits_for_sample` at the
+  `i32::MIN` / `i32::MAX` extremes; the new `_zp` path is bit-identical
+  to both. Measured wins on the existing encode benches (M-series
+  laptop, `--quick --measurement-time 3`): `mono/s24/48k/500ms`
+  160 ms → 128 ms (~20 %), `stereo/s24/48k/500ms` 622 ms → 511 ms
+  (~18 %), `6ch/s16/48k/250ms` 474 ms → 410 ms (~13 %),
+  `stereo/s16/44k1/1s` 1095 ms → 1055 ms (~4 %). The wider-sample
+  scenarios benefit the most: `raw_bits_for_sample` is invoked once
+  per residual element regardless of bit depth, so removing its
+  hot-path repetition shows up first on subframes whose residuals
+  carry more bits. Decoder, encoder on-wire output, and every
+  existing encode-decode round-trip pass byte-identically.
+
 - **Encoder: in-place symmetric-pair Levinson-Durbin update**
   (round 182, RFC 9639 §9.2.6). The autocorrelation-to-coefficient
   step at the heart of LPC analysis ran a textbook Levinson-Durbin

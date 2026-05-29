@@ -1123,9 +1123,11 @@ fn best_partition(residuals: &[i32], param_bits: u32, k_max: u32) -> PartChoice 
 /// needs the signed input). Avoids the per-partition `Vec<u32>` alloc
 /// + per-residual zigzag re-pass that the standalone path runs.
 ///
-/// The cost is the **same** the standalone path would compute — the only
-/// change is that the zigzag is computed once per subframe and shared
-/// across every `(method, partition_order)` pair the search visits.
+/// Retained as the round-176 reference path. The production encoder
+/// (`encode_rice_residual`) now uses [`best_partition_zp`] which
+/// additionally amortises the `sum_u` derivation and the `raw_bits`
+/// scan across the search via subframe-scoped prefix/per-element tables.
+#[cfg(test)]
 fn best_partition_z(residuals: &[i32], zigzag: &[u32], param_bits: u32, k_max: u32) -> PartChoice {
     debug_assert_eq!(residuals.len(), zigzag.len());
     let (rice_bits, k) = best_rice_params_z(zigzag, k_max);
@@ -1134,6 +1136,118 @@ fn best_partition_z(residuals: &[i32], zigzag: &[u32], param_bits: u32, k_max: u
     let needed_bits = raw_bits_needed(residuals);
     if needed_bits <= 31 {
         let escape_cost = param_bits as u64 + 5 + (residuals.len() as u64) * needed_bits as u64;
+        if escape_cost < rice_cost {
+            return PartChoice {
+                coding: PartCoding::Escape {
+                    raw_bps: needed_bits,
+                },
+                cost: escape_cost,
+            };
+        }
+    }
+    PartChoice {
+        coding: PartCoding::Rice { k },
+        cost: rice_cost,
+    }
+}
+
+/// Per-element bit width required to store `residuals[i]` raw as a
+/// two's-complement signed integer; matches the per-element body of
+/// [`raw_bits_needed`] without its outer max-and-clamp. Always in
+/// `1..=32` for any `i32` value. Used to seed [`raw_bits_table`] so
+/// the per-partition escape-cost test reduces to a max over a
+/// precomputed `u8` slice instead of re-derived `leading_zeros` per
+/// partition per `(method, partition_order)` pair.
+#[inline(always)]
+fn raw_bits_for_sample(r: i32) -> u8 {
+    let needed = if r >= 0 {
+        33 - (r as u32).leading_zeros()
+    } else {
+        33 - (!r as u32).leading_zeros()
+    };
+    // The per-element value is bounded by 32 by construction (33 minus
+    // at least 1 leading zero across both arms of the branch), so the
+    // cast to u8 cannot truncate.
+    needed as u8
+}
+
+/// Build the subframe-scoped tables the partitioned-Rice search reuses
+/// across every `(method, partition_order)` pair. Two arrays of length
+/// `residuals.len() + 1` (prefix sums) and `residuals.len()` (per-sample
+/// raw-bit widths) replace one full O(n) sum + one full O(n) leading-zero
+/// scan per partition per pair the search visits.
+///
+/// * `prefix[i] = sum(zigzag[0..i])`, so a partition's `sum_u` is
+///   `prefix[end] - prefix[start]` in O(1). Stored as `u64` because the
+///   sum of 4096 u32 zigzag values can reach 2^32 × 4096 = 2^44, well
+///   inside `u64::MAX` even at the full 4 KiB block.
+/// * `raw_bits[i] = raw_bits_for_sample(residuals[i])`. A partition's
+///   escape-cost test reads `max(raw_bits[start..end])` (each element is
+///   already clamped to `[1, 32]`) instead of running `leading_zeros`
+///   inside the inner loop.
+///
+/// Allocates twice per subframe (the two tables) — both fit in L1 for
+/// any realistic block size: the 32 KiB `prefix` + 4 KiB `raw_bits`
+/// pair stays under 36 KiB for a 4096-sample residual.
+fn build_partition_tables(residuals: &[i32], zigzag: &[u32]) -> (Vec<u64>, Vec<u8>) {
+    debug_assert_eq!(residuals.len(), zigzag.len());
+    let n = residuals.len();
+    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.push(0u64);
+    let mut acc: u64 = 0;
+    for &u in zigzag {
+        acc += u as u64;
+        prefix.push(acc);
+    }
+    let raw_bits: Vec<u8> = residuals.iter().map(|&r| raw_bits_for_sample(r)).collect();
+    (prefix, raw_bits)
+}
+
+/// Pre-computed-stats variant of [`best_partition_z`]. The chosen
+/// `(rice_cost, k)` plus the escape-cost comparison are derived from
+/// subframe-scoped prefix-sum + per-sample raw-bits tables; both shared
+/// across every `(method, partition_order)` pair in the partition-order
+/// search. The walk-based `sum(u >> k)` inside [`rice_cost_for_k`] still
+/// runs per candidate `k` — that's the inherent cost of scoring a Rice
+/// parameter — but the `sum_u` pass (the closed-form `k_est`'s input) is
+/// folded into a single O(1) prefix-sum subtraction, and the escape-path
+/// `raw_bits_needed` scan is replaced by a `max(u8 slice)` over the
+/// precomputed widths.
+fn best_partition_zp(
+    zigzag: &[u32],
+    prefix: &[u64],
+    raw_bits: &[u8],
+    start: usize,
+    end: usize,
+    param_bits: u32,
+    k_max: u32,
+) -> PartChoice {
+    debug_assert!(end <= zigzag.len());
+    debug_assert_eq!(prefix.len(), zigzag.len() + 1);
+    debug_assert_eq!(raw_bits.len(), zigzag.len());
+
+    let z_slice = &zigzag[start..end];
+    let sum_u = prefix[end] - prefix[start];
+    let (rice_bits, k) = best_rice_params_zp(z_slice, sum_u, k_max);
+    let rice_cost = param_bits as u64 + rice_bits;
+
+    // Max width over the precomputed per-sample u8 table. The empty
+    // case is impossible here — partition_layout_cost_zp short-circuits
+    // out before reaching this helper when partition_size would be
+    // zero — but we still guard against it to keep the function
+    // self-consistent.
+    let needed_bits = {
+        let mut m: u8 = 1;
+        for &b in &raw_bits[start..end] {
+            if b > m {
+                m = b;
+            }
+        }
+        m as u32
+    };
+    if needed_bits <= 31 {
+        let n = (end - start) as u64;
+        let escape_cost = param_bits as u64 + 5 + n * needed_bits as u64;
         if escape_cost < rice_cost {
             return PartChoice {
                 coding: PartCoding::Escape {
@@ -1190,9 +1304,13 @@ fn partition_layout_cost(
 
 /// Same as [`partition_layout_cost`] but operates on a pre-zigzagged
 /// view of the same residual span. The two slices are parallel (same
-/// length and ordering) so the per-partition indices match. Used by
-/// [`encode_rice_residual`] to amortise the zigzag conversion across
-/// every `(method, partition_order)` pair in the search.
+/// length and ordering) so the per-partition indices match.
+///
+/// Retained as the round-176 reference path. The production encoder
+/// uses [`partition_layout_cost_zp`] which additionally folds the
+/// per-partition `sum_u` and `raw_bits` scans into subframe-scoped
+/// prefix/per-element tables.
+#[cfg(test)]
 fn partition_layout_cost_z(
     residuals: &[i32],
     zigzag: &[u32],
@@ -1231,6 +1349,65 @@ fn partition_layout_cost_z(
     Some(total)
 }
 
+/// Production partition-order cost helper. Same per-partition cost
+/// the `_z` reference path would compute — every layout decision
+/// (which Rice `k` per partition, which partitions take the escape
+/// path) is byte-identical — but the per-partition `sum_u` and
+/// `raw_bits` scans read from subframe-scoped tables instead of
+/// re-deriving from the slice on every visit. Each
+/// `(method, partition_order)` pair pays only the `rice_cost_for_k`
+/// walks the search inherently needs.
+///
+/// Eight arguments because each table comes from a different stage of
+/// the per-subframe pipeline (zigzag conversion, prefix sum, per-sample
+/// raw widths, then the search loop's geometric and method parameters);
+/// folding them into a struct would push the allocation onto every call
+/// site without buying any clarity over the call shape `_z` already
+/// uses with seven arguments.
+#[allow(clippy::too_many_arguments)]
+fn partition_layout_cost_zp(
+    zigzag: &[u32],
+    prefix: &[u64],
+    raw_bits: &[u8],
+    block_size: usize,
+    predictor_order: usize,
+    partition_order: u32,
+    param_bits: u32,
+    k_max: u32,
+) -> Option<u64> {
+    debug_assert_eq!(prefix.len(), zigzag.len() + 1);
+    debug_assert_eq!(raw_bits.len(), zigzag.len());
+    let n_partitions = 1usize << partition_order;
+    if block_size % n_partitions != 0 {
+        return None;
+    }
+    let partition_size = block_size / n_partitions;
+    if partition_size <= predictor_order {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut idx = 0usize;
+    for p in 0..n_partitions {
+        let count = if p == 0 {
+            partition_size - predictor_order
+        } else {
+            partition_size
+        };
+        total += best_partition_zp(
+            zigzag,
+            prefix,
+            raw_bits,
+            idx,
+            idx + count,
+            param_bits,
+            k_max,
+        )
+        .cost;
+        idx += count;
+    }
+    Some(total)
+}
+
 /// Emit the partitioned-Rice residual for one subframe and return the
 /// exact number of bits written. Searches every legal partition order
 /// (0..=MAX_PARTITION_ORDER) under both Rice methods (4-bit and 5-bit
@@ -1253,17 +1430,24 @@ fn encode_rice_residual(
     // Pre-round-176 the standalone `best_rice_params` path allocated a
     // fresh `Vec<u32>` per partition per partition-order; profile-147
     // showed `best_partition` at ~61 % of encode self-samples. Folding
-    // the zigzag conversion up to subframe scope removes that redundant
-    // work entirely.
+    // the zigzag conversion up to subframe scope removed that redundant
+    // work entirely. Round 186 takes the same shape one step further:
+    // a subframe-scoped prefix-sum table (so `sum_u` for the closed-form
+    // `k_est` is O(1) per partition) and a per-sample raw-bit-width
+    // table (so the escape-cost path's max-of-leading-zeros is a `u8`
+    // max instead of `leading_zeros` per element) both shared across
+    // every `(method, partition_order)` pair the search visits.
     let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+    let (prefix, raw_bits) = build_partition_tables(residuals, &zigzag);
 
     // Find the (method, partition_order) pair with the smallest payload.
     let mut best: Option<(u32, u32, u32, u32, u64)> = None; // method, param_bits, k_max, p, cost
     for (method, param_bits, k_max) in [(0u32, 4u32, 14u32), (1u32, 5u32, 30u32)] {
         for p in 0..=MAX_PARTITION_ORDER {
-            let Some(cost) = partition_layout_cost_z(
-                residuals,
+            let Some(cost) = partition_layout_cost_zp(
                 &zigzag,
+                &prefix,
+                &raw_bits,
                 block_size,
                 predictor_order,
                 p,
@@ -1305,8 +1489,16 @@ fn encode_rice_residual(
         };
         let slice = &residuals[idx..idx + count];
         let z_slice = &zigzag[idx..idx + count];
+        let choice = best_partition_zp(
+            &zigzag,
+            &prefix,
+            &raw_bits,
+            idx,
+            idx + count,
+            param_bits,
+            k_max,
+        );
         idx += count;
-        let choice = best_partition_z(slice, z_slice, param_bits, k_max);
         match choice.coding {
             PartCoding::Escape { raw_bps } => {
                 w.write_u32(escape_marker, param_bits);
@@ -1341,6 +1533,12 @@ fn zigzag_encode(s: i32) -> u32 {
     ((s << 1) ^ (s >> 31)) as u32
 }
 
+/// Maximum bit width needed to store every residual in `residuals` raw
+/// as a two's-complement signed integer. Retained as the round-176
+/// reference path; production reads from the per-sample [`raw_bits`]
+/// table that [`build_partition_tables`] seeds via
+/// [`raw_bits_for_sample`].
+#[cfg(test)]
 fn raw_bits_needed(residuals: &[i32]) -> u32 {
     let mut max_bits = 1u32;
     for &r in residuals {
@@ -1422,6 +1620,13 @@ fn best_rice_params(residuals: &[i32], k_max: u32) -> (u64, u32) {
 /// per subframe and re-slices it across every partition the search
 /// visits. Output is bit-identical to [`best_rice_params`] for the
 /// equivalent input.
+///
+/// Retained as the round-176 reference path. The production encoder
+/// uses [`best_rice_params_zp`] which additionally accepts a
+/// pre-computed `sum_u` derived from a subframe-scoped prefix-sum so
+/// the `sum_u` pass over the slice doesn't repeat per
+/// `(method, partition_order)` pair.
+#[cfg(test)]
 fn best_rice_params_z(zigzag: &[u32], k_max: u32) -> (u64, u32) {
     if zigzag.is_empty() {
         return (0, 0);
@@ -1471,6 +1676,75 @@ fn best_rice_params_z(zigzag: &[u32], k_max: u32) -> (u64, u32) {
     // the window edge, the true optimum could be further in that
     // direction — walk outward while we keep improving. We never step
     // past `k_max`, which is the spec-imposed parameter ceiling.
+    if best_k == lo && lo > 0 {
+        for k in (0..lo).rev() {
+            let cost = rice_cost_for_k(zigzag, k, best_bits);
+            if cost < best_bits {
+                best_bits = cost;
+                best_k = k;
+            } else {
+                break;
+            }
+        }
+    }
+    if best_k == hi && hi < k_max {
+        for k in (hi + 1)..=k_max {
+            let cost = rice_cost_for_k(zigzag, k, best_bits);
+            if cost < best_bits {
+                best_bits = cost;
+                best_k = k;
+            } else {
+                break;
+            }
+        }
+    }
+
+    (best_bits, best_k)
+}
+
+/// Production variant of [`best_rice_params_z`]. Accepts a pre-computed
+/// `sum_u` (derived from the subframe-scoped prefix-sum table) instead
+/// of running an O(n) sum pass per partition per
+/// `(method, partition_order)` pair. The `rice_cost_for_k` walks still
+/// dominate the per-partition cost — they have to: scoring a Rice
+/// parameter inherently needs the shift-and-sum over the slice — but the
+/// `sum_u` reduction the closed-form `k_est` derivation needs is now
+/// O(1) per call. Output is bit-identical to [`best_rice_params_z`] for
+/// the equivalent input.
+fn best_rice_params_zp(zigzag: &[u32], sum_u: u64, k_max: u32) -> (u64, u32) {
+    if zigzag.is_empty() {
+        return (0, 0);
+    }
+    let n = zigzag.len() as u64;
+
+    // Closed-form estimate: `k_est = floor(log2(sum_u / n))`. The `sum_u
+    // == 0` case is the all-zero (post-predictor) partition where the
+    // optimal `k` is 0 — short-circuit so we don't run msb(0).
+    let k_est: u32 = if sum_u == 0 {
+        0
+    } else {
+        let mean_u = sum_u / n;
+        if mean_u == 0 {
+            0
+        } else {
+            // msb(mean_u) = 63 - leading_zeros; convert to u32.
+            63u32.saturating_sub(mean_u.leading_zeros())
+        }
+    };
+
+    let lo = k_est.saturating_sub(2).min(k_max);
+    let hi = (k_est + 3).min(k_max);
+
+    let mut best_k = lo;
+    let mut best_bits = u64::MAX;
+    for k in lo..=hi {
+        let cost = rice_cost_for_k(zigzag, k, best_bits);
+        if cost < best_bits {
+            best_bits = cost;
+            best_k = k;
+        }
+    }
+
     if best_k == lo && lo > 0 {
         for k in (0..lo).rev() {
             let cost = rice_cost_for_k(zigzag, k, best_bits);
@@ -2981,16 +3255,21 @@ mod tests {
 
     /// Round-176 hoisted the partition-search zigzag conversion from
     /// per-partition-per-(method, partition_order) scope up to a single
-    /// per-subframe `Vec<u32>`. The zigzag-amortised search variants
-    /// (`partition_layout_cost_z`, `best_partition_z`, `best_rice_params_z`)
-    /// must produce **bit-identical** layout costs to the standalone
-    /// pre-round-176 path for every residual the encoder might submit —
-    /// otherwise the search would pick a different `(method, partition_order)`
-    /// pair and the on-wire output would silently drift.
+    /// per-subframe `Vec<u32>`. Round-186 took the same shape one step
+    /// further: subframe-scoped prefix-sum and per-sample raw-bit tables
+    /// so the `sum_u` reduction (closed-form `k_est` input) is O(1) per
+    /// partition and the escape-cost path's `raw_bits_needed` max is a
+    /// `u8` slice scan instead of `leading_zeros` per element. Both
+    /// optimised variants — the round-176 `_z` path and the round-186
+    /// `_zp` path — must produce **bit-identical** layout costs to the
+    /// standalone pre-round-176 path for every residual the encoder
+    /// might submit; otherwise the search would pick a different
+    /// `(method, partition_order)` pair and the on-wire output would
+    /// silently drift.
     ///
-    /// This regression test crosswalks the new path against the retained
-    /// reference path across the same diverse residual buffers the
-    /// `best_rice_params_matches_brute_force_reference` test uses
+    /// This regression test crosswalks both optimised paths against the
+    /// retained reference path across the same diverse residual buffers
+    /// the `best_rice_params_matches_brute_force_reference` test uses
     /// (degenerate, Laplace-shaped, split-statistics, all-zero,
     /// adversarial single-spike), plus every legal partition order for a
     /// 4096-sample block under both methods. A mismatch fails the test
@@ -3044,8 +3323,20 @@ mod tests {
         }
         cases.push(("split-stats".into(), split));
 
+        // Extreme: residuals at the i32::MIN / i32::MAX edges. Exercises
+        // the round-186 `raw_bits_for_sample` against the limits of the
+        // `33 - leading_zeros` derivation (which must clamp to 32 for
+        // i32::MIN since !(i32::MIN) leading_zeros = 1, giving needed = 32).
+        let mut edge = vec![0i32; block];
+        edge[0] = i32::MIN;
+        edge[block / 4] = i32::MAX;
+        edge[block / 2] = -1;
+        edge[3 * block / 4] = 1;
+        cases.push(("edge-i32-bounds".into(), edge));
+
         for (name, residuals) in &cases {
             let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+            let (prefix, raw_bits) = build_partition_tables(residuals, &zigzag);
             for predictor_order in [0usize, 1, 4, 8, 12] {
                 for (param_bits, k_max) in [(4u32, 14u32), (5u32, 30u32)] {
                     for partition_order in 0..=MAX_PARTITION_ORDER {
@@ -3057,7 +3348,7 @@ mod tests {
                             param_bits,
                             k_max,
                         );
-                        let opt_cost = partition_layout_cost_z(
+                        let z_cost = partition_layout_cost_z(
                             residuals,
                             &zigzag,
                             block,
@@ -3066,11 +3357,27 @@ mod tests {
                             param_bits,
                             k_max,
                         );
+                        let zp_cost = partition_layout_cost_zp(
+                            &zigzag,
+                            &prefix,
+                            &raw_bits,
+                            block,
+                            predictor_order,
+                            partition_order,
+                            param_bits,
+                            k_max,
+                        );
                         assert_eq!(
-                            ref_cost, opt_cost,
-                            "{name}: cost mismatch for predictor_order={predictor_order} \
+                            ref_cost, z_cost,
+                            "{name}: _z mismatch for predictor_order={predictor_order} \
                              param_bits={param_bits} partition_order={partition_order}: \
-                             ref={ref_cost:?} opt={opt_cost:?}",
+                             ref={ref_cost:?} z={z_cost:?}",
+                        );
+                        assert_eq!(
+                            ref_cost, zp_cost,
+                            "{name}: _zp mismatch for predictor_order={predictor_order} \
+                             param_bits={param_bits} partition_order={partition_order}: \
+                             ref={ref_cost:?} zp={zp_cost:?}",
                         );
                     }
                 }

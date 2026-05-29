@@ -359,16 +359,16 @@ the encode-vs-decode shape is stable):
 | `decode    stereo/s16/44k1/1s`           |     1.10 |   ~150  |   ~910x  |
 | `decode    stereo/s24/48k/500ms`         |     0.67 |   ~205  |   ~745x  |
 | `decode    6ch/s16/48k/250ms`            |     0.74 |   ~190  |   ~340x  |
-| `encode    mono/s16/44k1/1s`             |      272 |   ~0.31 |    3.7x  |
-| `encode    stereo/s16/44k1/1s`           |     1095 |   ~0.16 |    0.9x  |
-| `encode    stereo/s24/48k/500ms`         |      622 |   ~0.22 |    0.8x  |
-| `encode    6ch/s16/48k/250ms`            |      474 |   ~0.29 |    0.5x  |
-| `encode    mono/s24/48k/500ms`           |      160 |   ~0.43 |    3.1x  |
-| `encode    mono/wasted/s16/44k1/1s`      |      284 |   ~0.30 |    3.5x  |
-| `encode    mono/constant/s16/44k1/1s`    |    0.246 |   ~340  |   ~4060x |
+| `encode    mono/s16/44k1/1s`             |      266 |   ~0.32 |    3.8x  |
+| `encode    stereo/s16/44k1/1s`           |     1055 |   ~0.16 |    0.9x  |
+| `encode    stereo/s24/48k/500ms`         |      511 |   ~0.27 |    1.0x  |
+| `encode    6ch/s16/48k/250ms`            |      410 |   ~0.34 |    0.6x  |
+| `encode    mono/s24/48k/500ms`           |      128 |   ~0.54 |    3.9x  |
+| `encode    mono/wasted/s16/44k1/1s`      |      271 |   ~0.31 |    3.7x  |
+| `encode    mono/constant/s16/44k1/1s`    |    0.280 |   ~300  |   ~3570x |
 
 The decode path is comfortably realtime by orders of magnitude. The
-encode path is now mono-realtime (3.2x) and within a small factor of
+encode path is now mono-realtime (3.8x) and within a small factor of
 realtime for stereo / multichannel — round 143's closed-form Rice
 parameter estimate (see `best_rice_params` in `src/encoder.rs`) cut
 the per-partition cost by ~4.6×–6× over the previous brute-force
@@ -380,10 +380,19 @@ window search, with each surviving LPC subframe still iterating
 ~12–23 % off the encode wall time on the existing benches by hoisting
 the residual zigzag conversion from per-partition-per-(method,
 partition_order) scope up to **once per subframe** in
-`encode_rice_residual` (see CHANGELOG `Round 176`). The reference
-numbers above are the post-r176 timings; pre-r176 they were 316 ms /
-1245 ms / 622 ms / 474 ms / 160 ms / 368 ms / 0.246 ms for the seven
-encode rows respectively. Round 150 attempted the obvious "reuse
+`encode_rice_residual` (see CHANGELOG `Round 176`). Round 186 took the
+same shape one step further: a subframe-scoped prefix-sum table (so
+the closed-form `k_est` input `sum_u` is O(1) per partition) and a
+per-sample raw-bit-width `u8` table (so the escape-cost test's max-bits
+scan is a `u8`-slice max instead of `leading_zeros` per element) both
+shared across every `(method, partition_order)` pair the search visits;
+the wider-sample scenarios benefited most (`mono/s24/48k/500ms` 160 ms
+→ 128 ms, `stereo/s24/48k/500ms` 622 ms → 511 ms, `6ch/s16/48k/250ms`
+474 ms → 410 ms — see CHANGELOG `Round 186` for the full table). The
+reference numbers above are the post-r186 timings; pre-r186 (post-r176)
+they were 272 / 1095 / 622 / 474 / 160 / 284 / 0.246 ms for the seven
+encode rows respectively, and pre-r176 they were 316 / 1245 / 622 /
+474 / 160 / 368 / 0.246 ms. Round 150 attempted the obvious "reuse
 residual `Vec<i32>` scratch across plans" follow-up the r147 profile
 suggested and measured a ~10 % regression on macOS arm64: the system
 allocator's small-bin caching already serves the small per-plan
