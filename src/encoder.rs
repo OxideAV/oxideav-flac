@@ -1544,14 +1544,39 @@ fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> 
             return None;
         }
         let k = r / error;
-        // Symmetric update in place; iterate from outside in to avoid
-        // clobbering values we still need.
-        let mut new_lpc = lpc.clone();
-        new_lpc[i] = k;
-        for j in 0..i {
-            new_lpc[j] = lpc[j] + k * lpc[i - 1 - j];
+        // Symmetric update in place. The recurrence
+        //   new_lpc[j]     = lpc[j]     + k * lpc[i-1-j]
+        //   new_lpc[i-1-j] = lpc[i-1-j] + k * lpc[j]
+        // depends only on the OLD `lpc[j]` and `lpc[i-1-j]`, so by
+        // processing the pair `(j, i-1-j)` together we can write both
+        // updates without disturbing any value the rest of the sweep
+        // still needs. When `i` is odd the middle index satisfies
+        // `j == i-1-j`, where the pair collapses to
+        // `new_lpc[j] = lpc[j] + k * lpc[j] = lpc[j] * (1 + k)`.
+        // Floating-point operands and order are bit-identical to the
+        // previous `new_lpc[j] = lpc[j] + k * lpc[i-1-j]` formulation,
+        // so the quantised coefficient stream stays byte-stable.
+        //
+        // Pre-round-182 this loop allocated + memcpy'd a fresh
+        // `new_lpc` of length `order` on every outer-loop iteration
+        // (order extra Vec allocations per Levinson-Durbin call); with
+        // 3 apodisation windows × 12 LPC orders per subframe, those
+        // allocations were a measurable fraction of encode time on the
+        // r147 flamegraph's allocator paths (`_xzm_free`, `xzm_malloc`,
+        // `__bzero`). The in-place sweep eliminates them.
+        let mid = i / 2;
+        for j in 0..mid {
+            let opp = i - 1 - j;
+            let a = lpc[j] + k * lpc[opp];
+            let b = lpc[opp] + k * lpc[j];
+            lpc[j] = a;
+            lpc[opp] = b;
         }
-        lpc = new_lpc;
+        if i % 2 == 1 {
+            // Self-paired middle element of an odd-length sweep.
+            lpc[mid] = lpc[mid] + k * lpc[mid];
+        }
+        lpc[i] = k;
         error *= 1.0 - k * k;
         if !error.is_finite() || error <= 0.0 {
             return None;
@@ -3047,6 +3072,174 @@ mod tests {
                              param_bits={param_bits} partition_order={partition_order}: \
                              ref={ref_cost:?} opt={opt_cost:?}",
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reference implementation of the Levinson-Durbin coefficient
+    /// update kept in test scope only, mirroring the pre-round-182 path
+    /// that allocated a fresh `new_lpc` vector per outer iteration. Used
+    /// solely as a regression oracle: the production [`levinson_durbin`]
+    /// performs the same recurrence in place by processing the symmetric
+    /// pair `(j, i-1-j)` simultaneously. This reference exists so the
+    /// crosswalk test [`levinson_durbin_in_place_matches_reference`] can
+    /// catch any future drift in the in-place sweep at the bit level.
+    #[cfg(test)]
+    fn levinson_durbin_reference(
+        samples: &[i32],
+        order: usize,
+        window: ApodizationWindow,
+    ) -> Option<Vec<f64>> {
+        let n = samples.len();
+        if n <= order || order == 0 {
+            return None;
+        }
+        let mut windowed: Vec<f64> = Vec::with_capacity(n);
+        for (i, &s) in samples.iter().enumerate() {
+            windowed.push(s as f64 * window.weight(i, n));
+        }
+        let mut autoc = vec![0.0f64; order + 1];
+        for lag in 0..=order {
+            let mut s = 0.0f64;
+            for i in lag..n {
+                s += windowed[i] * windowed[i - lag];
+            }
+            autoc[lag] = s;
+        }
+        if autoc[0] <= 0.0 || !autoc[0].is_finite() {
+            return None;
+        }
+        let mut lpc = vec![0.0f64; order];
+        let mut error = autoc[0];
+        for i in 0..order {
+            let mut r = -autoc[i + 1];
+            for j in 0..i {
+                r -= lpc[j] * autoc[i - j];
+            }
+            if error.abs() < 1e-12 {
+                return None;
+            }
+            let k = r / error;
+            // Allocate + copy form: exactly what the pre-round-182
+            // production path did.
+            let mut new_lpc = lpc.clone();
+            new_lpc[i] = k;
+            for j in 0..i {
+                new_lpc[j] = lpc[j] + k * lpc[i - 1 - j];
+            }
+            lpc = new_lpc;
+            error *= 1.0 - k * k;
+            if !error.is_finite() || error <= 0.0 {
+                return None;
+            }
+        }
+        let mut out = Vec::with_capacity(order);
+        for &v in lpc.iter() {
+            out.push(-v);
+        }
+        Some(out)
+    }
+
+    /// Round-182 replaced the cloning Levinson-Durbin inner loop with a
+    /// symmetric-pair in-place sweep that eliminates ~order Vec
+    /// allocations per call (called 3 windows × 12 LPC orders = 36 times
+    /// per encoded subframe). The recurrence is provably arithmetic-
+    /// identical to the previous formulation — both update positions `j`
+    /// and `i-1-j` from the **old** values of `lpc[j]` and `lpc[i-1-j]`
+    /// using the same `+` and `*` operands in the same evaluation order,
+    /// so the f64 result is bit-identical. This crosswalk verifies that
+    /// claim empirically across diverse signals and across every LPC
+    /// order the production encoder will ever submit, so that any future
+    /// refactor of the in-place sweep cannot silently drift the on-wire
+    /// coefficient stream.
+    #[test]
+    fn levinson_durbin_in_place_matches_reference() {
+        fn xorshift32(state: &mut u32) -> u32 {
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            *state
+        }
+
+        let mut cases: Vec<(String, Vec<i32>)> = Vec::new();
+
+        // Sine sweep — produces tightly-correlated samples for LPC.
+        let sr = 44_100u32;
+        for &freq in &[110.0f64, 440.0, 1_000.0, 4_410.0] {
+            let mut buf = Vec::with_capacity(4096);
+            for i in 0..4096 {
+                let t = i as f64 / sr as f64;
+                buf.push(((t * freq * 2.0 * std::f64::consts::PI).sin() * 20_000.0) as i32);
+            }
+            cases.push((format!("sine_{}hz", freq as u32), buf));
+        }
+
+        // Stacked partials at non-harmonic spacings — the case the
+        // multi-window search was added to handle. LPC coefficients
+        // here are particularly sensitive to autocorrelation precision.
+        let mut stacked = Vec::with_capacity(4096);
+        for i in 0..4096 {
+            let t = i as f64 / sr as f64;
+            let v = (t * 4_000.0 * 2.0 * std::f64::consts::PI).sin() * 8_000.0
+                + (t * 4_050.0 * 2.0 * std::f64::consts::PI).sin() * 8_000.0
+                + (t * 11_017.0 * 2.0 * std::f64::consts::PI).sin() * 4_000.0;
+            stacked.push(v as i32);
+        }
+        cases.push(("stacked_partials".into(), stacked));
+
+        // Pseudo-random walk — broad-spectrum input where LPC fits less
+        // tightly; the recurrence sees a wide dynamic range of `k`
+        // reflection coefficients.
+        let mut state = 0xC0FFEEu32;
+        let mut walk = Vec::with_capacity(4096);
+        let mut acc: i32 = 0;
+        for _ in 0..4096 {
+            let u = xorshift32(&mut state);
+            acc = acc.wrapping_add(((u >> 16) as i16 / 8) as i32);
+            walk.push(acc.clamp(-30_000, 30_000));
+        }
+        cases.push(("walk".into(), walk));
+
+        // Constant-tail PCM ending in zeros — the windowed autocorrelation
+        // gets a strong DC term that the recurrence handles via the
+        // reflection step.
+        let mut tail = Vec::with_capacity(4096);
+        for i in 0..2048 {
+            let t = i as f64 / sr as f64;
+            tail.push(((t * 1_000.0 * 2.0 * std::f64::consts::PI).sin() * 15_000.0) as i32);
+        }
+        tail.extend(std::iter::repeat(0i32).take(2048));
+        cases.push(("tonal_then_silence".into(), tail));
+
+        for (name, samples) in &cases {
+            for window in APODIZATION_WINDOWS.iter().copied() {
+                for order in 1..=MAX_LPC_ORDER {
+                    let opt = levinson_durbin(samples, order, window);
+                    let refc = levinson_durbin_reference(samples, order, window);
+                    assert_eq!(
+                        opt.is_some(),
+                        refc.is_some(),
+                        "{name}: convergence disagreement at order={order} window={window:?}",
+                    );
+                    if let (Some(opt), Some(refc)) = (opt, refc) {
+                        assert_eq!(
+                            opt.len(),
+                            refc.len(),
+                            "{name}: length disagreement at order={order} window={window:?}",
+                        );
+                        for (idx, (a, b)) in opt.iter().zip(refc.iter()).enumerate() {
+                            // Strict bit-for-bit f64 equality — see the
+                            // arithmetic-identity argument in
+                            // `levinson_durbin`'s body comment.
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "{name}: coefficient [{idx}] drift at order={order} \
+                                 window={window:?}: in-place={a} reference={b}",
+                            );
+                        }
                     }
                 }
             }

@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Encoder: in-place symmetric-pair Levinson-Durbin update**
+  (round 182, RFC 9639 §9.2.6). The autocorrelation-to-coefficient
+  step at the heart of LPC analysis ran a textbook Levinson-Durbin
+  recurrence whose inner update allocated a fresh `new_lpc =
+  lpc.clone()` `Vec<f64>` on every outer-loop iteration. With LPC
+  order capped at 12 (`MAX_LPC_ORDER`) that meant up to 12 redundant
+  Vec allocations plus 12 length-12 element copies *per* call —
+  multiplied by the 3 apodisation windows × 12 LPC orders that
+  `encode_lpc_plan` evaluates per subframe (36 calls), the per-frame
+  cost added up to several hundred small heap traffic events
+  exclusively to hold a 1-step lookback the recurrence already had in
+  registers. The new sweep rewrites both halves of each symmetric
+  index pair `(j, i-1-j)` in place from cached scalars (`a`, `b`),
+  needing no scratch buffer. Floating-point operands and evaluation
+  order are unchanged — both writes read the **old** `lpc[j]` and
+  `lpc[i-1-j]` via locals before either lane is mutated — so the
+  produced f64 coefficients are bit-identical to the cloning path
+  and the quantised on-wire bytes don't drift. A new regression test
+  (`levinson_durbin_in_place_matches_reference`) keeps a `#[cfg(test)]`
+  reference implementation in scope and crosswalks the production
+  path against it across four signal classes (sine sweep at four
+  frequencies, stacked partials, pseudo-random walk, tonal-then-
+  silence), every apodisation window (Welch / Hann / shallow Tukey)
+  and every LPC order 1..=12, comparing coefficient outputs at
+  `f64::to_bits()` granularity so any future drift in the in-place
+  sweep surfaces before bytes change. Full test suite passes
+  unchanged.
+
 - **Encoder: amortise residual zigzag across the partition-order search**
   (round 176, RFC 9639 §9.2.5). Pre-round-176 the partitioned-Rice
   search re-zigzagged every residual partition under every
