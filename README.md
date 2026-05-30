@@ -359,13 +359,13 @@ the encode-vs-decode shape is stable):
 | `decode    stereo/s16/44k1/1s`           |     1.10 |   ~150  |   ~910x  |
 | `decode    stereo/s24/48k/500ms`         |     0.67 |   ~205  |   ~745x  |
 | `decode    6ch/s16/48k/250ms`            |     0.74 |   ~190  |   ~340x  |
-| `encode    mono/s16/44k1/1s`             |      266 |   ~0.32 |    3.8x  |
-| `encode    stereo/s16/44k1/1s`           |     1055 |   ~0.16 |    0.9x  |
-| `encode    stereo/s24/48k/500ms`         |      511 |   ~0.27 |    1.0x  |
-| `encode    6ch/s16/48k/250ms`            |      410 |   ~0.34 |    0.6x  |
-| `encode    mono/s24/48k/500ms`           |      128 |   ~0.54 |    3.9x  |
-| `encode    mono/wasted/s16/44k1/1s`      |      271 |   ~0.31 |    3.7x  |
-| `encode    mono/constant/s16/44k1/1s`    |    0.280 |   ~300  |   ~3570x |
+| `encode    mono/s16/44k1/1s`             |      252 |   ~0.33 |    3.9x  |
+| `encode    stereo/s16/44k1/1s`           |     1005 |   ~0.17 |    1.0x  |
+| `encode    stereo/s24/48k/500ms`         |      491 |   ~0.28 |    1.0x  |
+| `encode    6ch/s16/48k/250ms`            |      388 |   ~0.36 |    0.6x  |
+| `encode    mono/s24/48k/500ms`           |      115 |   ~0.61 |    4.3x  |
+| `encode    mono/wasted/s16/44k1/1s`      |      261 |   ~0.32 |    3.8x  |
+| `encode    mono/constant/s16/44k1/1s`    |    0.263 |   ~324  |   ~3800x |
 
 The decode path is comfortably realtime by orders of magnitude. The
 encode path is now mono-realtime (3.8x) and within a small factor of
@@ -388,20 +388,23 @@ scan is a `u8`-slice max instead of `leading_zeros` per element) both
 shared across every `(method, partition_order)` pair the search visits;
 the wider-sample scenarios benefited most (`mono/s24/48k/500ms` 160 ms
 → 128 ms, `stereo/s24/48k/500ms` 622 ms → 511 ms, `6ch/s16/48k/250ms`
-474 ms → 410 ms — see CHANGELOG `Round 186` for the full table). The
-reference numbers above are the post-r186 timings; pre-r186 (post-r176)
-they were 272 / 1095 / 622 / 474 / 160 / 284 / 0.246 ms for the seven
-encode rows respectively, and pre-r176 they were 316 / 1245 / 622 /
-474 / 160 / 368 / 0.246 ms. Round 150 attempted the obvious "reuse
-residual `Vec<i32>` scratch across plans" follow-up the r147 profile
-suggested and measured a ~10 % regression on macOS arm64: the system
-allocator's small-bin caching already serves the small per-plan
-allocations effectively, and the threading overhead (a `&mut Scratch`
-plumbed through every plan call) costs more than it saves. The reuse
-cure was empirically worse than the disease for that specific scratch
-buffer; a Linux-target rerun under a different allocator may flip that
-conclusion. See `CHANGELOG.md` "Round 150 investigated …" for the full
-A/B record.
+474 ms → 410 ms — see CHANGELOG `Round 186` for the full table). Round
+191 promoted the per-subframe scratch tables themselves to **encoder-
+owned reusable buffers** — `residuals`, `zigzag`, `prefix`, `raw_bits`,
+plus the LPC `windowed`, `autoc`, `lpc_state`, `lpc_coeffs`, `qcoeffs`
+buffers — threaded through the candidate sweep so they grow once to
+peak capacity on the first frame and then reuse across every Fixed /
+LPC / precision candidate and across every subsequent frame. The
+biggest beneficiary is `6ch/s16/48k/250ms` (~7 % faster) where six
+independent subframes per frame amortise the scratch-reuse savings;
+the remaining encode benches gain 1–2.5 % each. Round 150 had
+attempted the same shape against the post-r147 hot path and measured
+a ~10 % regression because that path's per-partition allocations were
+already small enough for libmalloc's freelist; the post-r186 hot path
+allocates a different set of subframe-scoped buffers (the prefix-sum
+and raw-bits tables added in r186) whose reuse now does pay off. See
+`CHANGELOG.md` `[Unreleased]` for the bench A/B and the r150 note for
+the historical contrast.
 
 ## Codec / container IDs
 

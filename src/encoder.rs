@@ -94,6 +94,60 @@ const MIN_LPC_QLP_PRECISION: u32 = 5;
 /// content.
 const LPC_PRECISION_SEARCH_SPAN: u32 = 4;
 
+/// Reusable scratch buffers threaded through the per-subframe candidate
+/// sweep so the residuals / zigzag / prefix / raw-bits / Levinson tables
+/// are allocated **once** per encoder (not once per `(method, order,
+/// window, precision)` combination the search visits).
+///
+/// The pre-round-191 hot path allocated a fresh `Vec<i32>` residual for
+/// each FIXED 0..=4 and LPC 1..=12 candidate, a fresh `Vec<u32>` zigzag
+/// plus `Vec<u64>` prefix plus `Vec<u8>` raw-bits triple inside
+/// `encode_rice_residual` for each surviving plan, and three `Vec<f64>`
+/// scratch buffers (`windowed`, `autoc`, `lpc`) plus a `Vec<f64>`
+/// output for each apodisation window times LPC order pair. Profile-147
+/// surfaced the resulting allocator activity in the encode flamegraph's
+/// "remaining 25 %" sink.
+///
+/// Hoisting them to subframe scope (re-used across every candidate)
+/// and storing the scratch on the encoder itself (re-used across
+/// frames) lets the candidate sweep run entirely on the previous
+/// frame's heap allocations: `Vec::clear` keeps capacity, the next
+/// `push` reuses it. Capacity converges within the first block to
+/// the maximum the encoder will ever need, and stays there.
+///
+/// `lpc_coeffs` holds the final FLAC-convention coefficients
+/// (`-a[j]` for `j=1..=order`) that `levinson_durbin_s` would have
+/// returned by `Vec`; the candidate-precision sweep in
+/// `encode_lpc_plan_s` borrows it as `&[f64]` instead of cloning.
+#[derive(Default)]
+struct SubframeScratch {
+    /// Residual values: `samples[order..] - prediction` for FIXED and LPC.
+    residuals: Vec<i32>,
+    /// Zigzag-encoded view of `residuals` so the partition search reads
+    /// unsigned widths directly.
+    zigzag: Vec<u32>,
+    /// `prefix[i] = sum(zigzag[0..i])` — `sum_u` for any partition is
+    /// `prefix[end] - prefix[start]`.
+    prefix: Vec<u64>,
+    /// Per-residual raw width (1..=32 bits) so the escape-cost test is
+    /// a `max` over a `u8` slice instead of `leading_zeros` per element.
+    raw_bits: Vec<u8>,
+    /// Windowed signal used by `levinson_durbin_s` (samples × window
+    /// weight). One row per Levinson call, reused across windows.
+    windowed: Vec<f64>,
+    /// Autocorrelation vector (length `order + 1`).
+    autoc: Vec<f64>,
+    /// In-place Levinson-Durbin coefficient state (length `order`).
+    lpc_state: Vec<f64>,
+    /// Final FLAC-convention LPC coefficients (`-a[j+1]`), borrowed by
+    /// `encode_lpc_plan_at_s` for the candidate-precision sweep.
+    lpc_coeffs: Vec<f64>,
+    /// Quantised LPC coefficients (length `order`).
+    qcoeffs: Vec<i32>,
+    /// Wasted-bits-shifted sample buffer used by `best_subframe_s`.
+    shifted: Vec<i32>,
+}
+
 /// Analysis windows the encoder applies to a subframe before computing
 /// the autocorrelation that feeds Levinson-Durbin. RFC 9639 only ties
 /// down what reaches the bitstream — the quantised coefficients, the
@@ -289,6 +343,7 @@ pub fn make_encoder_with_options(
         max_frame_size: 0,
         eof: false,
         padding_bytes: options.padding_bytes,
+        scratch: SubframeScratch::default(),
     }))
 }
 
@@ -408,6 +463,11 @@ struct FlacEncoder {
     /// final `extradata` chain. `None` means no PADDING block — the
     /// pre-round-158 behaviour. See [`FlacEncoderOptions::padding_bytes`].
     padding_bytes: Option<usize>,
+    /// Reusable scratch buffers for the per-subframe candidate sweep.
+    /// First frame grows them to the maximum the encoder will need;
+    /// subsequent frames reuse the capacity in place. See
+    /// [`SubframeScratch`] for details.
+    scratch: SubframeScratch,
 }
 
 impl FlacEncoder {
@@ -488,6 +548,7 @@ impl FlacEncoder {
                 self.sample_rate,
                 self.bps,
                 &per_channel,
+                &mut self.scratch,
             )?;
             let fsize = data.len() as u32;
             if fsize < self.min_frame_size {
@@ -607,13 +668,14 @@ fn encode_frame(
     sample_rate: u32,
     bps: u8,
     channels: &[Vec<i32>],
+    scratch: &mut SubframeScratch,
 ) -> Result<Vec<u8>> {
     let n_ch = channels.len();
     if !(1..=8).contains(&n_ch) {
         return Err(Error::invalid("FLAC encoder: channel count out of range"));
     }
 
-    let (channel_code, subframe_plan) = choose_channel_assignment(channels, bps as u32)?;
+    let (channel_code, subframe_plan) = choose_channel_assignment(channels, bps as u32, scratch)?;
 
     let mut w = BitWriter::with_capacity(block_size as usize * 2 * n_ch);
 
@@ -721,12 +783,16 @@ fn encode_sample_size(bps: u8) -> u8 {
 /// Pick the channel-assignment (independent / L-S / R-S / M-S) that
 /// produces the smallest total subframe size, and return both the
 /// assignment code and the pre-computed subframes ready for emission.
-fn choose_channel_assignment(channels: &[Vec<i32>], bps: u32) -> Result<(u32, Vec<SubframePlan>)> {
+fn choose_channel_assignment(
+    channels: &[Vec<i32>],
+    bps: u32,
+    scratch: &mut SubframeScratch,
+) -> Result<(u32, Vec<SubframePlan>)> {
     let n_ch = channels.len();
     if n_ch != 2 {
         let mut plans = Vec::with_capacity(n_ch);
         for ch in channels {
-            plans.push(best_subframe(ch, bps)?);
+            plans.push(best_subframe_s(ch, bps, scratch)?);
         }
         return Ok(((n_ch - 1) as u32, plans));
     }
@@ -735,8 +801,8 @@ fn choose_channel_assignment(channels: &[Vec<i32>], bps: u32) -> Result<(u32, Ve
     let r = &channels[1];
     let n = l.len();
 
-    let sf_l = best_subframe(l, bps)?;
-    let sf_r = best_subframe(r, bps)?;
+    let sf_l = best_subframe_s(l, bps, scratch)?;
+    let sf_r = best_subframe_s(r, bps, scratch)?;
     let independent_bits = sf_l.bits + sf_r.bits;
     let mut best = (independent_bits, 1u32, vec![sf_l.clone(), sf_r.clone()]);
 
@@ -755,8 +821,8 @@ fn choose_channel_assignment(channels: &[Vec<i32>], bps: u32) -> Result<(u32, Ve
             let sum = l[i] as i64 + r[i] as i64;
             mid.push((sum >> 1) as i32);
         }
-        let sf_s = best_subframe(&side, bps + 1)?;
-        let sf_m = best_subframe(&mid, bps)?;
+        let sf_s = best_subframe_s(&side, bps + 1, scratch)?;
+        let sf_m = best_subframe_s(&mid, bps, scratch)?;
         let left_side_bits = sf_l.bits + sf_s.bits;
         let right_side_bits = sf_s.bits + sf_r.bits;
         let mid_side_bits = sf_m.bits + sf_s.bits;
@@ -806,7 +872,21 @@ impl SubframePlan {
 /// effective sample storage. Common in upsampled or low-amplitude
 /// content; the spec's wasted-bits header is single-byte, so any
 /// detection that saves at least one bit per sample wins.
+#[cfg(test)]
 fn best_subframe(samples: &[i32], bps: u32) -> Result<SubframePlan> {
+    let mut scratch = SubframeScratch::default();
+    best_subframe_s(samples, bps, &mut scratch)
+}
+
+/// Scratch-buffered variant of [`best_subframe`] used by the encoder
+/// hot path. Buffer-reuse keeps the candidate sweep's heap activity
+/// constant across frames; see [`SubframeScratch`] for the buffer
+/// inventory and reuse contract.
+fn best_subframe_s(
+    samples: &[i32],
+    bps: u32,
+    scratch: &mut SubframeScratch,
+) -> Result<SubframePlan> {
     let n = samples.len();
     if n == 0 {
         return Err(Error::invalid("FLAC encoder: empty subframe"));
@@ -817,19 +897,36 @@ fn best_subframe(samples: &[i32], bps: u32) -> Result<SubframePlan> {
     // count at bps-1.
     let wasted = wasted_bits(samples).min(bps.saturating_sub(1));
     if wasted > 0 {
-        let mut shifted: Vec<i32> = Vec::with_capacity(n);
+        scratch.shifted.clear();
+        scratch.shifted.reserve(n);
         for &s in samples {
-            shifted.push(s >> wasted);
+            scratch.shifted.push(s >> wasted);
         }
-        return best_subframe_with_wasted(&shifted, bps - wasted, wasted);
+        // Hand the shifted slice to the inner driver without aliasing
+        // the scratch — `best_subframe_with_wasted_s` uses every other
+        // buffer on the struct but never `shifted`, so a clone-free
+        // borrow via `std::mem::take` + restore is safe.
+        let shifted = std::mem::take(&mut scratch.shifted);
+        let result = best_subframe_with_wasted_s(&shifted, bps - wasted, wasted, scratch);
+        scratch.shifted = shifted;
+        return result;
     }
-    best_subframe_with_wasted(samples, bps, 0)
+    best_subframe_with_wasted_s(samples, bps, 0, scratch)
 }
 
 /// Inner driver that scores every subframe type at the given
 /// (already-wasted-shifted) bps and tags the chosen plan with the
 /// wasted-bits count so the writer can prepend the header bits.
-fn best_subframe_with_wasted(samples: &[i32], bps: u32, wasted: u32) -> Result<SubframePlan> {
+/// Scratch-buffered inner driver. Threads `scratch` into the FIXED and
+/// LPC candidate searches so the per-plan residual / partition tables
+/// live in one set of reusable buffers instead of one fresh `Vec` per
+/// `(method, order)` candidate.
+fn best_subframe_with_wasted_s(
+    samples: &[i32],
+    bps: u32,
+    wasted: u32,
+    scratch: &mut SubframeScratch,
+) -> Result<SubframePlan> {
     let n = samples.len();
     // CONSTANT dominates whenever every sample matches.
     if samples.iter().all(|&s| s == samples[0]) {
@@ -843,7 +940,7 @@ fn best_subframe_with_wasted(samples: &[i32], bps: u32, wasted: u32) -> Result<S
         if n <= order {
             continue;
         }
-        if let Some(plan) = encode_fixed_plan(samples, bps, order, wasted) {
+        if let Some(plan) = encode_fixed_plan_s(samples, bps, order, wasted, scratch) {
             if plan.bits < best.bits {
                 best = plan;
             }
@@ -852,7 +949,7 @@ fn best_subframe_with_wasted(samples: &[i32], bps: u32, wasted: u32) -> Result<S
 
     let max_lpc = MAX_LPC_ORDER.min(n.saturating_sub(1));
     for order in 1..=max_lpc {
-        if let Some(plan) = encode_lpc_plan(samples, bps, order, wasted) {
+        if let Some(plan) = encode_lpc_plan_s(samples, bps, order, wasted, scratch) {
             if plan.bits < best.bits {
                 best = plan;
             }
@@ -920,7 +1017,22 @@ fn encode_verbatim_plan(samples: &[i32], bps: u32, wasted: u32) -> SubframePlan 
     bits_snapshot(w, header_bits + (bps * samples.len() as u32))
 }
 
+#[cfg(test)]
 fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Option<SubframePlan> {
+    let mut scratch = SubframeScratch::default();
+    encode_fixed_plan_s(samples, bps, order, wasted, &mut scratch)
+}
+
+/// Scratch-buffered FIXED plan. The residual vector + every downstream
+/// partitioned-Rice scratch table live in `scratch` and survive the
+/// candidate sweep instead of being re-allocated per candidate.
+fn encode_fixed_plan_s(
+    samples: &[i32],
+    bps: u32,
+    order: usize,
+    wasted: u32,
+    scratch: &mut SubframeScratch,
+) -> Option<SubframePlan> {
     let n = samples.len();
     if n <= order {
         return None;
@@ -928,7 +1040,8 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
     // Fixed-predictor coefficients (FLAC spec §SUBFRAME_FIXED).
     const COEFFS: [&[i64]; 5] = [&[], &[1], &[2, -1], &[3, -3, 1], &[4, -6, 4, -1]];
     let c = COEFFS[order];
-    let mut residuals = Vec::with_capacity(n - order);
+    scratch.residuals.clear();
+    scratch.residuals.reserve(n - order);
     for i in order..n {
         let mut pred: i64 = 0;
         for (j, &cj) in c.iter().enumerate() {
@@ -938,7 +1051,7 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
         if !(i32::MIN as i64..=i32::MAX as i64).contains(&r) {
             return None;
         }
-        residuals.push(r as i32);
+        scratch.residuals.push(r as i32);
     }
 
     let mut w = BitWriter::new();
@@ -946,7 +1059,12 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
     for i in 0..order {
         w.write_i32(samples[i], bps);
     }
-    let residual_bits = encode_rice_residual(&mut w, &residuals, n, order);
+    // Detach `residuals` so `encode_rice_residual_s` can borrow `scratch`
+    // for its zigzag / prefix / raw_bits tables without aliasing the
+    // residual slice.
+    let residuals = std::mem::take(&mut scratch.residuals);
+    let residual_bits = encode_rice_residual_s(&mut w, &residuals, n, order, scratch);
+    scratch.residuals = residuals;
     Some(bits_snapshot(
         w,
         header_bits + (bps * order as u32) + residual_bits,
@@ -974,7 +1092,24 @@ fn encode_fixed_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Op
 /// Ties break toward the earlier window in `APODIZATION_WINDOWS`, so the
 /// historical Welch result is preserved whenever nothing strictly beats
 /// it. RFC 9639 §9.2.6.
+#[cfg(test)]
 fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Option<SubframePlan> {
+    let mut scratch = SubframeScratch::default();
+    encode_lpc_plan_s(samples, bps, order, wasted, &mut scratch)
+}
+
+/// Scratch-buffered LPC plan. The Levinson-Durbin scratch (windowed
+/// signal, autocorrelation, in-place state) and the candidate-precision
+/// quantisation buffer all live in `scratch`. The final coefficient
+/// vector `lpc_coeffs` is borrowed by the precision sweep — no `Vec`
+/// clone per `(window, precision)` pair.
+fn encode_lpc_plan_s(
+    samples: &[i32],
+    bps: u32,
+    order: usize,
+    wasted: u32,
+    scratch: &mut SubframeScratch,
+) -> Option<SubframePlan> {
     let n = samples.len();
     if n <= order {
         return None;
@@ -985,12 +1120,20 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
 
     let mut best: Option<SubframePlan> = None;
     for &window in APODIZATION_WINDOWS.iter() {
-        let Some(coeffs_f) = levinson_durbin(samples, order, window) else {
+        // `levinson_durbin_s` writes its FLAC-convention coefficients
+        // into `scratch.lpc_coeffs`. Returning `Ok` lets the precision
+        // sweep below read `scratch.lpc_coeffs` directly; on `Err` the
+        // buffer's contents are undefined and skipped.
+        if !levinson_durbin_s(samples, order, window, scratch) {
             continue;
-        };
+        }
+        // Detach the coefficient vector so the per-precision call can
+        // borrow `scratch` mutably for its own residual / partition
+        // tables without aliasing the read-only coefficient slice.
+        let coeffs = std::mem::take(&mut scratch.lpc_coeffs);
         for precision in floor..=ceiling {
             if let Some(plan) =
-                encode_lpc_plan_at(samples, bps, order, wasted, &coeffs_f, precision)
+                encode_lpc_plan_at_s(samples, bps, order, wasted, &coeffs, precision, scratch)
             {
                 let better = match &best {
                     Some(b) => plan.bits < b.bits,
@@ -1001,6 +1144,7 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
                 }
             }
         }
+        scratch.lpc_coeffs = coeffs;
     }
     best
 }
@@ -1010,6 +1154,7 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
 /// `None` if the coefficients can't be quantised at this precision or a
 /// residual overflows the 32-bit signed window required by RFC 9639
 /// §9.2.7.
+#[cfg(test)]
 fn encode_lpc_plan_at(
     samples: &[i32],
     bps: u32,
@@ -1018,13 +1163,39 @@ fn encode_lpc_plan_at(
     coeffs_f: &[f64],
     precision: u32,
 ) -> Option<SubframePlan> {
-    let n = samples.len();
-    let (qcoeffs, qlp_shift) = quantize_lpc(coeffs_f, precision)?;
+    let mut scratch = SubframeScratch::default();
+    encode_lpc_plan_at_s(
+        samples,
+        bps,
+        order,
+        wasted,
+        coeffs_f,
+        precision,
+        &mut scratch,
+    )
+}
 
-    let mut residuals = Vec::with_capacity(n - order);
+/// Scratch-buffered variant of [`encode_lpc_plan_at`]. Quantised LPC
+/// coefficients, residuals, and the partitioned-Rice search tables all
+/// reuse `scratch`'s buffers across the candidate sweep.
+#[allow(clippy::too_many_arguments)]
+fn encode_lpc_plan_at_s(
+    samples: &[i32],
+    bps: u32,
+    order: usize,
+    wasted: u32,
+    coeffs_f: &[f64],
+    precision: u32,
+    scratch: &mut SubframeScratch,
+) -> Option<SubframePlan> {
+    let n = samples.len();
+    let qlp_shift = quantize_lpc_into(coeffs_f, precision, &mut scratch.qcoeffs)?;
+
+    scratch.residuals.clear();
+    scratch.residuals.reserve(n - order);
     for i in order..n {
         let mut pred: i64 = 0;
-        for (j, &q) in qcoeffs.iter().enumerate() {
+        for (j, &q) in scratch.qcoeffs.iter().enumerate() {
             pred += q as i64 * samples[i - 1 - j] as i64;
         }
         let predicted = pred >> qlp_shift;
@@ -1032,7 +1203,7 @@ fn encode_lpc_plan_at(
         if !(i32::MIN as i64..=i32::MAX as i64).contains(&r) {
             return None;
         }
-        residuals.push(r as i32);
+        scratch.residuals.push(r as i32);
     }
 
     let mut w = BitWriter::new();
@@ -1046,10 +1217,14 @@ fn encode_lpc_plan_at(
     // qlp_shift is written as 5-bit two's complement; we only emit
     // non-negative shifts so the sign bit is always 0.
     w.write_u32(qlp_shift & 0x1F, 5);
-    for &q in &qcoeffs {
+    for &q in &scratch.qcoeffs {
         w.write_i32(q, precision);
     }
-    let residual_bits = encode_rice_residual(&mut w, &residuals, n, order);
+    // Detach residuals so the Rice residual call can borrow `scratch`
+    // mutably for its zigzag / prefix / raw_bits tables.
+    let residuals = std::mem::take(&mut scratch.residuals);
+    let residual_bits = encode_rice_residual_s(&mut w, &residuals, n, order, scratch);
+    scratch.residuals = residuals;
     let body_bits = (bps * order as u32) + 4 + 5 + (precision * order as u32);
     Some(bits_snapshot(w, header_bits + body_bits + residual_bits))
 }
@@ -1189,18 +1364,39 @@ fn raw_bits_for_sample(r: i32) -> u8 {
 /// Allocates twice per subframe (the two tables) — both fit in L1 for
 /// any realistic block size: the 32 KiB `prefix` + 4 KiB `raw_bits`
 /// pair stays under 36 KiB for a 4096-sample residual.
+#[cfg(test)]
 fn build_partition_tables(residuals: &[i32], zigzag: &[u32]) -> (Vec<u64>, Vec<u8>) {
+    let mut prefix = Vec::new();
+    let mut raw_bits = Vec::new();
+    build_partition_tables_into(residuals, zigzag, &mut prefix, &mut raw_bits);
+    (prefix, raw_bits)
+}
+
+/// Scratch-buffered table builder. Writes the prefix-sum table into
+/// `prefix` and the per-sample raw widths into `raw_bits`, clearing
+/// each first so capacity carries across subframes. Same numeric
+/// output as [`build_partition_tables`].
+fn build_partition_tables_into(
+    residuals: &[i32],
+    zigzag: &[u32],
+    prefix: &mut Vec<u64>,
+    raw_bits: &mut Vec<u8>,
+) {
     debug_assert_eq!(residuals.len(), zigzag.len());
     let n = residuals.len();
-    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.clear();
+    prefix.reserve(n + 1);
     prefix.push(0u64);
     let mut acc: u64 = 0;
     for &u in zigzag {
         acc += u as u64;
         prefix.push(acc);
     }
-    let raw_bits: Vec<u8> = residuals.iter().map(|&r| raw_bits_for_sample(r)).collect();
-    (prefix, raw_bits)
+    raw_bits.clear();
+    raw_bits.reserve(n);
+    for &r in residuals {
+        raw_bits.push(raw_bits_for_sample(r));
+    }
 }
 
 /// Pre-computed-stats variant of [`best_partition_z`]. The chosen
@@ -1414,11 +1610,28 @@ fn partition_layout_cost_zp(
 /// parameters), keeping the layout with the smallest total payload, and
 /// lets each partition independently fall back to an escape (raw) coding
 /// when that is cheaper than Rice. RFC 9639 §9.2.5.
+#[cfg(test)]
 fn encode_rice_residual(
     w: &mut BitWriter,
     residuals: &[i32],
     block_size: usize,
     predictor_order: usize,
+) -> u32 {
+    let mut scratch = SubframeScratch::default();
+    encode_rice_residual_s(w, residuals, block_size, predictor_order, &mut scratch)
+}
+
+/// Scratch-buffered residual emitter. The zigzag span, prefix-sum table,
+/// and per-sample raw-width table are written into `scratch`'s reusable
+/// buffers instead of being allocated fresh per call — eliminating the
+/// per-subframe `Vec<u32>` / `Vec<u64>` / `Vec<u8>` triple the
+/// pre-round-191 code paid on every Fixed / LPC candidate.
+fn encode_rice_residual_s(
+    w: &mut BitWriter,
+    residuals: &[i32],
+    block_size: usize,
+    predictor_order: usize,
+    scratch: &mut SubframeScratch,
 ) -> u32 {
     // Zigzag the entire residual span **once**. Both the partition-order
     // search and the emit loop reuse this single buffer instead of
@@ -1431,14 +1644,26 @@ fn encode_rice_residual(
     // fresh `Vec<u32>` per partition per partition-order; profile-147
     // showed `best_partition` at ~61 % of encode self-samples. Folding
     // the zigzag conversion up to subframe scope removed that redundant
-    // work entirely. Round 186 takes the same shape one step further:
-    // a subframe-scoped prefix-sum table (so `sum_u` for the closed-form
+    // work entirely. Round 186 took the same shape one step further: a
+    // subframe-scoped prefix-sum table (so `sum_u` for the closed-form
     // `k_est` is O(1) per partition) and a per-sample raw-bit-width
     // table (so the escape-cost path's max-of-leading-zeros is a `u8`
     // max instead of `leading_zeros` per element) both shared across
-    // every `(method, partition_order)` pair the search visits.
-    let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
-    let (prefix, raw_bits) = build_partition_tables(residuals, &zigzag);
+    // every `(method, partition_order)` pair the search visits. Round
+    // 191 carries that shape one layer further still: the zigzag /
+    // prefix / raw-bits triple itself now lives in subframe-scope
+    // scratch reused across every Fixed / LPC candidate.
+    scratch.zigzag.clear();
+    scratch.zigzag.reserve(residuals.len());
+    for &r in residuals {
+        scratch.zigzag.push(zigzag_encode(r));
+    }
+    // Detach the parallel buffers so `build_partition_tables_into` can
+    // borrow `prefix` and `raw_bits` mutably without aliasing `zigzag`.
+    let zigzag = std::mem::take(&mut scratch.zigzag);
+    let mut prefix = std::mem::take(&mut scratch.prefix);
+    let mut raw_bits = std::mem::take(&mut scratch.raw_bits);
+    build_partition_tables_into(residuals, &zigzag, &mut prefix, &mut raw_bits);
 
     // Find the (method, partition_order) pair with the smallest payload.
     let mut best: Option<(u32, u32, u32, u32, u64)> = None; // method, param_bits, k_max, p, cost
@@ -1526,6 +1751,11 @@ fn encode_rice_residual(
             }
         }
     }
+    // Restore the parallel buffers so the next candidate sees the same
+    // (now-grown) capacity.
+    scratch.zigzag = zigzag;
+    scratch.prefix = prefix;
+    scratch.raw_bits = raw_bits;
     total_bits
 }
 
@@ -1778,10 +2008,31 @@ fn best_rice_params_zp(zigzag: &[u32], sum_u: u64, k_max: u32) -> (u64, u32) {
 /// (zero energy or non-finite intermediate values). The first
 /// coefficient corresponds to `samples[n-1]`, following FLAC's
 /// convention.
+#[cfg(test)]
 fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> Option<Vec<f64>> {
+    let mut scratch = SubframeScratch::default();
+    if !levinson_durbin_s(samples, order, window, &mut scratch) {
+        return None;
+    }
+    Some(scratch.lpc_coeffs)
+}
+
+/// Scratch-buffered Levinson-Durbin. Writes the FLAC-convention LPC
+/// coefficients into `scratch.lpc_coeffs` and returns `true`; returns
+/// `false` (with `lpc_coeffs` cleared) for degenerate input. The
+/// `windowed`, `autoc`, and `lpc_state` work buffers are reused
+/// across windows and across frames; only the contents matter to the
+/// next call.
+fn levinson_durbin_s(
+    samples: &[i32],
+    order: usize,
+    window: ApodizationWindow,
+    scratch: &mut SubframeScratch,
+) -> bool {
+    scratch.lpc_coeffs.clear();
     let n = samples.len();
     if n <= order || order == 0 {
-        return None;
+        return false;
     }
 
     // Taper the block with the requested analysis window before computing
@@ -1790,32 +2041,35 @@ fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> 
     // never the window) — so trying several and keeping the smallest
     // result is a pure rate optimisation. RFC 9639 leaves the
     // autocorrelation-to-coefficient step to the encoder.
-    let mut windowed: Vec<f64> = Vec::with_capacity(n);
+    scratch.windowed.clear();
+    scratch.windowed.reserve(n);
     for (i, &s) in samples.iter().enumerate() {
-        windowed.push(s as f64 * window.weight(i, n));
+        scratch.windowed.push(s as f64 * window.weight(i, n));
     }
 
-    let mut autoc = vec![0.0f64; order + 1];
+    scratch.autoc.clear();
+    scratch.autoc.resize(order + 1, 0.0f64);
     for lag in 0..=order {
         let mut s = 0.0f64;
         for i in lag..n {
-            s += windowed[i] * windowed[i - lag];
+            s += scratch.windowed[i] * scratch.windowed[i - lag];
         }
-        autoc[lag] = s;
+        scratch.autoc[lag] = s;
     }
-    if autoc[0] <= 0.0 || !autoc[0].is_finite() {
-        return None;
+    if scratch.autoc[0] <= 0.0 || !scratch.autoc[0].is_finite() {
+        return false;
     }
 
-    let mut lpc = vec![0.0f64; order];
-    let mut error = autoc[0];
+    scratch.lpc_state.clear();
+    scratch.lpc_state.resize(order, 0.0f64);
+    let mut error = scratch.autoc[0];
     for i in 0..order {
-        let mut r = -autoc[i + 1];
+        let mut r = -scratch.autoc[i + 1];
         for j in 0..i {
-            r -= lpc[j] * autoc[i - j];
+            r -= scratch.lpc_state[j] * scratch.autoc[i - j];
         }
         if error.abs() < 1e-12 {
-            return None;
+            return false;
         }
         let k = r / error;
         // Symmetric update in place. The recurrence
@@ -1837,23 +2091,27 @@ fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> 
         // 3 apodisation windows × 12 LPC orders per subframe, those
         // allocations were a measurable fraction of encode time on the
         // r147 flamegraph's allocator paths (`_xzm_free`, `xzm_malloc`,
-        // `__bzero`). The in-place sweep eliminates them.
+        // `__bzero`). The in-place sweep eliminates them. Round 191
+        // additionally pulls the `lpc_state` / `windowed` / `autoc` work
+        // buffers up into [`SubframeScratch`] so they live across the
+        // 3-window × 12-order outer search instead of being re-allocated
+        // per `(window, order)` pair.
         let mid = i / 2;
         for j in 0..mid {
             let opp = i - 1 - j;
-            let a = lpc[j] + k * lpc[opp];
-            let b = lpc[opp] + k * lpc[j];
-            lpc[j] = a;
-            lpc[opp] = b;
+            let a = scratch.lpc_state[j] + k * scratch.lpc_state[opp];
+            let b = scratch.lpc_state[opp] + k * scratch.lpc_state[j];
+            scratch.lpc_state[j] = a;
+            scratch.lpc_state[opp] = b;
         }
         if i % 2 == 1 {
             // Self-paired middle element of an odd-length sweep.
-            lpc[mid] = lpc[mid] + k * lpc[mid];
+            scratch.lpc_state[mid] = scratch.lpc_state[mid] + k * scratch.lpc_state[mid];
         }
-        lpc[i] = k;
+        scratch.lpc_state[i] = k;
         error *= 1.0 - k * k;
         if !error.is_finite() || error <= 0.0 {
-            return None;
+            return false;
         }
     }
 
@@ -1862,11 +2120,11 @@ fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> 
     // Levinson-Durbin (predicting `s[n] = -sum a[j] * s[n-j]`) yields
     // `a[j]`; FLAC's coefficient is `-a[j+1]` with index-0 being the
     // nearest neighbour.
-    let mut out = Vec::with_capacity(order);
-    for &v in lpc.iter() {
-        out.push(-v);
+    scratch.lpc_coeffs.reserve(order);
+    for &v in scratch.lpc_state.iter() {
+        scratch.lpc_coeffs.push(-v);
     }
-    Some(out)
+    true
 }
 
 /// Quantise floating-point LPC coefficients into `precision`-bit signed
@@ -1875,7 +2133,19 @@ fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> 
 /// range). The shift is clamped to 0..=15: RFC 9639 §9.2.6 writes the
 /// shift as a 5-bit two's-complement quantity that MUST NOT be negative
 /// (Appendix B.4), so the legal positive range is exactly 0..=15.
+#[cfg(test)]
 fn quantize_lpc(coeffs: &[f64], precision: u32) -> Option<(Vec<i32>, u32)> {
+    let mut out = Vec::new();
+    let shift = quantize_lpc_into(coeffs, precision, &mut out)?;
+    Some((out, shift))
+}
+
+/// Scratch-buffered variant of [`quantize_lpc`] that writes the
+/// quantised coefficients into the caller-provided `out` (cleared,
+/// then pushed in order). Returns the chosen `qlp_shift`; `None`
+/// signals a degenerate coefficient vector with `out` left in a
+/// caller-defined state (typically empty).
+fn quantize_lpc_into(coeffs: &[f64], precision: u32, out: &mut Vec<i32>) -> Option<u32> {
     let cmax = coeffs.iter().fold(0f64, |acc, &c| acc.max(c.abs()));
     if !cmax.is_finite() || cmax == 0.0 {
         return None;
@@ -1888,7 +2158,8 @@ fn quantize_lpc(coeffs: &[f64], precision: u32) -> Option<(Vec<i32>, u32)> {
     let shift = raw_shift.clamp(0, 15) as u32;
     let scale = (1u64 << shift) as f64;
 
-    let mut out = Vec::with_capacity(coeffs.len());
+    out.clear();
+    out.reserve(coeffs.len());
     let mut error = 0.0f64;
     for &c in coeffs {
         let v = c * scale + error;
@@ -1903,7 +2174,7 @@ fn quantize_lpc(coeffs: &[f64], precision: u32) -> Option<(Vec<i32>, u32)> {
         }
         out.push(qi as i32);
     }
-    Some((out, shift))
+    Some(shift)
 }
 
 #[cfg(test)]
@@ -1918,12 +2189,21 @@ mod tests {
         let mut all_frames: Vec<Vec<u8>> = Vec::new();
         let mut frame_num = 0u64;
         let mut i = 0;
+        let mut scratch = SubframeScratch::default();
         while i < total {
             let take = ((total - i) as u32).min(block_size) as usize;
             let per_ch: Vec<Vec<i32>> = (0..n_ch)
                 .map(|c| channels_pcm[c][i..i + take].to_vec())
                 .collect();
-            let data = encode_frame(frame_num, take as u32, sample_rate, bps, &per_ch).unwrap();
+            let data = encode_frame(
+                frame_num,
+                take as u32,
+                sample_rate,
+                bps,
+                &per_ch,
+                &mut scratch,
+            )
+            .unwrap();
             all_frames.push(data);
             frame_num += 1;
             i += take;
@@ -2123,7 +2403,9 @@ mod tests {
             );
         }
         let r = l.clone();
-        let (code, plans) = choose_channel_assignment(&[l.clone(), r.clone()], 16).unwrap();
+        let mut scratch = SubframeScratch::default();
+        let (code, plans) =
+            choose_channel_assignment(&[l.clone(), r.clone()], 16, &mut scratch).unwrap();
         assert!(
             matches!(code, 8..=10),
             "expected a decorrelated stereo code (8/9/10), got {code}"
@@ -2210,7 +2492,8 @@ mod tests {
         let sf_l = best_subframe(&l, 16).unwrap();
         let sf_r = best_subframe(&r, 16).unwrap();
         let independent = sf_l.bits + sf_r.bits;
-        let (code, plans) = choose_channel_assignment(&[l, r], 16).unwrap();
+        let mut scratch = SubframeScratch::default();
+        let (code, plans) = choose_channel_assignment(&[l, r], 16, &mut scratch).unwrap();
         let picked: u64 = plans.iter().map(|p| p.bits).sum();
         assert!(
             picked <= independent,

@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Encoder: encoder-owned reusable scratch for the per-subframe
+  candidate sweep** (round 191, RFC 9639 §9.2). The per-subframe driver
+  evaluates CONSTANT + FIXED 0..=4 + LPC 1..=12 + VERBATIM with
+  per-LPC-order apodisation × precision search, then partitioned-Rice
+  codes the residual. Pre-round-191 each surviving candidate allocated
+  a fresh `Vec<i32>` residual, the post-r186
+  `encode_rice_residual` then allocated a `Vec<u32>` zigzag plus
+  `Vec<u64>` prefix-sum plus `Vec<u8>` raw-bits triple per call, and
+  every LPC `(window, order)` pair allocated three `Vec<f64>` work
+  buffers (`windowed`, `autoc`, `lpc_state`) plus the output `Vec<f64>`
+  coefficient vector. Round 191 lifts every one of those into a single
+  `SubframeScratch` struct owned by the `FlacEncoder` itself; the
+  candidate sweep clears + reuses each buffer in place via
+  `std::mem::take`, the encoder reuses them across every frame in the
+  stream, and capacities grow to peak on the first block and stay
+  there. The numeric output is byte-identical (every roundtrip test
+  passes unchanged; the `sine_sweep_bit_exact_and_compresses_below_verbatim`
+  integration test verifies the encoded bytes against the deterministic
+  sweep). Bench A/B against the pre-r191 baseline on Apple M-class
+  hardware (criterion `--sample-size 10 --warm-up-time 2
+  --measurement-time 8`, two-run mean of the lower/upper change-CI
+  bounds):
+  - `mono/s16/44k1/1s`: 254 → 252 ms (~1.1 % faster, p < 0.01)
+  - `stereo/s16/44k1/1s`: 1013 → 1005 ms (~0.9 % faster, p < 0.01)
+  - `stereo/s24/48k/500ms`: 495 → 491 ms (~0.8 % faster, p < 0.05)
+  - `6ch/s16/48k/250ms`: 420 → 388 ms (~7.4 % faster, p ≈ 0.06)
+  - `mono/s24/48k/500ms`: 116 → 115 ms (~1.4 % faster, p < 0.01)
+  - `mono/wasted_bits/s16/44k1/1s`: 261 → 261 ms (~1.0 % faster, p < 0.05)
+  - `mono/constant/s16/44k1/1s`: 266 → 263 µs (~2.1 % faster, p < 0.01)
+
+  The 6-channel scenario benefits the most: six independent subframes
+  per frame mean the scratch-reuse savings compound across more
+  candidates per block, while the per-allocation overhead the reuse
+  replaces is essentially fixed regardless of channel count. The other
+  scenarios all show statistically-significant but smaller wins
+  (1–2 %), consistent with the residual-allocation paths the round
+  targets accounting for a small but non-zero slice of the per-subframe
+  cost (the Rice candidate scoring still dominates per-subframe).
+
+  Round 150 had attempted the same "reuse residual scratch across
+  plans" follow-up against the post-r147 hot path and measured a
+  ~10 % *regression* — that hot path's per-plan allocations were small
+  enough for libmalloc's small-bin freelist that the threading and
+  `std::mem::take`/restore overhead exceeded the savings. The
+  post-r186 hot path allocates a wider set of subframe-scoped
+  buffers (the new prefix-sum + raw-bits tables) on top of the
+  residual + zigzag pair, and the wider allocation surface is what
+  tips the trade-off the other way at r191. The legacy
+  `best_subframe`, `encode_fixed_plan`, `encode_lpc_plan`,
+  `encode_lpc_plan_at`, `encode_rice_residual`, `levinson_durbin`,
+  `quantize_lpc`, and `build_partition_tables` helpers are retained
+  behind `#[cfg(test)]` as the wrap-each-call-in-a-fresh-scratch
+  reference path the regression suite still drives directly.
+
 - **Encoder: subframe-scoped prefix-sum + raw-bits tables for the
   partitioned-Rice search** (round 186, RFC 9639 §9.2.5). Pre-round-186
   the per-partition `sum_u` reduction inside `best_rice_params_z` (the
