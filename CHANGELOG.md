@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-flac/compare/v0.0.9...v0.0.10) - 2026-05-30
+
+### Other
+
+- encoder-owned scratch reused across candidate sweep
+- subframe-scoped prefix-sum + raw-bits tables (RFC 9639 §9.2.5)
+- in-place symmetric-pair Levinson-Durbin update (RFC 9639 §9.2.6)
+- hoist residual zigzag to once-per-subframe (RFC 9639 §9.2.5)
+- add typed PICTURE accessor + writer (RFC 9639 §8.8)
+- wire write_padding into make_encoder_with_options
+- add PADDING writer + composable block-header serialiser
+- round-150 encoder coverage for wide-mono / wasted-bits / CONSTANT
+- capture round-147 SVG flamegraphs for encode/decode/roundtrip
+- closed-form Rice parameter estimate cuts encode 4.6x-6.0x
+- add profile_flac.rs driver for samply / perf / flamegraph
+- add criterion benches for encode / decode / roundtrip
+- add sibling-shape decode target
+- add SEEKTABLE writer + property-style sine sweep test
+- search Welch/Hann/Tukey apodization windows per LPC subframe
+- search LPC coefficient precision per subframe
+- raise MAX_LPC_ORDER from 8 to 12 (per RFC 9639 §9.2.6)
+- adaptive LPC coefficient precision from block size
+- search partition orders 0..=8 for residual Rice coding
+- add write_cuesheet for round-trip CUESHEET emission
+- rewrite library-citation comments to remove external-library references
+- parse CUESHEET block + surface as Demuxer::chapters()
+- reject bps>32 to fix panic the fuzz harness found
+- add cargo-fuzz scaffold + libavcodec FLAC oracle
+
 ### Changed
 
 - **Encoder: encoder-owned reusable scratch for the per-subframe
