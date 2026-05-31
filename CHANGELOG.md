@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- bench: round-195 decoder coverage for mono-S24, uniform-noise Rice
+  hot path (escape-partition branch per RFC 9639 §9.2.7), and full-
+  width S32 sample path. Pairs the existing `encode_mono_s24` with a
+  matching decode scenario, exercises `subframe::decode_residual`
+  when `k` is forced toward the escape marker, and adds the only
+  decode scenario that drives the 32-bit residual + S32 interleave
+  output. Baseline numbers (release, Darwin aarch64):
+  `decode_mono_s24_48k_500ms` ≈ 306 µs (~224 MiB/s),
+  `decode_mono_noise_s16_44k1_1s` ≈ 635 µs (~132 MiB/s — the
+  slowest decode scenario, confirming residual reader is on the hot
+  path rather than VERBATIM-short-circuited),
+  `decode_stereo_s32_96k_250ms` ≈ 657 µs (~279 MiB/s).
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-flac/compare/v0.0.9...v0.0.10) - 2026-05-30
 
 ### Other

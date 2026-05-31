@@ -29,6 +29,23 @@
 //!   - **decode_6ch_s16_48k_250ms**: 0.25 s of 6-channel S16 PCM at
 //!     48 kHz — independent subframe per channel across the max
 //!     channel count, no stereo decorrelation.
+//!   - **decode_mono_s24_48k_500ms** *(r195)*: 0.5 s of mono S24 PCM
+//!     at 48 kHz — wide-sample single-channel decode path uncoupled
+//!     from the stereo decorrelation inverse. Pairs with the matching
+//!     encoder bench (`encode_mono_s24_48k_500ms`) so encoder + decoder
+//!     S24 numbers can be A/B-ed against the same input shape.
+//!   - **decode_mono_noise_s16_44k1_1s** *(r195)*: 1 s of mono S16 PCM
+//!     filled with uniform xorshift noise scaled to ~half-range. With
+//!     near-zero linear predictability the encoder's residuals stay
+//!     wide, which pushes the per-partition Rice parameter `k` up
+//!     toward (and occasionally past) the escape marker — exercises
+//!     the `read_unary -> read_u32(k)` hot path and the
+//!     escape-partition raw-bits branch (RFC 9639 §9.2.7) that the
+//!     tone-plus-noise scenarios rarely touch.
+//!   - **decode_stereo_s32_96k_250ms** *(r195)*: 0.25 s of stereo S32
+//!     PCM at 96 kHz — exercises the 32-bit sample-width path through
+//!     the residual reader, LPC inverse, and S32 little-endian
+//!     interleave output that the S16 / S24 scenarios never reach.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-flac --bench decode
@@ -49,9 +66,11 @@ fn build_pcm_per_channel(n_samples: usize, channels: u16, bits_per_sample: u16) 
     let mut out: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(n_samples)).collect();
     let mut state: u32 = 0xCAFE_F00D;
     let amp = if bits_per_sample <= 16 {
-        1 << 13
+        1 << 13 // ~25% of 16-bit range
+    } else if bits_per_sample <= 24 {
+        1 << 21 // ~25% of 24-bit range
     } else {
-        1 << 21
+        1 << 29 // ~25% of 32-bit range — for the r195 S32 scenario
     };
     for s in 0..n_samples {
         let phase = (s % 256) as i32 - 128;
@@ -215,11 +234,125 @@ fn bench_decode_6ch_s16_48k_250ms(c: &mut Criterion) {
     g.finish();
 }
 
+/// Build per-channel PCM as a slow ramp plus large-amplitude uniform
+/// xorshift32 noise. The ramp keeps FIXED order-1/2 a clear win over
+/// VERBATIM (otherwise the encoder would short-circuit to VERBATIM
+/// for pure noise and the residual reader would never run); the loud
+/// noise term keeps the FIXED residual wide, which forces the
+/// per-partition Rice parameter `k` up — frequently into double
+/// digits and occasionally hitting the escape marker (`k == 15` for
+/// method 0 / `k == 31` for method 1, RFC 9639 §9.2.7), tripping
+/// the raw-bits branch in `subframe::decode_residual` that the
+/// tone-plus-small-noise scenarios bypass.
+fn build_noise_pcm_per_channel(
+    n_samples: usize,
+    channels: u16,
+    bits_per_sample: u16,
+) -> Vec<Vec<i32>> {
+    let nch = channels as usize;
+    let mut out: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(n_samples)).collect();
+    let mut state: u32 = 0xDEAD_BEEF;
+    let (ramp_amp, noise_amp) = if bits_per_sample <= 16 {
+        (1i32 << 12, 1i32 << 13) // 16-bit container
+    } else if bits_per_sample <= 24 {
+        (1i32 << 20, 1i32 << 21) // 24-bit container
+    } else {
+        (1i32 << 28, 1i32 << 29) // 32-bit container
+    };
+    for s in 0..n_samples {
+        // Slow triangular ramp so FIXED order-1/2 still earns its keep
+        // over VERBATIM — without it the encoder picks VERBATIM and the
+        // bench would skip the residual reader entirely.
+        let phase = ((s as i32) % 1024) - 512;
+        let env = phase * ramp_amp / 512;
+        for ch in 0..nch {
+            let raw = xorshift32(&mut state) as i32;
+            let noise = ((raw as i64) * (noise_amp as i64) / (i32::MAX as i64)) as i32;
+            let chan_bias = (ch as i32) * (ramp_amp / 16);
+            out[ch].push(env + chan_bias + noise);
+        }
+    }
+    out
+}
+
+/// **Round 195 addition** — mono S24 decoder counterpart to the
+/// encoder bench `encode_mono_s24_48k_500ms`. The existing S24 scenario
+/// is stereo, which folds in the channel-decorrelation inverse; this
+/// isolates the cost of a single wide-sample subframe so the encoder
+/// and decoder S24 deltas can be A/B-ed against the same input shape.
+fn bench_decode_mono_s24_48k_500ms(c: &mut Criterion) {
+    let n = 24_000; // 0.5 s @ 48 kHz
+    let pcm = build_pcm_per_channel(n, 1, 24);
+    let (dec_params, packets) = prepare_flac_stream(SampleFormat::S24, 1, 48_000, &pcm);
+    let mut g = c.benchmark_group("decode_mono_s24_48k_500ms");
+    g.throughput(Throughput::Bytes((n * 3) as u64));
+    g.bench_function(BenchmarkId::from_parameter("mono/s24/48k/500ms"), |b| {
+        b.iter(|| {
+            let bytes = run_decode(
+                criterion::black_box(&dec_params),
+                criterion::black_box(&packets),
+            );
+            criterion::black_box(bytes);
+        });
+    });
+    g.finish();
+}
+
+/// **Round 195 addition** — uniform-noise scenario targeting the
+/// Rice unpack hot path. With near-zero linear predictability the
+/// encoder's residuals stay wide; per-partition `k` is forced up
+/// toward (and occasionally past) the escape marker (RFC 9639 §9.2.7),
+/// so the bench body runs the `read_unary + read_u32(k)` loop more
+/// often plus the escape-partition raw-bits branch the existing
+/// tone-shape scenarios rarely touch.
+fn bench_decode_mono_noise_s16_44k1_1s(c: &mut Criterion) {
+    let n = 44_100;
+    let pcm = build_noise_pcm_per_channel(n, 1, 16);
+    let (dec_params, packets) = prepare_flac_stream(SampleFormat::S16, 1, 44_100, &pcm);
+    let mut g = c.benchmark_group("decode_mono_noise_s16_44k1_1s");
+    g.throughput(Throughput::Bytes((n * 2) as u64));
+    g.bench_function(BenchmarkId::from_parameter("mono/noise/s16/44k1/1s"), |b| {
+        b.iter(|| {
+            let bytes = run_decode(
+                criterion::black_box(&dec_params),
+                criterion::black_box(&packets),
+            );
+            criterion::black_box(bytes);
+        });
+    });
+    g.finish();
+}
+
+/// **Round 195 addition** — full-width 32-bit sample scenario. The
+/// existing scenarios cap at S24; this one exercises the 32-bit
+/// branch of the residual reader, LPC inverse, and the S32 little-
+/// endian interleave output that the S16/S24 paths never reach.
+fn bench_decode_stereo_s32_96k_250ms(c: &mut Criterion) {
+    let n = 24_000; // 0.25 s @ 96 kHz
+    let pcm = build_pcm_per_channel(n, 2, 32);
+    let (dec_params, packets) = prepare_flac_stream(SampleFormat::S32, 2, 96_000, &pcm);
+    let mut g = c.benchmark_group("decode_stereo_s32_96k_250ms");
+    g.throughput(Throughput::Bytes((n * 4 * 2) as u64));
+    g.bench_function(BenchmarkId::from_parameter("stereo/s32/96k/250ms"), |b| {
+        b.iter(|| {
+            let bytes = run_decode(
+                criterion::black_box(&dec_params),
+                criterion::black_box(&packets),
+            );
+            criterion::black_box(bytes);
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_decode_mono_s16_44k1_1s,
     bench_decode_stereo_s16_44k1_1s,
     bench_decode_stereo_s24_48k_500ms,
     bench_decode_6ch_s16_48k_250ms,
+    bench_decode_mono_s24_48k_500ms,
+    bench_decode_mono_noise_s16_44k1_1s,
+    bench_decode_stereo_s32_96k_250ms,
 );
 criterion_main!(benches);
