@@ -89,3 +89,19 @@ name = "decode"
 path = "fuzz_targets/decode.rs"
 test = false
 doc = false
+
+# Target 5: METADATA_BLOCK chain walker + writer round-trip. Walks
+# a `fLaC`-magic-led chain of `BlockHeader::parse` → typed parser
+# (StreamInfo / SeekTable / CueSheet / Picture / PADDING-length) →
+# matching writer → re-parse, asserting parser ∘ writer ∘ parser
+# == parser at every step. Covers `parse_picture` + `write_picture`
+# + `write_cuesheet` + `write_seektable` + `write_padding` +
+# `BlockHeader::write_into`, none of which any existing target
+# exercises in writer-direction. Bounded loop (≤ 16 blocks per
+# iteration, ≤ 64 KiB per payload) so the fuzzer can't pin a
+# worker on a pathological chain.
+[[bin]]
+name = "metadata_walker"
+path = "fuzz_targets/metadata_walker.rs"
+test = false
+doc = false

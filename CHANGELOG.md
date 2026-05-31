@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-200 `metadata_walker` target — walks a `fLaC`-magic-led
+  METADATA_BLOCK chain through `BlockHeader::parse` → typed parser
+  (StreamInfo / SeekTable / CueSheet / Picture / PADDING) → matching
+  writer (`write_seektable` / `write_cuesheet` / `write_picture` /
+  `write_padding`) → re-parse, asserting parser ∘ writer ∘ parser
+  == parser at every step. First fuzz coverage for `parse_picture`,
+  `write_picture`, and `BlockHeader::write_into`, and the first
+  writer-direction round-trip fuzz for any FLAC metadata block.
+  Bounded loop (≤ 16 blocks per iteration, ≤ 64 KiB per payload)
+  keeps each libFuzzer iteration cheap. Auto-discovered by the
+  filesystem walk in the org-level `crate-fuzz.yml` workflow, so no
+  caller-side wiring is needed.
 - bench: round-195 decoder coverage for mono-S24, uniform-noise Rice
   hot path (escape-partition branch per RFC 9639 §9.2.7), and full-
   width S32 sample path. Pairs the existing `encode_mono_s24` with a
