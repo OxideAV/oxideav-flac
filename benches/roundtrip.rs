@@ -19,10 +19,26 @@
 //!   - **roundtrip_stereo_s16_44k1_1s**: stereo baseline — adds the
 //!     four-way decorrelation search on encode + the inverse step on
 //!     decode.
-//!   - **roundtrip_stereo_s24_48k_500ms**: highest-bps supported mode
+//!   - **roundtrip_stereo_s24_48k_500ms**: highest-bps stereo mode
 //!     (24-bit), wider residuals through Rice + LPC.
 //!   - **roundtrip_6ch_s16_48k_250ms**: max channel count (6),
 //!     independent subframe per channel.
+//!   - **roundtrip_mono_s24_48k_500ms** *(r207)*: wide-sample mono path
+//!     end-to-end. Pairs with `encode_mono_s24_48k_500ms` /
+//!     `decode_mono_s24_48k_500ms` so the wide-sample single-channel
+//!     pipeline can be A/B-ed against the combined encode+decode shape.
+//!   - **roundtrip_mono_noise_s16_44k1_1s** *(r207)*: uniform-noise
+//!     content that keeps the per-partition Rice parameter `k` wide
+//!     and occasionally trips the escape-partition raw-bits branch
+//!     (RFC 9639 §9.2.7). Round-trip variant of the matching encoder /
+//!     decoder noise benches; the bench-body invariant
+//!     (recovered-bytes == input) doubles as a regression guard that
+//!     the escape branch never silently drops or duplicates samples.
+//!   - **roundtrip_stereo_s32_96k_250ms** *(r207)*: full-width 32-bit
+//!     pipeline at 96 kHz. Exercises the wider residual path through
+//!     both directions (32-bit encoder subframe coding + the matching
+//!     decoder inverse + S32 little-endian de-interleave) that the
+//!     existing S16/S24 scenarios never reach.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-flac --bench roundtrip
@@ -43,9 +59,11 @@ fn build_pcm_per_channel(n_samples: usize, channels: u16, bits_per_sample: u16) 
     let mut out: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(n_samples)).collect();
     let mut state: u32 = 0xCAFE_F00D;
     let amp = if bits_per_sample <= 16 {
-        1 << 13
+        1 << 13 // ~25% of 16-bit range
+    } else if bits_per_sample <= 24 {
+        1 << 21 // ~25% of 24-bit range
     } else {
-        1 << 21
+        1 << 29 // ~25% of 32-bit range — r207 stereo_s32 scenario
     };
     for s in 0..n_samples {
         let phase = (s % 256) as i32 - 128;
@@ -53,6 +71,41 @@ fn build_pcm_per_channel(n_samples: usize, channels: u16, bits_per_sample: u16) 
         for ch in 0..nch {
             let noise = (xorshift32(&mut state) as i32) >> 24;
             let chan_bias = (ch as i32) * (amp / 16);
+            out[ch].push(env + chan_bias + noise);
+        }
+    }
+    out
+}
+
+/// **Round 207 addition** — uniform-noise PCM with a slow triangular
+/// ramp so FIXED order-1/2 stays a clear win over VERBATIM (otherwise
+/// the encoder short-circuits to VERBATIM for pure noise and the
+/// residual reader / writer never run). Mirrors the matching helper in
+/// `benches/decode.rs` so the roundtrip noise scenario uses the same
+/// shape the decoder bench's `bench_decode_mono_noise_s16_44k1_1s`
+/// exercises.
+fn build_noise_pcm_per_channel(
+    n_samples: usize,
+    channels: u16,
+    bits_per_sample: u16,
+) -> Vec<Vec<i32>> {
+    let nch = channels as usize;
+    let mut out: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(n_samples)).collect();
+    let mut state: u32 = 0xDEAD_BEEF;
+    let (ramp_amp, noise_amp) = if bits_per_sample <= 16 {
+        (1i32 << 12, 1i32 << 13)
+    } else if bits_per_sample <= 24 {
+        (1i32 << 20, 1i32 << 21)
+    } else {
+        (1i32 << 28, 1i32 << 29)
+    };
+    for s in 0..n_samples {
+        let phase = ((s as i32) % 1024) - 512;
+        let env = phase * ramp_amp / 512;
+        for ch in 0..nch {
+            let raw = xorshift32(&mut state) as i32;
+            let noise = ((raw as i64) * (noise_amp as i64) / (i32::MAX as i64)) as i32;
+            let chan_bias = (ch as i32) * (ramp_amp / 16);
             out[ch].push(env + chan_bias + noise);
         }
     }
@@ -219,11 +272,97 @@ fn bench_roundtrip_6ch_s16_48k_250ms(c: &mut Criterion) {
     g.finish();
 }
 
+/// **Round 207 addition** — wide-sample mono roundtrip. Pairs with
+/// `encode_mono_s24_48k_500ms` (added r150) and
+/// `decode_mono_s24_48k_500ms` (added r195) so the wide-sample single-
+/// channel pipeline can be A/B-ed end-to-end without the stereo
+/// decorrelation search confounding the delta.
+fn bench_roundtrip_mono_s24_48k_500ms(c: &mut Criterion) {
+    let n = 24_000; // 0.5 s @ 48 kHz
+    let pcm = build_pcm_per_channel(n, 1, 24);
+    let expected = n * 3; // mono s24 (3 bytes/sample)
+    let mut g = c.benchmark_group("roundtrip_mono_s24_48k_500ms");
+    g.throughput(Throughput::Bytes(expected as u64));
+    g.sample_size(10);
+    g.bench_function(BenchmarkId::from_parameter("mono/s24/48k/500ms"), |b| {
+        b.iter(|| {
+            roundtrip_once(
+                SampleFormat::S24,
+                1,
+                48_000,
+                criterion::black_box(&pcm),
+                expected,
+            );
+        });
+    });
+    g.finish();
+}
+
+/// **Round 207 addition** — uniform-noise roundtrip. With near-zero
+/// linear predictability the encoder's residuals stay wide, which
+/// pushes the per-partition Rice parameter `k` up toward (and
+/// occasionally past) the escape marker (RFC 9639 §9.2.7). Round-trip
+/// shape of the matching encoder bench scenarios — the body invariant
+/// (`recovered_bytes == input`) doubles as a regression guard that the
+/// escape branch never silently drops or duplicates samples in either
+/// direction.
+fn bench_roundtrip_mono_noise_s16_44k1_1s(c: &mut Criterion) {
+    let n = 44_100;
+    let pcm = build_noise_pcm_per_channel(n, 1, 16);
+    let expected = n * 2; // mono s16
+    let mut g = c.benchmark_group("roundtrip_mono_noise_s16_44k1_1s");
+    g.throughput(Throughput::Bytes(expected as u64));
+    g.sample_size(10);
+    g.bench_function(BenchmarkId::from_parameter("mono/noise/s16/44k1/1s"), |b| {
+        b.iter(|| {
+            roundtrip_once(
+                SampleFormat::S16,
+                1,
+                44_100,
+                criterion::black_box(&pcm),
+                expected,
+            );
+        });
+    });
+    g.finish();
+}
+
+/// **Round 207 addition** — full-width 32-bit roundtrip. The existing
+/// scenarios cap at S24; this one exercises the 32-bit branch of the
+/// residual writer + reader, LPC forward + inverse, and the S32 little-
+/// endian interleave plus de-interleave that the S16/S24 paths never
+/// reach. Pairs with `decode_stereo_s32_96k_250ms` (r195) so encoder +
+/// decoder S32 numbers can be compared against the combined end-to-end
+/// cost.
+fn bench_roundtrip_stereo_s32_96k_250ms(c: &mut Criterion) {
+    let n = 24_000; // 0.25 s @ 96 kHz
+    let pcm = build_pcm_per_channel(n, 2, 32);
+    let expected = n * 4 * 2; // stereo s32 (4 bytes/sample)
+    let mut g = c.benchmark_group("roundtrip_stereo_s32_96k_250ms");
+    g.throughput(Throughput::Bytes(expected as u64));
+    g.sample_size(10);
+    g.bench_function(BenchmarkId::from_parameter("stereo/s32/96k/250ms"), |b| {
+        b.iter(|| {
+            roundtrip_once(
+                SampleFormat::S32,
+                2,
+                96_000,
+                criterion::black_box(&pcm),
+                expected,
+            );
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_roundtrip_mono_s16_44k1_1s,
     bench_roundtrip_stereo_s16_44k1_1s,
     bench_roundtrip_stereo_s24_48k_500ms,
     bench_roundtrip_6ch_s16_48k_250ms,
+    bench_roundtrip_mono_s24_48k_500ms,
+    bench_roundtrip_mono_noise_s16_44k1_1s,
+    bench_roundtrip_stereo_s32_96k_250ms,
 );
 criterion_main!(benches);

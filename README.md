@@ -305,7 +305,18 @@ A/B against without rerunning the full docs corpus:
 - **`roundtrip`** — encode + decode back-to-back, with each iteration
   asserting that the recovered byte count equals the input so a
   state-machine drift would surface as a `panic!` in the bench
-  output rather than silent miscompression.
+  output rather than silent miscompression. Seven scenarios: the
+  original four (mono S16, stereo S16, stereo S24, 6-channel S16) and
+  three round-207 additions that bring roundtrip coverage in line
+  with the matching `encode` / `decode` scenarios — `mono/s24/48k/500ms`
+  (wide-sample single-channel pipeline without the stereo decorrelation
+  search), `mono/noise/s16/44k1/1s` (uniform-noise content that pushes
+  per-partition Rice `k` toward the §9.2.7 escape marker in both
+  directions — the recovered-bytes invariant doubles as a regression
+  guard that the escape branch never silently drops or duplicates
+  samples), and `stereo/s32/96k/250ms` (full-width 32-bit residual +
+  LPC + S32 little-endian interleave, the only path that reaches the
+  encoder's and decoder's 32-bit branches end-to-end).
 
 No committed fixture files; PCM is synthesised in-bench. Run with
 `cargo bench -p oxideav-flac --bench {encode,decode,roundtrip}`.

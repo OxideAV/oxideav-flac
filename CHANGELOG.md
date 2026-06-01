@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- bench: round-207 roundtrip coverage for the three scenarios that
+  encode (r150) and decode (r195) gained but roundtrip never picked
+  up. `roundtrip_mono_s24_48k_500ms` (wide-sample single-channel
+  end-to-end pipeline, no stereo decorrelation search), `roundtrip
+  _mono_noise_s16_44k1_1s` (uniform-noise content that pushes the
+  per-partition Rice parameter `k` toward / past the RFC 9639 §9.2.7
+  escape marker; the bench-body `recovered_bytes == input` invariant
+  doubles as a regression guard that the escape branch never silently
+  drops or duplicates samples on either direction), and
+  `roundtrip_stereo_s32_96k_250ms` (full-width 32-bit residual + LPC
+  + S32 little-endian interleave — the only roundtrip path that
+  reaches the encoder's and decoder's 32-bit branches end-to-end).
+  Baseline numbers (release, Darwin aarch64, `--quick --measurement-
+  time 1 --warm-up-time 1`): `roundtrip_mono_s24_48k_500ms` ≈
+  120.7 ms, `roundtrip_mono_noise_s16_44k1_1s` ≈ 267 ms,
+  `roundtrip_stereo_s32_96k_250ms` ≈ 277 ms — all within ~1 ms of the
+  encode-only number for the same shape (the decode pass is
+  effectively free at the criterion timer's resolution, which matches
+  the per-bench `decode` table where every scenario is ≤ 1 ms).
 - fuzz: round-200 `metadata_walker` target — walks a `fLaC`-magic-led
   METADATA_BLOCK chain through `BlockHeader::parse` → typed parser
   (StreamInfo / SeekTable / CueSheet / Picture / PADDING) → matching
