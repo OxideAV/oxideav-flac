@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- bench: round-218 `crc` harness — eight scenarios measuring the
+  streaming `Crc8` / `Crc16` validators (round-212) and the
+  one-shot `crc8` / `crc16` slice helpers against deterministic
+  xorshift-synthesised byte buffers sized to typical FLAC frame
+  footprints (8 KiB) and a worst-case multichannel high-bit-depth
+  frame (64 KiB). Three CRC-8 scenarios (one-shot, chunked streaming
+  via `update(&[u8])` with off-aligned splits to mimic Ogg-FLAC
+  segment arrival, byte-at-a-time via `update_byte`) at 8 KiB; the
+  same three CRC-16 scenarios at 8 KiB plus one-shot + chunked
+  CRC-16 at 64 KiB. CRC-8 is skipped at 64 KiB because RFC 9639 §6.1
+  caps the header it covers at ≤ 16 bytes. Every bench iteration
+  asserts the produced value matches the one-shot helper so a
+  regression that broke the streaming path silently surfaces as a
+  benchmark panic instead of a 1.1x speedup walking different bytes.
+  Baseline numbers (release, Darwin aarch64): CRC-8 ~775 MiB/s
+  one-shot, ~735 MiB/s chunked, ~725 MiB/s byte-at-a-time; CRC-16
+  ~500 MiB/s across every 8 KiB and 64 KiB shape, confirming the
+  inner loop is table-lookup-bound and bandwidth-flat past the L1
+  working set. The bench gives future CRC tweaks (a slice-by-16
+  table, a SIMD `pclmulqdq`-driven inner loop, an
+  inline-attribute audit) a stable A/B baseline; sized per
+  RFC 9639 §6.1 (header CRC-8) and §7 (frame footer CRC-16).
 - crc: round-212 streaming CRC-8 / CRC-16 validators (`Crc8` /
   `Crc16` in `oxideav_flac::crc`) for callers that consume FLAC bytes
   in pieces — Ogg-FLAC demuxers fetching one Ogg segment at a time, a

@@ -246,6 +246,29 @@ non-Subset):
   127) and rejects payload lengths above `BlockHeader::MAX_LENGTH`
   (`2^24 - 1`).
 
+### CRC validators
+
+- **`crc`** *(r218)* — eight scenarios measuring the streaming `Crc8`
+  / `Crc16` validators (`oxideav_flac::crc`, added r212) and the
+  one-shot `crc8` / `crc16` slice helpers against deterministic
+  xorshift-synthesised byte buffers sized to typical FLAC frame
+  footprints. Three CRC-8 scenarios on an 8 KiB buffer (one-shot
+  slice, chunked streaming via `update(&[u8])` with off-aligned
+  splits, byte-at-a-time via `update_byte`) and five CRC-16 scenarios
+  (the same three at 8 KiB plus one-shot + chunked at 64 KiB for a
+  worst-case multichannel high-bit-depth frame). Every iteration
+  asserts the produced value matches the one-shot helper so a
+  regression that broke the streaming path silently shows up as a
+  benchmark panic instead of a quiet 1.1x speedup that was actually
+  walking different bytes. Baseline numbers (release, Darwin aarch64,
+  `--quick --warm-up-time 1 --measurement-time 1`): CRC-8 ~775 MiB/s
+  one-shot, ~735 MiB/s chunked, ~725 MiB/s byte-at-a-time; CRC-16
+  ~500 MiB/s across all three 8 KiB shapes; the 64 KiB CRC-16 scenarios
+  hold the same ~500 MiB/s, confirming the inner loop is
+  table-lookup-bound and bandwidth-flat past the L1 working set.
+  A future SIMD `pclmulqdq`-driven CRC-16, a slice-by-16 table, or an
+  inline-attribute removal would A/B against these numbers.
+
 ## Fuzzing
 
 `fuzz/` carries four `cargo-fuzz` targets that all share the same
@@ -279,7 +302,7 @@ returns `Error::Unsupported` instead of panicking inside
 
 ## Benchmarks
 
-`benches/` carries three `criterion` harnesses that drive the public
+`benches/` carries four `criterion` harnesses that drive the public
 `oxideav_flac::encoder::make_encoder` / `decoder::make_decoder` trait
 objects against deterministic xorshift-synthesised PCM. They exist so
 future encoder rounds (partition-order early-exit, apodization-window
@@ -319,7 +342,7 @@ A/B against without rerunning the full docs corpus:
   encoder's and decoder's 32-bit branches end-to-end).
 
 No committed fixture files; PCM is synthesised in-bench. Run with
-`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip}`.
+`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip,crc}`.
 The shape mirrors the cinepak / tta bench harnesses so numbers are
 directly comparable across the workspace.
 
