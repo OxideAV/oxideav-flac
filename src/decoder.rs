@@ -150,7 +150,15 @@ fn decode_one_frame(
         ));
     }
     let claimed_crc = u16::from_be_bytes([data[frame_byte_len], data[frame_byte_len + 1]]);
-    let computed = crc::crc16(&data[..frame_byte_len]);
+    // Streaming validator: fold the frame bytes through `Crc16` in one
+    // call. Equivalent to the one-shot `crc::crc16(&data[..n])` form
+    // it replaced, but exercises the streaming API in production so a
+    // regression that broke `Crc16::update` would surface on every
+    // decode call instead of only in the unit-test path. The cost is
+    // identical (single table-driven byte loop either way).
+    let mut crc = crc::Crc16::new();
+    crc.update(&data[..frame_byte_len]);
+    let computed = crc.value();
     if computed != claimed_crc {
         return Err(Error::invalid(format!(
             "FLAC frame CRC-16 mismatch (got {:#06x}, want {:#06x})",

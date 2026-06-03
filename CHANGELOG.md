@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- crc: round-212 streaming CRC-8 / CRC-16 validators (`Crc8` /
+  `Crc16` in `oxideav_flac::crc`) for callers that consume FLAC bytes
+  in pieces — Ogg-FLAC demuxers fetching one Ogg segment at a time, a
+  network-fed decoder fronted by a ring buffer, an in-place verifier
+  that wants to early-fail before allocating subframe sample vectors.
+  Both expose `new()` / `update_byte(b)` / `update(&[u8])` / `value()`
+  and share the same lookup tables as the existing one-shot `crc8` /
+  `crc16` slice helpers (which are now thin wrappers around the
+  streaming types — single byte-loop either way, no extra cost per
+  decode). The frame-CRC check site in `decoder::decode_one_frame` is
+  rewired to fold through `Crc16` in production so a regression that
+  broke `Crc16::update` would surface on every decode call instead of
+  only on the unit-test path. Six unit tests pin the streaming /
+  one-shot equivalence: byte-at-a-time and chunked variants for each
+  width plus an empty-update no-op test (Ogg-FLAC EOS / zero-byte
+  network reads must not perturb the running state) and a
+  chunk-boundary independence test that sweeps every split point
+  1..n-1 and confirms each pair-split agrees with the one-shot value.
+
 - bench: round-207 roundtrip coverage for the three scenarios that
   encode (r150) and decode (r195) gained but roundtrip never picked
   up. `roundtrip_mono_s24_48k_500ms` (wide-sample single-channel
