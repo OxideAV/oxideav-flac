@@ -49,3 +49,7 @@ harness = false
 [[bench]]
 name = "crc"
 harness = false
+
+[[bench]]
+name = "seek"
+harness = false

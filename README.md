@@ -302,7 +302,7 @@ returns `Error::Unsupported` instead of panicking inside
 
 ## Benchmarks
 
-`benches/` carries four `criterion` harnesses that drive the public
+`benches/` carries five `criterion` harnesses that drive the public
 `oxideav_flac::encoder::make_encoder` / `decoder::make_decoder` trait
 objects against deterministic xorshift-synthesised PCM. They exist so
 future encoder rounds (partition-order early-exit, apodization-window
@@ -342,9 +342,40 @@ A/B against without rerunning the full docs corpus:
   encoder's and decoder's 32-bit branches end-to-end).
 
 No committed fixture files; PCM is synthesised in-bench. Run with
-`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip,crc}`.
+`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip,crc,seek}`.
 The shape mirrors the cinepak / tta bench harnesses so numbers are
 directly comparable across the workspace.
+
+### Seek-path benchmark
+
+- **`seek`** *(r223)* — four scenarios measuring the demuxer's
+  `seek_to` hot path (binary search across the parsed `Vec<SeekPoint>`
+  per RFC 9639 §8.5.1 + `Cursor::seek` + `scan.reset_to` + post-seek
+  sync-code re-walk). The decode/encode/roundtrip harnesses all
+  measure forward-only work; the seek path had never been
+  benchmarked in isolation, so a regression to linear-scan or a
+  slow `Cursor::seek` would be invisible. Two warm-table scenarios
+  use `iter_batched` so STREAMINFO + SEEKTABLE parse cost is amortised
+  out: `seek_only/N=11` (1 s of audio → 11 SEEKPOINTs at the
+  encoder's default 4096-sample block size) and `seek_only/N=173`
+  (16 s → 173 SEEKPOINTs). A `seek_then_next_packet` scenario
+  measures the user-visible seek + sync-walk cost. A
+  `linear_walk_baseline` scenario walks every packet without
+  seeking — A/B baseline for the per-packet demux throughput.
+  Baseline numbers (release, Darwin aarch64, `--quick`):
+  seek_only ~14.6 ns / call at N=11, ~19.5 ns at N=173 (ratio
+  1.34× — well below the linear-scan worst case of ~16×, confirming
+  the binary search is fast enough that the constant-cost
+  `Cursor::seek` + `reset_to` overhead dominates the comparison
+  loop); seek_then_next_packet ~2.47 µs / call (the post-seek
+  sync-code walk into the next frame dominates); linear_walk_baseline
+  ~1.36 G samples/s. Fixtures synthesised via the production encoder
+  with a SEEKTABLE injected through
+  `oxideav_flac::metadata::write_seektable` +
+  `BlockHeader::write_into` — no committed `.flac` files. Gives a
+  future seek-path tweak (a zero-copy Cursor-replacement, a packed
+  16-byte SeekPoint, an "already at offset" fast-path) a stable A/B
+  baseline.
 
 ## Profiling
 

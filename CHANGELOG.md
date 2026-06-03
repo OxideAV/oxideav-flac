@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- bench: round-223 `seek` harness — four scenarios measuring the
+  FLAC demuxer's `seek_to` hot path (binary search across the
+  parsed `Vec<SeekPoint>` per RFC 9639 §8.5.1 + `Cursor::seek` +
+  `scan.reset_to` + post-seek sync-code re-walk). Every prior
+  bench measured forward-only decode/encode work; the seek path
+  had never been measured in isolation, leaving a regression to
+  linear scan or a `Cursor::seek` slowdown undetectable from the
+  existing `decode` / `encode` / `roundtrip` numbers. Two
+  warm-table scenarios (`iter_batched` so STREAMINFO + SEEKTABLE
+  parse happens outside the timed region) cover small (1 s of
+  audio → ~11 SEEKPOINTs) and large (16 s → ~173 SEEKPOINTs)
+  tables; a `seek_then_next_packet` scenario measures the
+  user-visible seek + frame-header walk cost; a
+  `linear_walk_baseline` gives an A/B reference for the
+  per-packet demuxer throughput without ever calling `seek_to`.
+  Baseline numbers (release, Darwin aarch64): seek_only ~14.6 ns
+  per call at N=11, ~19.5 ns at N=173 (ratio 1.34× —
+  log2(173)/log2(11) ≈ 2.1, so the binary search is fast enough
+  that the constant-cost `Cursor::seek` + `reset_to` overhead
+  dominates the comparison loop); seek_then_next_packet
+  ~2.47 µs / call (the post-seek sync-code walk into the next
+  frame dominates); linear_walk_baseline ~1.36 G samples/s
+  demuxer throughput. Fixtures are built via the production
+  `oxideav_flac::encoder::make_encoder` with a SEEKTABLE
+  injected through `oxideav_flac::metadata::write_seektable` +
+  `BlockHeader::write_into`; no committed `.flac` files, no
+  external library — every byte is synthesised from a
+  deterministic xorshift seed. Gives the next round's seek-path
+  tweaks (a zero-copy Cursor-replacement, a packed 16-byte
+  SeekPoint layout, a fast-path that returns early when the
+  cursor is already at the resolved offset) a stable A/B
+  baseline.
 - bench: round-218 `crc` harness — eight scenarios measuring the
   streaming `Crc8` / `Crc16` validators (round-212) and the
   one-shot `crc8` / `crc16` slice helpers against deterministic
