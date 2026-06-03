@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-228 `encoder_options` target — sixth `cargo-fuzz`
+  harness exercising `make_encoder_with_options` itself, the one
+  encoder-construction surface the existing five targets
+  (`panic_free_decode`, `roundtrip`, `flac_oracle_decode`,
+  `decode`, `metadata_walker`) only sweep indirectly. Every fuzz
+  iteration carves an 8-byte prefix into a format / channel /
+  sample-rate / padding-mode / padding-seed selector tuple,
+  builds a `FlacEncoderOptions` whose `padding_bytes` lands in one
+  of five regimes (`None`, `Some(0)`, `Some(small)`,
+  `Some(near-cap)`, `Some(over-cap)`), and calls
+  `make_encoder_with_options`. The channel byte is the raw u8 so
+  most values fall outside the `1..=8` guard; the sample-rate
+  selector includes the pathological `0`, `1`, and `u32::MAX`
+  edges. Every successful construction has its `extradata` chain
+  walked via `BlockHeader::parse` and asserted against the RFC
+  9639 §6 / §8.2 / §8.6 invariants — STREAMINFO is block 0,
+  payload length is fixed at 34, the `last` flag flips iff
+  PADDING follows, and any PADDING block carries `last=true`, the
+  caller-requested length, and an all-zero payload with no
+  trailing slack. When the params round-trip cleanly, the
+  remaining input bytes (capped at 2 KiB) feed a single
+  `send_frame` -> `flush` -> `receive_packet*` cycle and the
+  post-flush extradata is re-verified — the STREAMINFO
+  repopulation (MD5 / min-max frame size / total samples) must
+  not change the chain length nor corrupt the PADDING tail.
+  Contract under test: every reachable combination of params +
+  options returns `Result` and never panics, never overflows in a
+  debug build, and the extradata invariants survive the flush
+  rebuild. The harness ran 50 000 iterations against an empty
+  corpus locally with zero crashes / panics / hangs (release,
+  Darwin aarch64). Together with the round-200 `metadata_walker`
+  target this closes the metadata-block surface: parsers (decode
+  direction), writers via the chain walker (`metadata_walker`),
+  encoder-construction extradata production (`encoder_options`).
 - bench: round-223 `seek` harness — four scenarios measuring the
   FLAC demuxer's `seek_to` hot path (binary search across the
   parsed `Vec<SeekPoint>` per RFC 9639 §8.5.1 + `Cursor::seek` +

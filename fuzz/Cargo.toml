@@ -105,3 +105,23 @@ name = "metadata_walker"
 path = "fuzz_targets/metadata_walker.rs"
 test = false
 doc = false
+
+# Target 6 (round 228): `make_encoder_with_options` construction +
+# post-flush extradata-chain verification. Sweeps a fuzzer-chosen
+# `FlacEncoderOptions { padding_bytes }` (None / Some(0) / Some(small)
+# / Some(near-cap) / Some(over-cap)) alongside fuzzer-chosen channels
+# (raw u8 — most values land outside the `1..=8` guard), sample rate
+# (incl. pathological 0 / 1 / u32::MAX edges), and sample format. On
+# every successful construction the harness walks STREAMINFO ±
+# PADDING via `BlockHeader::parse`, asserting the chain invariants
+# (STREAMINFO `last` flag, PADDING `last=true` + requested length +
+# all-zero payload per RFC 9639 §8.6, no trailing slack). When the
+# parameters round-trip cleanly, a small PCM tail is pushed through
+# `send_frame` -> `flush` -> `receive_packet*` and the chain
+# invariants are re-asserted on the post-flush extradata so the
+# STREAMINFO repopulation can't corrupt the PADDING tail.
+[[bin]]
+name = "encoder_options"
+path = "fuzz_targets/encoder_options.rs"
+test = false
+doc = false

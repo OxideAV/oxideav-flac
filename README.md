@@ -271,7 +271,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries four `cargo-fuzz` targets that all share the same
+`fuzz/` carries six `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -293,6 +293,29 @@ on malformed input, never panic, abort, or OOM:
   FLAC stream, then cross-decodes through both `oxideav-flac` and
   `libavcodec` (loaded via `libloading`); requires no `*-sys`
   dependency and skips silently when the system library is absent.
+- **`metadata_walker`** *(r200)* — `fLaC`-magic-led metadata chain
+  walker that round-trips every typed parser (`StreamInfo`,
+  `SeekTable`, `CueSheet`, `Picture`, PADDING length) through its
+  matching writer (`write_seektable`, `write_cuesheet`,
+  `write_picture`, `write_padding`, `BlockHeader::write_into`) and
+  re-parses to assert parser ∘ writer ∘ parser = parser. Bounded at
+  16 blocks / 64 KiB per payload so a degenerate chain can't pin a
+  worker.
+- **`encoder_options`** *(r228)* — `make_encoder_with_options`
+  construction sweep. Drives a fuzzer-chosen
+  `FlacEncoderOptions { padding_bytes }` across five regimes
+  (`None`, `Some(0)`, `Some(small)`, `Some(near-cap)`,
+  `Some(over-cap)`) alongside raw u8 channel counts (most outside
+  the `1..=8` guard) and pathological sample-rate edges (0, 1,
+  `u32::MAX`); asserts every successful construction yields an
+  `extradata` chain whose RFC 9639 §6 / §8.2 / §8.6 invariants
+  (STREAMINFO payload = 34 bytes, `last` flag flips iff PADDING
+  follows, PADDING `last=true` + requested length + all-zero
+  payload + no trailing slack) hold both before AND after the
+  post-flush STREAMINFO rebuild. Together with `metadata_walker`
+  this closes the metadata-block surface — parser direction
+  (decode), writer direction via chain walker, encoder-construction
+  direction (extradata production).
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the
