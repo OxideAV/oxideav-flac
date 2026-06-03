@@ -105,3 +105,22 @@ name = "metadata_walker"
 path = "fuzz_targets/metadata_walker.rs"
 test = false
 doc = false
+
+# Target 6: encoder construction + options sweep. Fuzzes
+# `make_encoder_with_options` over a wide bps / channels / sample-rate
+# / `padding_bytes` matrix, validates the produced `extradata` is a
+# parseable STREAMINFO+(optionally PADDING) chain with the expected
+# shape (STREAMINFO's `last` flag reflects PADDING presence, PADDING
+# block length matches the requested `padding_bytes`, PADDING payload
+# is all-zero), and asserts the encoded packets self-decode bit-exact
+# under the **post-flush** extradata (the rebuild path that embeds
+# real min/max/total/MD5). Over-MAX padding values MUST be rejected
+# at construction with `Err(Error::Invalid(_))` — never accepted,
+# never panic. None of the existing five targets exercise
+# `make_encoder_with_options` with a non-default `FlacEncoderOptions`,
+# nor do they re-parse the post-flush extradata chain.
+[[bin]]
+name = "encoder_options"
+path = "fuzz_targets/encoder_options.rs"
+test = false
+doc = false

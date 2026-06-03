@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-228 `encoder_options` target — exercises
+  `make_encoder_with_options` over a wide bps / channels /
+  sample-rate / `padding_bytes` matrix that none of the prior
+  five targets (`panic_free_decode`, `roundtrip`, `decode`,
+  `flac_oracle_decode`, `metadata_walker`) reach. The
+  `padding_bytes` axis includes `None`, `Some(0)`, `Some(1)`,
+  small / medium / near-`BlockHeader::MAX_LENGTH` values, and an
+  intentionally over-MAX value; the encoder must reject the
+  over-MAX case at construction with `Err(Error::InvalidData(_))`
+  rather than panicking inside `write_padding` at flush time.
+  For accepted options the harness parses the produced
+  `extradata` as a STREAMINFO+(optional PADDING) metadata chain
+  and checks the contract shape (STREAMINFO `last` flag reflects
+  PADDING presence, `length == 34`, payload bps/channels/rate
+  match the caller's `CodecParameters`; PADDING header is
+  `last=true`, `length == padding_bytes`, payload all-zero per
+  RFC 9639 §8.6), then re-parses the **post-flush** extradata to
+  confirm the rebuild path (which re-runs `build_extradata` to
+  embed the real `min_frame_size` / `max_frame_size` /
+  `total_samples` / MD5) preserves the same shape. Finally runs
+  a full self-roundtrip (encode → decode → bit-exact assert)
+  using the post-flush extradata so the decoder's
+  end-of-stream MD5 verification gets exercised under
+  non-default PADDING-bearing extradata layouts — a path the
+  existing `roundtrip` target never hits because it constructs
+  encoders via `make_encoder` (defaults: no PADDING). Sample
+  rates include a deliberately-odd 37 337 Hz value that lands
+  outside the 11-entry fixed-rate table and forces the frame
+  header onto the three-byte variable-rate escape (RFC 9639
+  §9.1.5 code 13), broadening the rate-escape coverage every
+  iteration. Per-iteration sample cap is 128 per channel so a
+  fuzz worker churns through inputs even on S32-8ch.
 - bench: round-223 `seek` harness — four scenarios measuring the
   FLAC demuxer's `seek_to` hot path (binary search across the
   parsed `Vec<SeekPoint>` per RFC 9639 §8.5.1 + `Cursor::seek` +

@@ -271,7 +271,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries four `cargo-fuzz` targets that all share the same
+`fuzz/` carries six `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -293,6 +293,24 @@ on malformed input, never panic, abort, or OOM:
   FLAC stream, then cross-decodes through both `oxideav-flac` and
   `libavcodec` (loaded via `libloading`); requires no `*-sys`
   dependency and skips silently when the system library is absent.
+- **`metadata_walker`** — walks a `fLaC`-magic-led METADATA_BLOCK
+  chain through `BlockHeader::parse` → typed parser
+  (StreamInfo / SeekTable / CueSheet / Picture / PADDING-length) →
+  matching writer → re-parse, asserting parser ∘ writer ∘ parser
+  == parser at every step. Covers every metadata writer
+  (`write_seektable`, `write_cuesheet`, `write_padding`,
+  `write_picture`) plus `BlockHeader::write_into` in writer
+  direction.
+- **`encoder_options`** — `make_encoder_with_options` over a wide
+  bps / channels / sample-rate / `padding_bytes` matrix.
+  Verifies the produced `extradata` parses as a STREAMINFO+(optional
+  PADDING) metadata chain with the expected shape (STREAMINFO's
+  `last` flag reflects PADDING presence, PADDING block length
+  matches the requested `padding_bytes`, PADDING payload is all
+  zero) and that the encoded packets self-decode bit-exact under
+  the **post-flush** extradata (the rebuild path that embeds real
+  min/max/total/MD5). Over-MAX padding values must be rejected at
+  construction with `Err(Error::InvalidData(_))`.
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the
