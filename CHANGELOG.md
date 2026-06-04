@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-232 `md5_streaming` target — seventh `cargo-fuzz`
+  harness covering the one surface the prior six targets
+  (`panic_free_decode`, `roundtrip`, `flac_oracle_decode`,
+  `decode`, `metadata_walker`, `encoder_options`) only swept
+  indirectly: the streaming-vs-oneshot equivalence of
+  `oxideav_flac::md5::Md5`. The encoder feeds the running MD5 a
+  single deterministic schedule (one `update` per audio frame);
+  none of the existing targets stress the chunk-schedule surface
+  of `Md5::update` / `Md5::finalize`. A divergence between the
+  streaming API and the oneshot `md5::compute()` helper would
+  silently produce a STREAMINFO whose 128-bit MD5 signature (RFC
+  9639 §8.2) does not match the decoded PCM bytes a verifier
+  would recompute over the stream — every emitted `.flac` file
+  would carry an `md5sum`-mismatch under round-trip verification.
+  The risk surface is concentrated in `Md5::update`'s
+  block-boundary arithmetic: the leftover-buffer drain when an
+  incoming slice straddles the 64-byte block boundary, the
+  64-bit bit-count accumulator's `bits_hi` / `bits_lo` split with
+  overflow-add into `bits_hi`, `finalize`'s pad-length selector
+  (`56 - buffer_len` vs `120 - buffer_len`) at the 55 / 56 / 63
+  / 64 / 65 edges, and `process_block`'s 16-word little-endian
+  load. The harness carves the input into a 4-byte schedule
+  descriptor (`n_chunks_sel`, `chunk_size_seed`, `extra_update_sel`,
+  `default_sel`) and a payload tail capped at 8 KiB. Every fuzz
+  iteration drives the streaming API over seven distinct chunk
+  schedules — even split, xorshift-irregular, byte-at-a-time
+  (bounded ≤ 512 B), zero-length-interlude, `Md5::default()`
+  parity, 64-byte block-aligned, prime-stride-7 — and asserts
+  byte-for-byte equality of every schedule's digest against the
+  oneshot reference. Re-asserts the RFC 1321 §A.5 empty-input
+  vector (`d41d8cd9 8f00b204 e9800998 ecf8427e`) on every
+  iteration so a finalize-pad regression cannot slip past a
+  fuzzer that never produces a zero-length payload. Ran 7 960 199
+  iterations against the existing corpus locally with zero
+  crashes / panics / hangs (release, Darwin aarch64). Together
+  with the round-228 `encoder_options` target this closes the
+  STREAMINFO-production surface: encoder-construction extradata
+  (`encoder_options`) + the 128-bit signature field's hashing
+  primitive (`md5_streaming`).
 - fuzz: round-228 `encoder_options` target — sixth `cargo-fuzz`
   harness exercising `make_encoder_with_options` itself, the one
   encoder-construction surface the existing five targets

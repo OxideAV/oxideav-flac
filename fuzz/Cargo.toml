@@ -125,3 +125,27 @@ name = "encoder_options"
 path = "fuzz_targets/encoder_options.rs"
 test = false
 doc = false
+
+# Target 7 (round 232): `oxideav_flac::md5` streaming-vs-oneshot
+# equivalence. The encoder feeds the running MD5 a single
+# deterministic schedule (one `update` per audio frame); no existing
+# target stresses the chunk-schedule surface of `Md5::update` /
+# `Md5::finalize`. A divergence between the streaming API and the
+# oneshot `md5::compute()` helper would silently produce a
+# STREAMINFO whose 128-bit MD5 signature (RFC 9639 §8.2) does not
+# match the decoded PCM bytes a verifier would recompute over the
+# stream — every emitted `.flac` would carry an md5sum mismatch
+# under round-trip verification. The harness sweeps seven distinct
+# chunk schedules per fuzz iteration (even split, xorshift-irregular,
+# byte-at-a-time, zero-length interludes, `Md5::default()` parity,
+# 64-byte block-aligned, prime-stride-7) against a payload tail
+# capped at 8 KiB and asserts byte-for-byte equality of every
+# schedule's digest against the oneshot reference. Re-asserts the
+# RFC 1321 §A.5 empty-input vector on every iteration so a
+# finalize-pad regression can't slip past a fuzzer that never
+# produces a zero-length payload.
+[[bin]]
+name = "md5_streaming"
+path = "fuzz_targets/md5_streaming.rs"
+test = false
+doc = false
