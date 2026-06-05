@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-237 `utf8_varint` target — eighth `cargo-fuzz` harness
+  covering the one surface the prior seven targets
+  (`panic_free_decode`, `roundtrip`, `flac_oracle_decode`, `decode`,
+  `metadata_walker`, `encoder_options`, `md5_streaming`) only swept
+  indirectly: the writer ↔ reader equivalence of
+  `oxideav_flac::bits_ext::{read_utf8_u64, write_utf8_u64}` (RFC 9639
+  §9.1.5). The frame-header path exercises the reader only at the
+  value the host pipeline happens to land on, and the writer is only
+  exercised through the encoder, which emits one varint per emitted
+  frame at a single value per frame. A divergence between writer and
+  reader at any of the seven lead-byte-range boundaries (`0xxxxxxx`,
+  `110xxxxx`, `1110xxxx`, `11110xxx`, `111110xx`, `1111110x`,
+  `11111110`) would silently corrupt every coded number near that
+  boundary — a 16-bit sample-number bug would surface only on
+  variable-blocking streams whose first frame happens to land after
+  sample ~65 536, breaking seek-table consistency at every later
+  frame in the file. The risk surface is concentrated in the writer's
+  `bits_needed`→`(n_extra, lead_prefix, lead_payload_bits)` lookup,
+  the reader's `b0`-pattern dispatch (which must mirror the writer's
+  seven arms exactly), and the continuation-byte mask check
+  (`cont & 0xC0 != 0x80`) with shift-and-or accumulator (a mis-typed
+  mask or shift would corrupt a single nibble per continuation byte
+  without crashing). The harness runs six schedules every iteration:
+  **A** boundary-value roundtrip on a 14-value set (0, `2^k - 1`,
+  `2^k` for k in {7, 11, 16, 21, 26, 31}, plus `2^36 - 1`) asserting
+  byte-for-byte round-trip and per-range expected byte counts;
+  **B** fuzzer-derived 36-bit values; **C** reader panic-freedom on
+  arbitrary bytes (any sequence must return `Result`, never panic,
+  and a successful read must consume exactly the byte count the
+  lead-byte's nominal pattern mandates); **D** chained writer →
+  reader on up to 8 back-to-back varints to catch framing bugs where
+  one varint's tail bleeds into the next reader's state; **E**
+  byte-length stability at every power-of-two range boundary; **F**
+  alignment-precondition coverage (a bit-misaligned reader must
+  return `Err`, not panic). Ran 3 824 126 iterations in 46 seconds
+  locally under cargo-fuzz with sanitizer (Darwin aarch64) — zero
+  crashes, panics, hangs. Together with the round-228
+  `encoder_options` target and the round-232 `md5_streaming` target
+  this closes the field-level invariants the encoder writes into
+  every emitted frame: STREAMINFO construction (`encoder_options`)
+  + the 128-bit signature field's hashing primitive (`md5_streaming`)
+  + the frame-header coded-number field (`utf8_varint`).
 - fuzz: round-232 `md5_streaming` target — seventh `cargo-fuzz`
   harness covering the one surface the prior six targets
   (`panic_free_decode`, `roundtrip`, `flac_oracle_decode`,

@@ -149,3 +149,31 @@ name = "md5_streaming"
 path = "fuzz_targets/md5_streaming.rs"
 test = false
 doc = false
+
+# Target 8 (round 237): FLAC UTF-8 varint (RFC 9639 §9.1.5) writer ↔
+# reader roundtrip + reader panic-freedom + byte-length stability +
+# alignment-precondition coverage. No existing target stresses
+# `bits_ext::{read_utf8_u64, write_utf8_u64}` as a focused
+# cross-checked pair: the frame-header path exercises the reader
+# only at the value the host pipeline lands on, and the writer is
+# only exercised through the encoder (one varint per emitted frame
+# at a single value per frame). A divergence between writer and
+# reader at any of the seven lead-byte-range boundaries
+# (`0xxxxxxx` / `110xxxxx` / `1110xxxx` / `11110xxx` / `111110xx`
+# / `1111110x` / `11111110`) would silently corrupt every coded
+# number near that boundary — a 16-bit sample-number bug would
+# surface only on variable-blocking streams whose first frame
+# happens to land after sample ~65 536 and would break seek-table
+# consistency at every later frame. The harness sweeps a 14-value
+# boundary set every iteration (0, 2^k - 1, 2^k for k in
+# {7, 11, 16, 21, 26, 31}, plus 2^36 - 1), plus fuzzer-derived
+# 36-bit values, plus arbitrary-byte reader panic-freedom, plus
+# chained writer → reader to catch framing bugs where one varint's
+# tail bleeds into the next, plus a re-assertion that a
+# bit-misaligned reader returns `Err` rather than panicking, plus
+# byte-length stability at every range-boundary power of two.
+[[bin]]
+name = "utf8_varint"
+path = "fuzz_targets/utf8_varint.rs"
+test = false
+doc = false
