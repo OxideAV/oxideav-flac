@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-flac/compare/v0.0.10...v0.0.11) - 2026-06-05
+
+### Other
+
+- round-237 utf8_varint target — writer ↔ reader roundtrip + byte-length stability for the FLAC §9.1.5 varint
+- round-232 md5_streaming target — streaming-vs-oneshot equivalence (RFC 9639 §8.2)
+- round-228 encoder_options target — FlacEncoderOptions construction + extradata invariants
+- round-223 seek harness for SEEKTABLE binary-search + sync-walk
+- round-218 crc harness for streaming Crc8 / Crc16 validators
+- streaming CRC-8 / CRC-16 validators for chunked-input callers
+- round-207 roundtrip coverage for mono-S24 / noise / S32
+- round-200 metadata_walker — writer-direction round-trip target
+
 ### Added
 
 - fuzz: round-237 `utf8_varint` target — eighth `cargo-fuzz` harness
