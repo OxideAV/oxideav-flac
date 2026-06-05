@@ -149,3 +149,20 @@ name = "md5_streaming"
 path = "fuzz_targets/md5_streaming.rs"
 test = false
 doc = false
+
+# Target 8 (round 237): focused stress on the FLAC UTF-8-shaped
+# variable-length integer (`bits_ext::{read_utf8_u64,
+# write_utf8_u64}`, RFC 9639 §9.1.5). Every host-pipeline target
+# exercises one value per emitted frame; this target sweeps the
+# value space across all seven lead-byte-range boundaries
+# (0xxxxxxx / 110xxxxx / 1110xxxx / 11110xxx / 111110xx / 1111110x
+# / 11111110), asserts writer→reader round-trip equivalence, the
+# documented per-bit-width byte-length stability, and reader
+# robustness against arbitrary input bytes (including continuation
+# bytes 0x80..=0xBF and the reserved 0xFF sentinel that the writer
+# never produces).
+[[bin]]
+name = "utf8_varint"
+path = "fuzz_targets/utf8_varint.rs"
+test = false
+doc = false

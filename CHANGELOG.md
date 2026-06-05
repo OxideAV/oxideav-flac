@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-237 `utf8_varint` target — eighth `cargo-fuzz`
+  harness covering `oxideav_flac::bits_ext::{read_utf8_u64,
+  write_utf8_u64}`, the FLAC UTF-8-shaped variable-length integer
+  of RFC 9639 §9.1.5 (frame-header `sample_number` under
+  variable-blocking, `frame_number` under fixed-blocking). Every
+  host-pipeline target exercises the reader only at the value the
+  encoder happened to emit (one varint per emitted frame at one
+  value per frame); none of the prior seven harnesses sweep the
+  value space, so a divergence between writer and reader at any
+  of the seven lead-byte-range boundaries (`0xxxxxxx` /
+  `110xxxxx` / `1110xxxx` / `11110xxx` / `111110xx` /
+  `1111110x` / `11111110`) would silently corrupt every coded
+  number near that boundary — a 16-bit `sample_number` bug would
+  surface only on variable-blocking streams whose first frame
+  lands after sample ~65 536 and would break seek-table
+  consistency at every later frame. The harness covers four
+  contracts: writer→reader round-trip equivalence
+  (`write_utf8_u64(v) -> bytes -> read_utf8_u64(bytes) == Ok(v)`),
+  per-bit-width byte-length stability (the emitted byte count
+  must fall inside the 1/2/3/4/5/6/7-byte schedule documented in
+  §9.1.5), a 14-entry boundary sweep that runs unconditionally
+  every iteration (0, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000,
+  0x1F_FFFF, 0x20_0000, 0x3FF_FFFF, 0x400_0000, 0x7FFF_FFFF,
+  0x8000_0000, (1u64<<36)-1) so a regression at an edge cannot
+  escape a session that never produces the exact boundary value
+  through the value-driven sweep, and reader-robustness against
+  arbitrary input bytes (the parser must always return a
+  `Result` — never panic, never read past the slice — for any
+  byte sequence the fuzzer can produce, including continuation
+  bytes 0x80..=0xBF at the lead-byte position and the reserved
+  0xFF sentinel that the writer never produces). Successful
+  parses re-encode and re-parse; the second parse must match
+  the first (canonical-form stability). Ran 2 000 000 iterations
+  locally with zero crashes / panics / hangs (release, Darwin
+  aarch64). With this target the eight-target rotation now
+  covers: decoder pipeline (`panic_free_decode`, `decode`),
+  encode/decode self-consistency (`roundtrip`), cross-decode
+  validation, metadata chain walks (`metadata_walker`),
+  encoder-construction extradata (`encoder_options`), MD5
+  streaming (`md5_streaming`), and frame-header varint
+  (`utf8_varint`).
 - fuzz: round-232 `md5_streaming` target — seventh `cargo-fuzz`
   harness covering the one surface the prior six targets
   (`panic_free_decode`, `roundtrip`, `flac_oracle_decode`,

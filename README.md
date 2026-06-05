@@ -271,7 +271,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries six `cargo-fuzz` targets that all share the same
+`fuzz/` carries eight `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -316,6 +316,41 @@ on malformed input, never panic, abort, or OOM:
   this closes the metadata-block surface — parser direction
   (decode), writer direction via chain walker, encoder-construction
   direction (extradata production).
+- **`md5_streaming`** *(r232)* — streaming-vs-oneshot equivalence
+  for `oxideav_flac::md5::Md5`. The encoder feeds the running
+  MD5 a single deterministic schedule (one `update` per audio
+  frame); a divergence between the streaming API and the oneshot
+  `md5::compute()` helper would silently produce a STREAMINFO
+  whose 128-bit signature (RFC 9639 §8.2) does not match the
+  decoded PCM. Sweeps seven schedules per iteration (even split,
+  xorshift-irregular, byte-at-a-time, zero-length interludes,
+  `Md5::default()` parity, 64-byte block-aligned, prime-stride-7)
+  against a payload tail capped at 8 KiB and asserts byte-for-byte
+  equality of every schedule's digest against the oneshot
+  reference. Re-asserts the RFC 1321 §A.5 empty-input vector
+  every iteration as a finalize-pad regression guard.
+- **`utf8_varint`** *(r237)* — focused stress on the FLAC
+  UTF-8-shaped variable-length integer
+  (`bits_ext::{read_utf8_u64, write_utf8_u64}`, RFC 9639 §9.1.5
+  frame-header coded number — `sample_number` under
+  variable-blocking, `frame_number` under fixed-blocking). Every
+  host-pipeline target exercises one varint value per emitted
+  frame; this target sweeps the value space across all seven
+  lead-byte-range boundaries (`0xxxxxxx` / `110xxxxx` /
+  `1110xxxx` / `11110xxx` / `111110xx` / `1111110x` /
+  `11111110`) and asserts: writer→reader round-trip equivalence
+  (`write_utf8_u64(v) -> bytes -> read_utf8_u64(bytes) == Ok(v)`),
+  per-bit-width byte-length stability (1/2/3/4/5/6/7-byte
+  schedule per §9.1.5), a 14-entry unconditional boundary sweep
+  every iteration (0, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000,
+  0x1F_FFFF, 0x20_0000, 0x3FF_FFFF, 0x400_0000, 0x7FFF_FFFF,
+  0x8000_0000, (1u64<<36)-1), and reader robustness against
+  arbitrary input bytes — the parser returns `Result` for every
+  input, including continuation bytes 0x80..=0xBF at the lead
+  position and the reserved 0xFF sentinel. Successful parses
+  re-encode and re-parse; canonical-form stability guards
+  against codec drift at values the writer can produce but a
+  hand-built input encoded in a longer-than-necessary form.
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the
