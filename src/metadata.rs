@@ -889,6 +889,282 @@ pub fn write_picture(pic: &Picture) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Parsed VORBIS_COMMENT metadata block contents (RFC 9639 §8.6).
+///
+/// A VORBIS_COMMENT block carries a vendor identification string and
+/// a list of `name=value` fields ("FLAC tags"). RFC 9639 §8.6 admits
+/// this is the one block in the format whose 4-byte length fields
+/// are **little-endian** rather than the format's usual big-endian
+/// encoding.
+///
+/// Compared to the container-layer parser this typed accessor
+/// preserves:
+///
+/// * The vendor string verbatim (the container projection drops it
+///   into the framework's narrower `Vec<(String, String)>` metadata
+///   surface, where it is conflated with a synthetic `"vendor"` key).
+/// * Each field's original `name` casing (the container projection
+///   lowercases the field name for case-insensitive matching, which
+///   is the right behaviour for evaluating field equality per RFC
+///   9639 §8.6 but loses round-trip fidelity).
+/// * Empty values (the container projection skips fields whose value
+///   is empty after trimming; the spec admits a zero-length field
+///   value, so a tagger that legitimately stored `comment=` round-
+///   trips through this accessor intact).
+/// * Field name / value whitespace (the container projection
+///   `.trim()`s both around the `=`, which is fine for display but
+///   would silently drop leading or trailing spaces a tagger might
+///   have intended — for example a deliberately space-padded artist
+///   string).
+///
+/// The typed parser enforces every invariant RFC 9639 §8.6 names:
+///
+/// * Field names MUST be UTF-8 code points U+0020 through U+007E
+///   excluding U+003D (`=`) — printable ASCII minus the equals sign.
+/// * Field values are arbitrary UTF-8.
+/// * The vendor string is arbitrary UTF-8 (the spec does not place a
+///   character-class restriction on the vendor string beyond
+///   "human-readable, UTF-8").
+///
+/// Note that the spec also says "A FLAC file MUST NOT contain more
+/// than one Vorbis comment metadata block." That is a chain-level
+/// constraint enforced by the container demuxer / muxer, not the
+/// block-level parser; this accessor handles one block payload at a
+/// time and does not police uniqueness across a chain.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct VorbisComment {
+    /// Vendor identification string supplied by the producer (the
+    /// program that generated the file or stream). RFC 9639 §8.6
+    /// places no character-class restriction beyond UTF-8.
+    pub vendor: String,
+    /// `(name, value)` pairs in their original order. Names are
+    /// preserved with their original case; callers wanting case-
+    /// insensitive lookup should fold case at the call site (per
+    /// RFC 9639 §8.6: "The evaluation of the field names MUST be
+    /// case insensitive"). Order is preserved so a round-trip
+    /// emission reproduces the original byte sequence.
+    pub comments: Vec<(String, String)>,
+}
+
+impl VorbisComment {
+    /// Look up a comment value by case-insensitive field name (RFC
+    /// 9639 §8.6 mandates that field-name evaluation is case
+    /// insensitive). Returns the first matching value, or `None` if
+    /// no field matches.
+    ///
+    /// Multiple fields with the same name are legal per spec; this
+    /// convenience picks the first occurrence. Callers that need every
+    /// value (e.g. multi-artist albums) should walk `comments`
+    /// directly and filter on `eq_ignore_ascii_case`.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.comments
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Validate a Vorbis-comment field name against the RFC 9639 §8.6
+/// character class: bytes U+0020 through U+007E excluding U+003D
+/// (`=`). Returns `Err(byte)` on the first offending byte so the
+/// caller can produce a precise diagnostic.
+fn check_vorbis_field_name(name: &str) -> Result<()> {
+    for &b in name.as_bytes() {
+        if !(0x20..=0x7E).contains(&b) || b == b'=' {
+            return Err(Error::invalid(format!(
+                "FLAC VORBIS_COMMENT: field name byte 0x{b:02X} outside printable \
+                 ASCII range 0x20..=0x7E excluding 0x3D (=)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse a VORBIS_COMMENT block payload (RFC 9639 §8.6).
+///
+/// Wire layout (all `u32` length fields little-endian unsigned, the
+/// only little-endian fields in the FLAC format):
+///
+/// ```text
+///   u32_le  vendor length (N0)
+///   u8*N0   vendor string (UTF-8)
+///   u32_le  comment count (N)
+///   N times:
+///     u32_le  field length (Ni)
+///     u8*Ni   field bytes (UTF-8), shape "NAME=VALUE"
+/// ```
+///
+/// The parser rejects:
+///
+/// * any payload too short for the declared lengths (so a hostile
+///   producer cannot induce an out-of-bounds read on a short payload
+///   by advertising a 4 GiB vendor string);
+/// * any vendor string or field that is not valid UTF-8 (the spec
+///   mandates UTF-8 — we surface invalid UTF-8 as an error rather
+///   than silently replacing with `U+FFFD` as the container
+///   projection does);
+/// * any field that does not contain an `=` separator (a Vorbis
+///   comment field MUST be a `NAME=VALUE` pair per RFC 9639 §8.6;
+///   a payload of just `NAME` is malformed);
+/// * any field whose name contains a byte outside the allowed
+///   character class (printable ASCII minus `=`);
+/// * any trailing bytes after the declared count of fields (a
+///   silent leftover would indicate a length-mismatch we'd rather
+///   surface up the stack).
+pub fn parse_vorbis_comment(bytes: &[u8]) -> Result<VorbisComment> {
+    fn read_u32_le(bytes: &[u8], i: &mut usize, what: &str) -> Result<u32> {
+        if i.checked_add(4).map_or(true, |end| end > bytes.len()) {
+            return Err(Error::invalid(format!(
+                "FLAC VORBIS_COMMENT: payload truncated reading {what} length \
+                 (need 4 bytes at offset {i}, have {})",
+                bytes.len()
+            )));
+        }
+        let v = u32::from_le_bytes([bytes[*i], bytes[*i + 1], bytes[*i + 2], bytes[*i + 3]]);
+        *i += 4;
+        Ok(v)
+    }
+
+    let mut i = 0usize;
+    let vendor_len = read_u32_le(bytes, &mut i, "vendor")? as usize;
+    if i.checked_add(vendor_len)
+        .map_or(true, |end| end > bytes.len())
+    {
+        return Err(Error::invalid(format!(
+            "FLAC VORBIS_COMMENT: vendor string overruns payload \
+             (need {vendor_len} bytes at offset {i}, have {})",
+            bytes.len()
+        )));
+    }
+    let vendor = std::str::from_utf8(&bytes[i..i + vendor_len])
+        .map_err(|e| Error::invalid(format!("FLAC VORBIS_COMMENT: vendor not valid UTF-8: {e}")))?
+        .to_string();
+    i += vendor_len;
+
+    let count = read_u32_le(bytes, &mut i, "comment count")? as usize;
+    let mut comments = Vec::with_capacity(count.min(64));
+    for n in 0..count {
+        let field_len = read_u32_le(bytes, &mut i, "field")? as usize;
+        if i.checked_add(field_len)
+            .map_or(true, |end| end > bytes.len())
+        {
+            return Err(Error::invalid(format!(
+                "FLAC VORBIS_COMMENT: field {n} ({field_len} bytes) overruns payload \
+                 at offset {i} (payload {} bytes)",
+                bytes.len()
+            )));
+        }
+        let entry = std::str::from_utf8(&bytes[i..i + field_len]).map_err(|e| {
+            Error::invalid(format!(
+                "FLAC VORBIS_COMMENT: field {n} not valid UTF-8: {e}"
+            ))
+        })?;
+        i += field_len;
+        let eq = entry
+            .as_bytes()
+            .iter()
+            .position(|&b| b == b'=')
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "FLAC VORBIS_COMMENT: field {n} missing `=` separator"
+                ))
+            })?;
+        let name = &entry[..eq];
+        check_vorbis_field_name(name)?;
+        let value = &entry[eq + 1..];
+        comments.push((name.to_string(), value.to_string()));
+    }
+
+    if i != bytes.len() {
+        return Err(Error::invalid(format!(
+            "FLAC VORBIS_COMMENT: {} trailing byte(s) after declared {} field(s)",
+            bytes.len() - i,
+            count
+        )));
+    }
+
+    Ok(VorbisComment { vendor, comments })
+}
+
+/// Serialise a [`VorbisComment`] back into a RFC 9639 §8.6
+/// VORBIS_COMMENT block payload. Round-trips through
+/// [`parse_vorbis_comment`] byte-for-byte.
+///
+/// The writer enforces every invariant the parser checks, before
+/// emitting any bytes:
+///
+/// * `vendor` length must fit a `u32` (always true within `usize` on
+///   64-bit platforms but checked explicitly for clarity).
+/// * Each field name must be printable ASCII excluding `=`
+///   (`0x20..=0x7E` minus `0x3D`) — bytes outside that range produce
+///   `Error::invalid`. This is the writer-side mirror of the parser's
+///   character-class check so a constructed `VorbisComment` cannot
+///   silently round-trip through a writer/parser pair that disagree.
+/// * Each field's combined `name.len() + 1 + value.len()` must fit a
+///   `u32`.
+/// * `comments.len()` must fit a `u32`.
+///
+/// `String`s are valid UTF-8 by Rust's type invariants, so no extra
+/// UTF-8 check is needed on the field values or the vendor.
+///
+/// Returns `Error::invalid` on any of those failures. The resulting
+/// payload may still exceed the metadata-block-header's 24-bit length
+/// ceiling (`BlockHeader::MAX_LENGTH`); the wrapping
+/// [`BlockHeader::write_into`] call catches that downstream so we do
+/// not duplicate the check here.
+pub fn write_vorbis_comment(vc: &VorbisComment) -> Result<Vec<u8>> {
+    if vc.vendor.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "FLAC VORBIS_COMMENT: vendor length {} exceeds u32",
+            vc.vendor.len()
+        )));
+    }
+    if vc.comments.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "FLAC VORBIS_COMMENT: comment count {} exceeds u32",
+            vc.comments.len()
+        )));
+    }
+    // Pre-compute total + validate every name's character class.
+    let mut total = 4 + vc.vendor.len() + 4;
+    for (n, (name, value)) in vc.comments.iter().enumerate() {
+        check_vorbis_field_name(name)?;
+        let entry_len = name
+            .len()
+            .checked_add(1)
+            .and_then(|x| x.checked_add(value.len()))
+            .ok_or_else(|| {
+                Error::invalid(format!("FLAC VORBIS_COMMENT: field {n} length overflow"))
+            })?;
+        if entry_len > u32::MAX as usize {
+            return Err(Error::invalid(format!(
+                "FLAC VORBIS_COMMENT: field {n} length {entry_len} exceeds u32"
+            )));
+        }
+        total = total
+            .checked_add(4)
+            .and_then(|x| x.checked_add(entry_len))
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "FLAC VORBIS_COMMENT: cumulative payload size overflow at field {n}"
+                ))
+            })?;
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(vc.vendor.len() as u32).to_le_bytes());
+    out.extend_from_slice(vc.vendor.as_bytes());
+    out.extend_from_slice(&(vc.comments.len() as u32).to_le_bytes());
+    for (name, value) in &vc.comments {
+        let entry_len = name.len() + 1 + value.len();
+        out.extend_from_slice(&(entry_len as u32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value.as_bytes());
+    }
+    debug_assert_eq!(out.len(), total);
+    Ok(out)
+}
+
 impl StreamInfo {
     /// Parse a STREAMINFO block. The block payload is exactly 34 bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
@@ -1983,5 +2259,331 @@ mod tests {
         let bytes = write_picture(&pic).expect("write");
         let parsed = parse_picture(&bytes).expect("parse");
         assert_eq!(parsed.picture_type, 0xDEAD_BEEF);
+    }
+
+    // ----------------------------------------------------------------
+    // VORBIS_COMMENT (RFC 9639 §8.6) — typed accessor + writer tests
+    // ----------------------------------------------------------------
+
+    /// Build a synthetic VORBIS_COMMENT block payload directly from a
+    /// vendor string and a (name, value) field list. Used by the
+    /// tests to exercise the parser against bytes that bypass the
+    /// writer's validation path.
+    fn synth_vorbis_payload(vendor: &[u8], fields: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        buf.extend_from_slice(vendor);
+        buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        for (n, v) in fields {
+            let entry_len = n.len() + 1 + v.len();
+            buf.extend_from_slice(&(entry_len as u32).to_le_bytes());
+            buf.extend_from_slice(n);
+            buf.push(b'=');
+            buf.extend_from_slice(v);
+        }
+        buf
+    }
+
+    #[test]
+    fn vorbis_comment_parses_minimal_payload() {
+        // Empty vendor, zero comments — the smallest legal payload.
+        let payload = synth_vorbis_payload(b"", &[]);
+        let vc = parse_vorbis_comment(&payload).expect("parse");
+        assert!(vc.vendor.is_empty());
+        assert!(vc.comments.is_empty());
+        // Round-trip through write_vorbis_comment.
+        let re_bytes = write_vorbis_comment(&vc).expect("write");
+        assert_eq!(re_bytes, payload, "byte-for-byte round-trip");
+        let re = parse_vorbis_comment(&re_bytes).expect("re-parse");
+        assert_eq!(re, vc);
+    }
+
+    #[test]
+    fn vorbis_comment_parses_real_shape() {
+        // Realistic shape: a vendor tag plus title/artist/album fields.
+        let payload = synth_vorbis_payload(
+            b"oxideav-flac 0.0.10",
+            &[
+                (b"TITLE", b"Symphony No. 5"),
+                (b"ARTIST", b"Ludwig van Beethoven"),
+                (b"ALBUM", b"Greatest Hits"),
+            ],
+        );
+        let vc = parse_vorbis_comment(&payload).expect("parse");
+        assert_eq!(vc.vendor, "oxideav-flac 0.0.10");
+        assert_eq!(vc.comments.len(), 3);
+        assert_eq!(vc.comments[0], ("TITLE".into(), "Symphony No. 5".into()));
+        assert_eq!(
+            vc.comments[1],
+            ("ARTIST".into(), "Ludwig van Beethoven".into())
+        );
+        assert_eq!(vc.comments[2], ("ALBUM".into(), "Greatest Hits".into()));
+        // Byte-for-byte round-trip.
+        let re_bytes = write_vorbis_comment(&vc).expect("write");
+        assert_eq!(re_bytes, payload);
+    }
+
+    #[test]
+    fn vorbis_comment_get_is_case_insensitive() {
+        // RFC 9639 §8.6 mandates case-insensitive field-name matching.
+        let payload = synth_vorbis_payload(
+            b"vendor",
+            &[
+                (b"Title", b"Hello"),
+                (b"ARTIST", b"World"),
+                (b"album", b"X"),
+            ],
+        );
+        let vc = parse_vorbis_comment(&payload).unwrap();
+        assert_eq!(vc.get("title"), Some("Hello"));
+        assert_eq!(vc.get("TITLE"), Some("Hello"));
+        assert_eq!(vc.get("Artist"), Some("World"));
+        assert_eq!(vc.get("ALBUM"), Some("X"));
+        assert_eq!(vc.get("missing"), None);
+    }
+
+    #[test]
+    fn vorbis_comment_preserves_empty_value() {
+        // RFC 9639 §8.6 places no minimum length on a field value —
+        // the byte sequence "NAME=" is a legal field with an empty
+        // value. The container-layer projection drops empty values;
+        // the typed accessor preserves them.
+        let payload = synth_vorbis_payload(b"v", &[(b"COMMENT", b"")]);
+        let vc = parse_vorbis_comment(&payload).expect("parse");
+        assert_eq!(vc.comments, vec![("COMMENT".into(), "".into())]);
+        let re_bytes = write_vorbis_comment(&vc).expect("write");
+        assert_eq!(re_bytes, payload);
+    }
+
+    #[test]
+    fn vorbis_comment_preserves_name_case_and_whitespace_in_value() {
+        // The container projection lowercases names and trims values;
+        // the typed accessor MUST preserve the original byte sequence
+        // so round-trips are stable.
+        let payload = synth_vorbis_payload(
+            b"v",
+            &[
+                (b"Title", b"  Spaced  "),
+                (b"ARTIST", b"\tTabbed"),
+                (b"album", b"Mixed\nNewline"),
+            ],
+        );
+        let vc = parse_vorbis_comment(&payload).unwrap();
+        assert_eq!(vc.comments[0], ("Title".into(), "  Spaced  ".into()));
+        assert_eq!(vc.comments[1], ("ARTIST".into(), "\tTabbed".into()));
+        assert_eq!(vc.comments[2], ("album".into(), "Mixed\nNewline".into()));
+        let re = write_vorbis_comment(&vc).expect("write");
+        assert_eq!(re, payload);
+    }
+
+    #[test]
+    fn vorbis_comment_value_admits_arbitrary_utf8() {
+        // §8.6: "The field contents can contain any UTF-8 character."
+        let payload = synth_vorbis_payload(
+            b"vendor",
+            &[
+                (b"TITLE", "Été ‒ café".as_bytes()),
+                (b"ARTIST", "山田太郎".as_bytes()),
+                (b"EMOJI", "🎵🔥".as_bytes()),
+            ],
+        );
+        let vc = parse_vorbis_comment(&payload).expect("parse");
+        assert_eq!(vc.comments[0].1, "Été ‒ café");
+        assert_eq!(vc.comments[1].1, "山田太郎");
+        assert_eq!(vc.comments[2].1, "🎵🔥");
+        let re_bytes = write_vorbis_comment(&vc).expect("write");
+        assert_eq!(re_bytes, payload);
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_field_name_with_equals_sign() {
+        // The `=` byte (0x3D) is the field-name/value separator and
+        // MUST NOT appear in the name. Construct a payload where the
+        // first `=` is the legitimate separator and the name itself
+        // is empty before it (i.e. "=VALUE") — the parser MUST treat
+        // the empty-name case as one whose name field passes the
+        // character-class check (no offending byte) but is not the
+        // case under test here. Instead, embed a non-printable byte
+        // in the name to drive the actual rejection path.
+        let payload = synth_vorbis_payload(b"v", &[(b"NA\x01ME", b"V")]);
+        let err = parse_vorbis_comment(&payload).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("field name") || msg.contains("0x01"),
+            "error should name the offending byte: {msg}"
+        );
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_field_name_with_non_ascii_byte() {
+        // 0xC3 starts a UTF-8 multi-byte sequence — still outside
+        // the printable-ASCII range the spec allows for names.
+        let payload = synth_vorbis_payload(b"v", &[("CAFÉ".as_bytes(), b"V")]);
+        assert!(parse_vorbis_comment(&payload).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_field_without_equals_separator() {
+        // A field with no `=` byte is malformed — RFC 9639 §8.6 says
+        // "Each field consists of a field name and field contents,
+        // separated by an = character."
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // vendor len = 0
+        buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&4u32.to_le_bytes()); // field len = 4
+        buf.extend_from_slice(b"NAME"); // no `=`
+        let err = parse_vorbis_comment(&buf).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("separator") || msg.contains("="));
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_truncated_vendor() {
+        // Declared 100-byte vendor in a 10-byte payload — must Err
+        // cleanly, no panic.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(b"short"); // only 5 vendor bytes follow
+        assert!(parse_vorbis_comment(&buf).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_overflowing_field_length() {
+        // Declared 0xFFFF_FFFF-byte field in a tiny payload.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // vendor len
+        buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // field len = huge
+                                                        // No further bytes.
+        assert!(parse_vorbis_comment(&buf).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_invalid_utf8_vendor() {
+        // Lone 0xFF is invalid UTF-8.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.push(0xFF);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        assert!(parse_vorbis_comment(&buf).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_invalid_utf8_field() {
+        // Lone 0xFF inside a field value is also rejected. We arrange
+        // the `=` byte to land first so the validity check trips on
+        // the value side of the split.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes()); // vendor len = 0
+        buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        let field = b"N=\xFF"; // 3 bytes: N, =, lone 0xFF
+        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        buf.extend_from_slice(field);
+        assert!(parse_vorbis_comment(&buf).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_trailing_garbage() {
+        let mut payload = synth_vorbis_payload(b"v", &[(b"K", b"V")]);
+        // Append a stray byte after the declared field count.
+        payload.push(0x00);
+        let err = parse_vorbis_comment(&payload).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("trailing"));
+    }
+
+    #[test]
+    fn vorbis_comment_rejects_short_payload() {
+        // Empty payload — not even the vendor length fits.
+        assert!(parse_vorbis_comment(&[]).is_err());
+        // 3 bytes — short of the 4-byte vendor length.
+        assert!(parse_vorbis_comment(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_writer_rejects_bad_field_name() {
+        let vc = VorbisComment {
+            vendor: String::new(),
+            comments: vec![("BAD=KEY".into(), "V".into())],
+        };
+        assert!(write_vorbis_comment(&vc).is_err());
+        let vc2 = VorbisComment {
+            vendor: String::new(),
+            comments: vec![("BAD\x7FKEY".into(), "V".into())],
+        };
+        // 0x7F is DEL, outside the 0x20..=0x7E range.
+        assert!(write_vorbis_comment(&vc2).is_err());
+    }
+
+    #[test]
+    fn vorbis_comment_writer_accepts_printable_ascii_name_boundaries() {
+        // Boundary characters 0x20 (space) and 0x7E (~) are admitted.
+        let vc = VorbisComment {
+            vendor: "v".into(),
+            comments: vec![
+                (" name".into(), "spaceLead".into()),
+                ("name~".into(), "tildeTail".into()),
+                ("!@#$%^&*()".into(), "punct".into()),
+            ],
+        };
+        let bytes = write_vorbis_comment(&vc).expect("write");
+        let re = parse_vorbis_comment(&bytes).expect("parse");
+        assert_eq!(re, vc);
+    }
+
+    #[test]
+    fn vorbis_comment_round_trip_byte_stable() {
+        // write_vorbis_comment MUST be deterministic so two emissions
+        // of the same value produce identical bytes.
+        let vc = VorbisComment {
+            vendor: "vendor-name".into(),
+            comments: vec![
+                ("TITLE".into(), "value1".into()),
+                ("ARTIST".into(), "value2".into()),
+            ],
+        };
+        let a = write_vorbis_comment(&vc).unwrap();
+        let b = write_vorbis_comment(&vc).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn vorbis_comment_admits_duplicate_field_names() {
+        // RFC 9639 §8.6 does not forbid duplicate field names —
+        // multi-artist or multi-genre lists are commonly stored as
+        // repeated identically-named fields. `get` returns the first
+        // hit; iterating `comments` recovers all of them.
+        let payload = synth_vorbis_payload(
+            b"v",
+            &[
+                (b"ARTIST", b"Vocalist"),
+                (b"ARTIST", b"Guitarist"),
+                (b"ARTIST", b"Drummer"),
+            ],
+        );
+        let vc = parse_vorbis_comment(&payload).unwrap();
+        assert_eq!(vc.comments.len(), 3);
+        assert_eq!(vc.get("artist"), Some("Vocalist"));
+        let all: Vec<&str> = vc
+            .comments
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("ARTIST"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(all, vec!["Vocalist", "Guitarist", "Drummer"]);
+    }
+
+    #[test]
+    fn vorbis_comment_does_not_panic_on_random_input() {
+        // Every shape must return either Ok or Err — no panic.
+        for len in [0usize, 1, 4, 7, 16, 64, 256, 1024] {
+            let buf = vec![0xABu8; len];
+            let _ = parse_vorbis_comment(&buf);
+        }
+        // A near-MAX vendor length encoded in the first 4 bytes —
+        // must Err cleanly without trying to slice past the payload.
+        let mut buf = vec![0u8; 16];
+        buf[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_vorbis_comment(&buf).is_err());
     }
 }

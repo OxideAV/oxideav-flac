@@ -245,6 +245,37 @@ non-Subset):
   serialiser refuses to emit the spec's `Invalid` sentinel (code
   127) and rejects payload lengths above `BlockHeader::MAX_LENGTH`
   (`2^24 - 1`).
+- **VORBIS_COMMENT typed accessor + writer** *(r241)*:
+  `metadata::parse_vorbis_comment` and `metadata::write_vorbis_comment`
+  round-trip a RFC 9639 §8.6 VORBIS_COMMENT block payload through a
+  typed `VorbisComment` struct that carries the vendor string and a
+  `Vec<(name, value)>` of fields preserving original ordering, name
+  casing, and value whitespace. The container demuxer continues to
+  project onto the framework's narrower `Vec<(String, String)>`
+  metadata surface for the public `Demuxer::metadata()` API (which
+  lowercases names for case-insensitive matching, trims values, and
+  drops empty fields); callers wanting full fidelity — multi-artist
+  fields stored as repeated identically-named entries, the original
+  vendor identification, deliberately whitespace-padded values, or
+  field-order preservation for byte-stable re-emission — read the
+  block payload from the demuxer's preserved metadata-chain
+  extradata and feed it to `parse_vorbis_comment` directly. The
+  parser enforces every §8.6 invariant: vendor and field bytes
+  must be valid UTF-8 (surfaced as an error rather than the
+  container's `from_utf8_lossy` behaviour); field names must be
+  printable ASCII excluding the `=` separator (`0x20..=0x7E` minus
+  `0x3D`); every field MUST carry an `=` separator; the declared
+  field count MUST exactly consume the payload (no trailing slack).
+  The four `u32` length fields are little-endian — the spec's only
+  little-endian fields anywhere in FLAC — and the parser / writer
+  agree on the layout so a parse / write / re-parse cycle is
+  byte-for-byte stable. A convenience `VorbisComment::get(name)`
+  performs the spec-mandated case-insensitive field lookup
+  (`name.eq_ignore_ascii_case(...)`); callers wanting every value
+  for a repeated field walk `comments` directly. The writer mirrors
+  the parser's character-class check on every field name so a
+  hand-constructed value cannot silently round-trip through a
+  writer / parser pair that disagree on the rules.
 
 ### CRC validators
 

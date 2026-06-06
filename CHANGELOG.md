@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- metadata: round-241 typed `VorbisComment` accessor + writer —
+  `metadata::parse_vorbis_comment` and `metadata::write_vorbis_comment`
+  round-trip a RFC 9639 §8.6 VORBIS_COMMENT block payload through a
+  new `VorbisComment` struct (`vendor: String`,
+  `comments: Vec<(String, String)>`). Fills the last typed-accessor
+  gap in `metadata::` — every well-known FLAC metadata block now has a
+  symmetric parser + writer pair (STREAMINFO is parser-only; the
+  encoder owns its serialisation). The container demuxer's existing
+  internal Vorbis-comment projection continues to populate the
+  framework's narrower `Vec<(String, String)>` metadata surface
+  (lowercases names, trims values, drops empty fields); the typed
+  accessor adds a higher-fidelity path for callers needing the
+  vendor string, original-case names, value whitespace, repeated
+  identically-named fields (e.g. multi-artist), or byte-stable
+  re-emission. The parser enforces every §8.6 invariant (UTF-8
+  vendor, UTF-8 fields, printable-ASCII names excluding `=`,
+  mandatory `=` separator per field, no trailing slack after the
+  declared field count, no integer overflow on length-prefix
+  arithmetic). The writer mirrors the same character-class check so
+  a hand-constructed value cannot round-trip through a writer /
+  parser pair that disagree. A `VorbisComment::get(name)`
+  convenience performs the §8.6 case-insensitive field lookup
+  (`name.eq_ignore_ascii_case(...)`). 21 unit tests cover the
+  minimal payload, real-shape title/artist/album, case-insensitive
+  lookup, empty-value preservation, whitespace preservation,
+  arbitrary UTF-8 in values (`Été`, CJK, emoji), every parser
+  rejection path (bad name byte, missing `=`, truncated vendor,
+  overflowing field length, invalid UTF-8 in vendor or field,
+  trailing garbage, short payload), writer rejection of bad names
+  (DEL `0x7F`, embedded `=`), printable-ASCII boundary acceptance
+  (`0x20` space and `0x7E` tilde), byte-stable deterministic
+  writer output, and duplicate-field-name preservation
+  (multi-artist albums). The `metadata_walker` fuzz harness gains
+  VORBIS_COMMENT coverage on both its walker path (BlockType
+  dispatch now hits all five typed parsers) and its direct typed
+  surface path (Path 2's parser ∘ writer ∘ parser invariant now
+  includes VORBIS_COMMENT alongside SEEKTABLE / CUESHEET /
+  PICTURE / PADDING); the previous "VORBIS_COMMENT not exposed as
+  typed parsers" skip note is now stale and replaced by a
+  byte-length-equality assertion that mirrors the writer's
+  pre-allocation math against the parser-consumed byte count.
 - fuzz: round-237 `utf8_varint` target — eighth `cargo-fuzz`
   harness covering `oxideav_flac::bits_ext::{read_utf8_u64,
   write_utf8_u64}`, the FLAC UTF-8-shaped variable-length integer

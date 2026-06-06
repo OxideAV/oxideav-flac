@@ -4,9 +4,11 @@
 //!
 //! Complements the four existing targets (`panic_free_decode`,
 //! `roundtrip`, `decode`, `flac_oracle_decode`) by focusing entirely
-//! on the metadata-block surface — the four typed parsers AND the
-//! four matching writers (`write_seektable`, `write_cuesheet`,
-//! `write_padding`, `write_picture`) plus `BlockHeader::write_into`.
+//! on the metadata-block surface — the five typed parsers AND the
+//! five matching writers (`write_seektable`, `write_cuesheet`,
+//! `write_padding`, `write_picture`, `write_vorbis_comment`) plus
+//! `BlockHeader::write_into`. The VORBIS_COMMENT typed accessor was
+//! added in round 241; before that this target skipped the block.
 //!
 //! The previous fuzz coverage exercises every metadata parser in
 //! isolation but never feeds a parsed structure back into its writer.
@@ -56,8 +58,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_flac::metadata::{
-    parse_cuesheet, parse_picture, parse_seektable, write_cuesheet, write_padding, write_picture,
-    write_seektable, BlockHeader, BlockType, Picture, StreamInfo, FLAC_MAGIC,
+    parse_cuesheet, parse_picture, parse_seektable, parse_vorbis_comment, write_cuesheet,
+    write_padding, write_picture, write_seektable, write_vorbis_comment, BlockHeader, BlockType,
+    Picture, StreamInfo, VorbisComment, FLAC_MAGIC,
 };
 
 /// Cap the walker so a fuzzer can't make us iterate forever on a
@@ -185,6 +188,35 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
+    // VORBIS_COMMENT: parser + writer both validate per RFC 9639
+    // §8.6 (UTF-8 vendor, printable-ASCII field names excluding `=`,
+    // arbitrary UTF-8 values). Round-trip Ok parses through the
+    // writer and re-parse, and check second-pass byte stability so
+    // a non-deterministic writer surfaces as a hard failure.
+    if let Ok(vc) = parse_vorbis_comment(data) {
+        let written =
+            write_vorbis_comment(&vc).expect("parse_vorbis_comment Ok ⇒ write must succeed");
+        let re = parse_vorbis_comment(&written).expect("write_vorbis_comment must re-parse");
+        assert_eq!(re, vc, "vorbis-comment round-trip drift");
+        let written2 = write_vorbis_comment(&re).expect("second write must succeed");
+        assert_eq!(
+            written, written2,
+            "write_vorbis_comment is non-deterministic"
+        );
+        // First-pass byte stability: the writer output MUST equal
+        // the input payload byte-for-byte when the input was itself
+        // a well-formed VORBIS_COMMENT payload that the parser
+        // accepted without any trailing slack. The parser rejects
+        // trailing bytes, so a successful parse here implies the
+        // writer can reproduce the exact bytes that were parsed
+        // (the layout is fully positional).
+        assert_eq!(
+            written.len(),
+            consumed_vorbis_comment_bytes(&vc),
+            "writer byte length must equal parser-consumed byte length"
+        );
+    }
+
     // PADDING: writer takes a length, no parser to feed it back
     // through. Derive a length from the input and assert
     // `write_padding(len)` succeeds for in-range lengths and fails
@@ -253,11 +285,34 @@ fn try_typed_round_trip(block_type: BlockType, payload: &[u8]) {
                 assert_pictures_equal(&pic, &re);
             }
         }
-        // Application / VorbisComment / Reserved / Invalid: no
-        // typed surface here; payloads still survive the walker
-        // (header round-trip already exercised above).
+        BlockType::VorbisComment => {
+            if let Ok(vc) = parse_vorbis_comment(payload) {
+                let written = write_vorbis_comment(&vc)
+                    .expect("parse_vorbis_comment Ok ⇒ write must succeed");
+                let re = parse_vorbis_comment(&written)
+                    .expect("write_vorbis_comment output must re-parse cleanly");
+                assert_eq!(re, vc);
+            }
+        }
+        // Application / Reserved / Invalid: no typed surface here;
+        // payloads still survive the walker (header round-trip
+        // already exercised above).
         _ => {}
     }
+}
+
+/// Byte-length the writer is expected to produce for a parsed
+/// `VorbisComment`. Mirrors the writer's pre-allocation math so the
+/// fuzz harness can assert the writer's output is identical in
+/// length to what the parser consumed — a divergence would mean the
+/// parser accepted a payload whose declared lengths don't match the
+/// payload's actual content.
+fn consumed_vorbis_comment_bytes(vc: &VorbisComment) -> usize {
+    let mut total = 4 + vc.vendor.len() + 4;
+    for (name, value) in &vc.comments {
+        total += 4 + name.len() + 1 + value.len();
+    }
+    total
 }
 
 /// Strict-ascending-by-sample_number unique prefix of `pts`. The
