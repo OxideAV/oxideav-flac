@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- metadata: round-244 typed `Application` accessor + writer —
+  `metadata::parse_application` and `metadata::write_application`
+  round-trip a RFC 9639 §8.4 APPLICATION block payload through a new
+  `Application` struct carrying the 32-bit IANA-registered
+  application ID (RFC 9639 §12.2) split from the opaque
+  application-defined byte run. Completes the typed-accessor
+  coverage of RFC 9639 §8 — every block type whose payload has a
+  spec-defined structural split (STREAMINFO / SEEKTABLE /
+  VORBIS_COMMENT / CUESHEET / PICTURE / PADDING / APPLICATION) now
+  has a parser + writer pair. Parser rejects payloads shorter than
+  the mandatory 4-byte ID header without slicing past the buffer;
+  writer rejects payloads whose total size would overflow the
+  enclosing metadata-block-header's 24-bit length ceiling
+  (`BlockHeader::MAX_LENGTH`). Six unit tests cover the canonical
+  round trip, the spec-legal zero-byte data run, short-buffer
+  rejection across every length from 0 to 3, big-endian byte-order
+  emission, the writer's ceiling check (boundary + overflow), and
+  that the parser does not alias the input buffer.
 - metadata: round-241 typed `VorbisComment` accessor + writer —
   `metadata::parse_vorbis_comment` and `metadata::write_vorbis_comment`
   round-trip a RFC 9639 §8.6 VORBIS_COMMENT block payload through a

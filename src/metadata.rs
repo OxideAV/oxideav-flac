@@ -655,6 +655,103 @@ pub fn write_padding(len: usize) -> Result<Vec<u8>> {
     Ok(vec![0u8; len])
 }
 
+/// Parsed APPLICATION metadata block contents (RFC 9639 §8.4).
+///
+/// The APPLICATION block is the spec's escape hatch for third-party
+/// applications: it carries a 32-bit registered application ID
+/// (IANA "FLAC Application Metadata Block IDs" registry, RFC 9639
+/// §12.2) followed by an opaque byte run whose length is the
+/// metadata-block header length minus the four ID bytes. RFC 9639
+/// §8.4 Table 5 leaves the data payload uninterpreted at the
+/// container level — only the originating application understands
+/// its bytes — and the only wire-format invariant on the payload
+/// itself is that it MUST be a whole number of bytes.
+///
+/// This struct is the typed mirror of [`parse_application`] /
+/// [`write_application`]: it splits the wire format's mandatory ID
+/// header from the application-defined bytes, so callers carrying
+/// FLAC files with third-party metadata can read and write the ID
+/// without re-implementing the 32-bit big-endian split each time.
+///
+/// The application data is stored as a `Vec<u8>` (an opaque payload
+/// per RFC 9639 §8.4) — the parser does not interpret it and the
+/// writer enforces only the enclosing metadata-block-header's
+/// 24-bit length ceiling (`BlockHeader::MAX_LENGTH`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Application {
+    /// IANA-registered application identifier (RFC 9639 §12.2).
+    /// Stored in host order — the wire format is 32-bit big-endian
+    /// per Table 5's `u(32)` row.
+    pub id: u32,
+    /// Application-defined payload. Length equals the enclosing
+    /// metadata-block-header length minus four (the ID's byte
+    /// width). Treated as opaque bytes: RFC 9639 §8.4 leaves the
+    /// interpretation to the originating application.
+    pub data: Vec<u8>,
+}
+
+/// Parse a FLAC APPLICATION block payload (RFC 9639 §8.4).
+///
+/// `bytes` is the metadata block's payload (header already stripped
+/// by the caller). The first four bytes are the 32-bit big-endian
+/// application ID per RFC 9639 §8.4 Table 5; the remaining bytes
+/// are the application-defined data run.
+///
+/// Returns `Error::invalid` if the payload is shorter than the
+/// mandatory four-byte ID header (a zero-byte data run is legal —
+/// §8.4 admits `n = 0` because the spec only constrains `n` to be
+/// a whole number of bytes).
+pub fn parse_application(bytes: &[u8]) -> Result<Application> {
+    if bytes.len() < 4 {
+        return Err(Error::invalid(format!(
+            "FLAC APPLICATION block payload must hold the 4-byte application ID; got {} bytes",
+            bytes.len()
+        )));
+    }
+    let id = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let data = bytes[4..].to_vec();
+    Ok(Application { id, data })
+}
+
+/// Serialise an [`Application`] back into a RFC 9639 §8.4
+/// APPLICATION block payload.
+///
+/// The wire format is four big-endian bytes of `id` followed by the
+/// `data` byte run unchanged. Returns `Error::invalid` if the total
+/// payload length (`4 + data.len()`) would exceed the 24-bit
+/// metadata-block-header length ceiling
+/// (`BlockHeader::MAX_LENGTH`); callers can otherwise hand the
+/// returned vector straight to [`BlockHeader::write_into`].
+///
+/// Round-trips through [`parse_application`] losslessly: an
+/// `Application { id, data }` reads back byte-identical after a
+/// writer / parser cycle.
+pub fn write_application(app: &Application) -> Result<Vec<u8>> {
+    // 4-byte ID header + opaque data. The 24-bit ceiling on the
+    // enclosing metadata-block-header length is the binding limit
+    // (RFC 9639 §8.1 Table 3 / `BlockHeader::MAX_LENGTH`); checked
+    // here so callers don't have to bracket every write_application
+    // call with a manual size check.
+    let total = 4usize.checked_add(app.data.len()).ok_or_else(|| {
+        Error::invalid(format!(
+            "FLAC APPLICATION: data length {} overflows usize when adding the 4-byte ID header",
+            app.data.len()
+        ))
+    })?;
+    if total > BlockHeader::MAX_LENGTH as usize {
+        return Err(Error::invalid(format!(
+            "FLAC APPLICATION: total payload size {} exceeds 24-bit metadata length max ({})",
+            total,
+            BlockHeader::MAX_LENGTH
+        )));
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&app.id.to_be_bytes());
+    out.extend_from_slice(&app.data);
+    debug_assert_eq!(out.len(), total);
+    Ok(out)
+}
+
 /// Parsed PICTURE metadata block contents (RFC 9639 §8.8).
 ///
 /// FLAC reuses the ID3v2 `APIC` taxonomy for `picture_type` (so the
@@ -2585,5 +2682,118 @@ mod tests {
         let mut buf = vec![0u8; 16];
         buf[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse_vorbis_comment(&buf).is_err());
+    }
+
+    // --- APPLICATION block (§8.4) accessor tests ----------------------
+
+    #[test]
+    fn application_round_trips_through_parse_write() {
+        // RFC 9639 §8.4 Table 5: u(32) ID followed by an
+        // application-defined byte run. A canonical reproducible
+        // shape: ID 0x46494341 ("FICA") + a small data run.
+        let app = Application {
+            id: 0x4649_4341,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67],
+        };
+        let bytes = write_application(&app).expect("writer");
+        // Wire format: 4 bytes BE ID + opaque data.
+        assert_eq!(bytes.len(), 4 + app.data.len());
+        assert_eq!(&bytes[0..4], &[0x46, 0x49, 0x43, 0x41]);
+        assert_eq!(&bytes[4..], &app.data[..]);
+        let reparsed = parse_application(&bytes).expect("parser");
+        assert_eq!(reparsed, app);
+    }
+
+    #[test]
+    fn application_zero_data_run_is_legal() {
+        // RFC 9639 §8.4 Table 5: "n MUST be a multiple of 8" — `n = 0`
+        // is the smallest legal data run, leaving the block carrying
+        // just the 4-byte ID. The writer accepts it and the parser
+        // round-trips it.
+        let app = Application {
+            id: 0xAABB_CCDD,
+            data: Vec::new(),
+        };
+        let bytes = write_application(&app).expect("writer");
+        assert_eq!(bytes, [0xAA, 0xBB, 0xCC, 0xDD]);
+        let reparsed = parse_application(&bytes).expect("parser");
+        assert_eq!(reparsed, app);
+    }
+
+    #[test]
+    fn application_parse_rejects_short_payload() {
+        // The 4-byte ID header is mandatory — anything under 4 bytes
+        // cannot carry it and the parser must reject before slicing
+        // past the buffer.
+        for short in 0..4 {
+            let buf = vec![0u8; short];
+            assert!(parse_application(&buf).is_err(), "len {short} must reject");
+        }
+    }
+
+    #[test]
+    fn application_id_is_big_endian_on_the_wire() {
+        // Sanity-check the byte order against RFC 9639 §8.4
+        // Table 5's `u(32)` row by picking an asymmetric ID whose
+        // MSB and LSB differ obviously, and asserting the writer
+        // emits high byte first.
+        let app = Application {
+            id: 0x1122_3344,
+            data: vec![],
+        };
+        let bytes = write_application(&app).expect("writer");
+        assert_eq!(bytes, [0x11, 0x22, 0x33, 0x44]);
+        // And the parser reads it back identically.
+        let reparsed = parse_application(&bytes).expect("parser");
+        assert_eq!(reparsed.id, 0x1122_3344);
+        assert!(reparsed.data.is_empty());
+    }
+
+    #[test]
+    fn application_writer_rejects_oversize_payload() {
+        // The metadata-block-header length field is 24 bits
+        // (`BlockHeader::MAX_LENGTH`), so any
+        // `4 + data.len() > MAX_LENGTH` value must Err before
+        // returning a vector the surrounding header can't describe.
+        let too_big = BlockHeader::MAX_LENGTH as usize - 3; // 4 + (MAX-3) = MAX+1
+        let app = Application {
+            id: 0,
+            data: vec![0u8; too_big],
+        };
+        assert!(write_application(&app).is_err());
+
+        // Exactly at the ceiling (4 + (MAX-4)) is legal — boundary
+        // check to prove the off-by-one isn't inverted. Allocate up
+        // front so the size of the round-trip is bounded by the
+        // 16 MiB header ceiling but doesn't push the test binary
+        // into excessive memory usage on CI runners.
+        let exact = BlockHeader::MAX_LENGTH as usize - 4;
+        let app_ok = Application {
+            id: 0x1234_5678,
+            data: vec![0xCDu8; exact],
+        };
+        let bytes = write_application(&app_ok).expect("writer at ceiling");
+        assert_eq!(bytes.len(), BlockHeader::MAX_LENGTH as usize);
+        // Confirm the header writer accepts the resulting length too.
+        let h = BlockHeader {
+            last: true,
+            block_type: BlockType::Application,
+            length: bytes.len() as u32,
+        };
+        assert!(h.to_bytes().is_ok());
+    }
+
+    #[test]
+    fn application_parse_does_not_alias_input() {
+        // The parser owns its returned `data` (Vec<u8>); mutating the
+        // input afterwards must not change the parsed copy. Guards
+        // against an accidental zero-copy slice-of-input refactor.
+        let mut buf = vec![0x12, 0x34, 0x56, 0x78, 0xAA, 0xBB, 0xCC];
+        let app = parse_application(&buf).expect("parser");
+        buf[4] = 0x00;
+        buf[5] = 0x00;
+        buf[6] = 0x00;
+        assert_eq!(app.data, vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(app.id, 0x1234_5678);
     }
 }
