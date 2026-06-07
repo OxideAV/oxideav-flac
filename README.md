@@ -411,7 +411,7 @@ returns `Error::Unsupported` instead of panicking inside
 
 ## Benchmarks
 
-`benches/` carries five `criterion` harnesses that drive the public
+`benches/` carries six `criterion` harnesses that drive the public
 `oxideav_flac::encoder::make_encoder` / `decoder::make_decoder` trait
 objects against deterministic xorshift-synthesised PCM. They exist so
 future encoder rounds (partition-order early-exit, apodization-window
@@ -451,7 +451,7 @@ A/B against without rerunning the full docs corpus:
   encoder's and decoder's 32-bit branches end-to-end).
 
 No committed fixture files; PCM is synthesised in-bench. Run with
-`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip,crc,seek}`.
+`cargo bench -p oxideav-flac --bench {encode,decode,roundtrip,crc,seek,md5}`.
 The shape mirrors the cinepak / tta bench harnesses so numbers are
 directly comparable across the workspace.
 
@@ -485,6 +485,43 @@ directly comparable across the workspace.
   future seek-path tweak (a zero-copy Cursor-replacement, a packed
   16-byte SeekPoint, an "already at offset" fast-path) a stable A/B
   baseline.
+
+### MD5 benchmark
+
+- **`md5`** *(r255)* — seven scenarios measuring the FLAC STREAMINFO
+  MD5 validator (RFC 9639 §8.2) in isolation. The encoder accumulates
+  a running MD5 over the decoded PCM bytes by calling `Md5::update`
+  once per audio frame in `feed_md5`; until this round the per-byte
+  hash cost was folded into the wider encode wall time so a regression
+  in the `process_block` 64-byte compressor would be invisible. Three
+  one-shot scenarios cover representative per-frame payloads:
+  `md5/oneshot/4k` (one mono-S16-44.1k frame at the encoder's default
+  4096-sample block size), `md5/oneshot/16k` (one stereo-S16-44.1k
+  frame), `md5/oneshot/64k` (one multichannel-S24-48k frame). A
+  `md5/streaming-chunked/64k` scenario feeds the same 64 KiB buffer
+  through `Md5::update` as 16 unequal chunks with two deliberately
+  off-aligned splits — mirrors the encoder's per-frame call pattern
+  and forces the partial-block carry path through every iteration. A
+  `md5/streaming-byte/4k` scenario feeds one byte at a time (worst-case
+  interface for the carry-buffer path). Two finalize-pad scenarios
+  (`md5/oneshot/empty`, `md5/oneshot/3b`) cover the RFC 1321 §A.5
+  zero-length test vector and the < 56-byte single-pad-block branch.
+  Every scenario asserts the digest matches the oneshot reference
+  inside the timed iteration so a regression that produced a different
+  hash would surface as a `panic!` rather than a misleading speedup.
+  Baseline numbers (release, Darwin aarch64, `--quick`):
+  `md5/oneshot/4k` ≈ 5.2 µs (~780 MiB/s), `md5/oneshot/16k` ≈ 20.8 µs
+  (~770 MiB/s), `md5/oneshot/64k` ≈ 83 µs (~775 MiB/s — confirming
+  bandwidth-bound inner loop), `md5/streaming-chunked/64k` ≈ 83 µs
+  (matches oneshot to noise — chunked feed does not regress the carry
+  path), `md5/streaming-byte/4k` ≈ 10 µs (~400 MiB/s — about 2× the
+  oneshot per-byte cost from per-call dispatch overhead),
+  `md5/oneshot/empty` ≈ 67 ns, `md5/oneshot/3b` ≈ 70 ns. Buffers
+  synthesised in-bench from the same `0xCAFE_F00D` xorshift32 seed as
+  the neighbouring `crc` / `encode` / `decode` / `roundtrip` benches.
+  No committed fixture files. Gives a future MD5-speed tweak
+  (parallel 4-message-block mixing, SIMD round mixing, a tail-pad
+  micro-optimisation) a stable A/B baseline.
 
 ## Profiling
 

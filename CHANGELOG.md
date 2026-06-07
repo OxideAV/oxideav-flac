@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- bench: round-255 `md5` Criterion harness — fifth depth-mode bench
+  binary alongside `decode` / `encode` / `roundtrip` / `crc` / `seek`,
+  exercising the FLAC STREAMINFO MD5 validator (RFC 9639 §8.2) on the
+  exact `oxideav_flac::md5::{compute, Md5}` API the encoder calls
+  once per audio frame in `feed_md5`. Every prior round folded the
+  MD5 cost into the wider encode wall time; the fresh harness pins
+  the per-byte hash throughput as a standalone A/B target so future
+  speed work on `process_block` (parallel 4-message-block mixing,
+  SIMD round mixing, tail-pad micro-optimisation) has a stable
+  baseline. Seven scenarios: `md5_oneshot_{4k,16k,64k}` (slice
+  helper, mirroring per-frame payloads — 4 KiB mono S16,
+  16 KiB stereo S16, 64 KiB multichannel S24);
+  `md5_streaming_chunked_64k` (16-chunk `Md5::update` schedule with
+  two deliberately off-aligned splits, matching the encoder's
+  per-frame call pattern); `md5_streaming_byte_4k` (worst-case
+  single-byte feed); `md5_empty` + `md5_short` (RFC 1321 §A.5
+  pad-branch coverage). Every scenario asserts the digest matches
+  the oneshot reference inside the timed iteration so a regression
+  that silently produced a different hash would surface as a panic
+  rather than a misleading speedup. Buffers synthesised in-bench
+  from the same `0xCAFE_F00D` xorshift32 seed as the neighbouring
+  `crc` / `encode` / `decode` / `roundtrip` benches so numbers stay
+  comparable across the bench surface. No `docs/` fixtures, no
+  external files, no external `md5` reference implementation
+  consulted. Reference numbers on an M-series laptop (release,
+  Darwin aarch64): `md5/oneshot/4k` ≈ 5.2 µs (~780 MiB/s),
+  `md5/oneshot/16k` ≈ 20.8 µs (~770 MiB/s), `md5/oneshot/64k` ≈
+  83 µs (~775 MiB/s — confirming the inner loop is bandwidth-bound
+  rather than setup-bound), `md5/streaming-chunked/64k` ≈ 83 µs
+  (matches oneshot to noise — chunked feed does not regress the
+  in-buffer carry path), `md5/streaming-byte/4k` ≈ 10 µs (~400
+  MiB/s — about 2× the oneshot cost per byte from per-call dispatch
+  overhead), `md5/oneshot/empty` ≈ 67 ns, `md5/oneshot/3b` ≈
+  70 ns. Run with `cargo bench -p oxideav-flac --bench md5`.
+
 - metadata: round-252 typed `StreamInfo` writer — `StreamInfo::write`
   (with a `metadata::write_streaminfo` free-function alias for
   symmetry with the other top-level writers) serialises a
