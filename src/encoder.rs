@@ -25,7 +25,7 @@ use oxideav_core::{
 use crate::bits_ext::BitWriterExt;
 use crate::crc;
 use crate::md5::Md5;
-use crate::metadata::{write_padding, BlockHeader, BlockType};
+use crate::metadata::{write_padding, BlockHeader, BlockType, StreamInfo};
 use oxideav_core::bits::BitWriter;
 
 /// Caller-supplied tuning knobs for [`make_encoder_with_options`]. All
@@ -370,28 +370,31 @@ fn build_streaminfo_metadata_block(
     md5: &[u8; 16],
     last: bool,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 34);
+    // Delegate the 34-byte payload to the typed writer so both call
+    // paths (encoder build-time + standalone `StreamInfo::write`)
+    // walk the same RFC 9639 §8.1 packer.
+    let info = StreamInfo {
+        min_block_size: block_size as u16,
+        max_block_size: block_size as u16,
+        min_frame_size,
+        max_frame_size,
+        sample_rate,
+        channels,
+        bits_per_sample: bps,
+        total_samples,
+        md5: *md5,
+    };
+    let payload = info
+        .write()
+        .expect("encoder build path supplies spec-valid STREAMINFO fields");
+    let mut out = Vec::with_capacity(4 + StreamInfo::PAYLOAD_LEN);
     // Block-header byte 0: high bit = `last`, low 7 bits = STREAMINFO
     // type code (0).
     out.push(if last { 0x80 } else { 0x00 });
     out.push(0x00);
     out.push(0x00);
     out.push(0x22);
-    out.extend_from_slice(&(block_size as u16).to_be_bytes());
-    out.extend_from_slice(&(block_size as u16).to_be_bytes());
-    out.push(((min_frame_size >> 16) & 0xFF) as u8);
-    out.push(((min_frame_size >> 8) & 0xFF) as u8);
-    out.push((min_frame_size & 0xFF) as u8);
-    out.push(((max_frame_size >> 16) & 0xFF) as u8);
-    out.push(((max_frame_size >> 8) & 0xFF) as u8);
-    out.push((max_frame_size & 0xFF) as u8);
-    let total_36 = total_samples & 0x0000_000F_FFFF_FFFF;
-    let packed: u64 = ((sample_rate as u64) << 44)
-        | (((channels - 1) as u64 & 0x7) << 41)
-        | (((bps - 1) as u64 & 0x1F) << 36)
-        | total_36;
-    out.extend_from_slice(&packed.to_be_bytes());
-    out.extend_from_slice(md5);
+    out.extend_from_slice(&payload);
     out
 }
 

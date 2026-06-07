@@ -245,6 +245,26 @@ non-Subset):
   serialiser refuses to emit the spec's `Invalid` sentinel (code
   127) and rejects payload lengths above `BlockHeader::MAX_LENGTH`
   (`2^24 - 1`).
+- **STREAMINFO typed writer** *(r252)*:
+  `StreamInfo::write` (with a `metadata::write_streaminfo` free
+  function alias for symmetry with the other writers) serialises a
+  `StreamInfo` struct back into the exact 34-byte RFC 9639 §8.1
+  block payload, round-tripping through `StreamInfo::parse`
+  bit-for-bit. The writer enforces every wire-format ceiling its
+  packed-bit fields can carry: `sample_rate` against the 20-bit
+  field maximum (`MAX_SAMPLE_RATE = 1_048_575`), `total_samples`
+  against the 36-bit field maximum (`MAX_TOTAL_SAMPLES`), `channels`
+  against the 3-bit `channels − 1` encoding (`1..=8`),
+  `bits_per_sample` against the 5-bit `bps − 1` encoding (`1..=32`),
+  and both `min_frame_size` / `max_frame_size` against the 24-bit
+  field maximum (`MAX_FRAME_SIZE`). The 16-bit
+  `min_block_size` / `max_block_size` fields fit the full u16 range
+  on the wire and need no bound check. The encoder's
+  STREAMINFO-builder now delegates the 34-byte payload pack to this
+  typed writer so both code paths (encoder build-time + standalone
+  metadata-chain rewriting) share the same packer; the wire bytes
+  the encoder hands the muxer are byte-identical to the pre-r252
+  output.
 - **VORBIS_COMMENT typed accessor + writer** *(r241)*:
   `metadata::parse_vorbis_comment` and `metadata::write_vorbis_comment`
   round-trip a RFC 9639 §8.6 VORBIS_COMMENT block payload through a

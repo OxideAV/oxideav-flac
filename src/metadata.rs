@@ -1263,9 +1263,42 @@ pub fn write_vorbis_comment(vc: &VorbisComment) -> Result<Vec<u8>> {
 }
 
 impl StreamInfo {
+    /// Spec-defined exact byte length of a STREAMINFO block payload
+    /// (RFC 9639 §8.1 Table 2 sums to exactly 272 bits = 34 bytes).
+    pub const PAYLOAD_LEN: usize = 34;
+
+    /// Spec ceiling on the 20-bit `sample_rate` field. The RFC's
+    /// stream-level upper bound is 655_350 Hz (`655_350 = 65_535 × 10`,
+    /// the largest value the §9.1.3 frame-header code 14 can express
+    /// for a per-stream rate), but the on-wire field is a flat 20-bit
+    /// unsigned int. The writer enforces the wire-format ceiling so a
+    /// caller building a STREAMINFO for an unusual rate (e.g. the
+    /// `frame_rate = 0` sentinel meaning "rate carried in the frame
+    /// header") sees a single bounds check; downstream decoders apply
+    /// the per-frame range check on top of this.
+    pub const MAX_SAMPLE_RATE: u32 = (1 << 20) - 1;
+    /// Spec ceiling on `total_samples`: the field is 36 bits, so 0 (the
+    /// "unknown" sentinel) up through `2^36 − 1`.
+    pub const MAX_TOTAL_SAMPLES: u64 = (1 << 36) - 1;
+    /// Spec ceiling on `min_frame_size` / `max_frame_size`: both
+    /// fields are 24-bit unsigned ints (RFC 9639 §8.1 Table 2). Zero
+    /// is the "unknown" sentinel both the spec and our encoder use
+    /// before the first frame is encoded.
+    pub const MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
+    /// Minimum spec-permitted channel count (mono).
+    pub const MIN_CHANNELS: u8 = 1;
+    /// Maximum spec-permitted channel count: 3-bit `channels − 1` =>
+    /// 8 channels.
+    pub const MAX_CHANNELS: u8 = 8;
+    /// Minimum spec-permitted bits-per-sample.
+    pub const MIN_BPS: u8 = 1;
+    /// Maximum spec-permitted bits-per-sample: 5-bit `bps − 1` =>
+    /// 32 bits per sample.
+    pub const MAX_BPS: u8 = 32;
+
     /// Parse a STREAMINFO block. The block payload is exactly 34 bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 34 {
+        if bytes.len() < Self::PAYLOAD_LEN {
             return Err(Error::invalid("FLAC STREAMINFO block must be 34 bytes"));
         }
         let min_block_size = u16::from_be_bytes([bytes[0], bytes[1]]);
@@ -1294,6 +1327,107 @@ impl StreamInfo {
             md5,
         })
     }
+
+    /// Serialise a [`StreamInfo`] into a 34-byte RFC 9639 §8.1
+    /// STREAMINFO block payload.
+    ///
+    /// Round-trips through [`StreamInfo::parse`] bit-for-bit: every
+    /// field is packed at its spec-defined offset in the 34-byte
+    /// payload (4 B min_blocksize, 4 B max_blocksize, 6 B
+    /// min/max_framesize each 3 B, 8 B of packed
+    /// sample_rate(20)/channels-1(3)/bps-1(5)/total_samples(36), and
+    /// the 16-byte MD5 signature).
+    ///
+    /// Returns `Error::invalid` when any field would overflow its
+    /// spec-defined width:
+    ///   * `sample_rate` > `MAX_SAMPLE_RATE` (20-bit ceiling, 1_048_575);
+    ///   * `channels` outside `MIN_CHANNELS..=MAX_CHANNELS` (1..=8) —
+    ///     the wire format encodes `channels − 1` in 3 bits;
+    ///   * `bits_per_sample` outside `MIN_BPS..=MAX_BPS` (1..=32) —
+    ///     the wire format encodes `bps − 1` in 5 bits;
+    ///   * `total_samples` > `MAX_TOTAL_SAMPLES` (36-bit ceiling);
+    ///   * `min_frame_size` or `max_frame_size` > `MAX_FRAME_SIZE`
+    ///     (24-bit ceiling).
+    ///
+    /// The 16-bit `min_block_size` / `max_block_size` fields fit the
+    /// entire u16 range on the wire, so no bounds check is needed
+    /// there.
+    pub fn write(&self) -> Result<Vec<u8>> {
+        if self.sample_rate > Self::MAX_SAMPLE_RATE {
+            return Err(Error::invalid(format!(
+                "FLAC STREAMINFO: sample_rate {} exceeds 20-bit max ({})",
+                self.sample_rate,
+                Self::MAX_SAMPLE_RATE
+            )));
+        }
+        if !(Self::MIN_CHANNELS..=Self::MAX_CHANNELS).contains(&self.channels) {
+            return Err(Error::invalid(format!(
+                "FLAC STREAMINFO: channels {} outside spec range {}..={}",
+                self.channels,
+                Self::MIN_CHANNELS,
+                Self::MAX_CHANNELS
+            )));
+        }
+        if !(Self::MIN_BPS..=Self::MAX_BPS).contains(&self.bits_per_sample) {
+            return Err(Error::invalid(format!(
+                "FLAC STREAMINFO: bits_per_sample {} outside spec range {}..={}",
+                self.bits_per_sample,
+                Self::MIN_BPS,
+                Self::MAX_BPS
+            )));
+        }
+        if self.total_samples > Self::MAX_TOTAL_SAMPLES {
+            return Err(Error::invalid(format!(
+                "FLAC STREAMINFO: total_samples {} exceeds 36-bit max ({})",
+                self.total_samples,
+                Self::MAX_TOTAL_SAMPLES
+            )));
+        }
+        if self.min_frame_size > Self::MAX_FRAME_SIZE {
+            return Err(Error::invalid(format!(
+                "FLAC STREAMINFO: min_frame_size {} exceeds 24-bit max ({})",
+                self.min_frame_size,
+                Self::MAX_FRAME_SIZE
+            )));
+        }
+        if self.max_frame_size > Self::MAX_FRAME_SIZE {
+            return Err(Error::invalid(format!(
+                "FLAC STREAMINFO: max_frame_size {} exceeds 24-bit max ({})",
+                self.max_frame_size,
+                Self::MAX_FRAME_SIZE
+            )));
+        }
+        let mut out = Vec::with_capacity(Self::PAYLOAD_LEN);
+        out.extend_from_slice(&self.min_block_size.to_be_bytes());
+        out.extend_from_slice(&self.max_block_size.to_be_bytes());
+        out.push(((self.min_frame_size >> 16) & 0xFF) as u8);
+        out.push(((self.min_frame_size >> 8) & 0xFF) as u8);
+        out.push((self.min_frame_size & 0xFF) as u8);
+        out.push(((self.max_frame_size >> 16) & 0xFF) as u8);
+        out.push(((self.max_frame_size >> 8) & 0xFF) as u8);
+        out.push((self.max_frame_size & 0xFF) as u8);
+        let packed: u64 = ((self.sample_rate as u64) << 44)
+            | (((self.channels - 1) as u64 & 0x7) << 41)
+            | (((self.bits_per_sample - 1) as u64 & 0x1F) << 36)
+            | (self.total_samples & Self::MAX_TOTAL_SAMPLES);
+        out.extend_from_slice(&packed.to_be_bytes());
+        out.extend_from_slice(&self.md5);
+        debug_assert_eq!(out.len(), Self::PAYLOAD_LEN);
+        Ok(out)
+    }
+}
+
+/// Serialise a [`StreamInfo`] back into a RFC 9639 §8.1 STREAMINFO
+/// block payload.
+///
+/// Free-function alias for [`StreamInfo::write`] — kept for symmetry
+/// with the other top-level writers in this module
+/// ([`write_cuesheet`], [`write_seektable`], [`write_padding`],
+/// [`write_application`], [`write_picture`], [`write_vorbis_comment`])
+/// so callers walking the metadata-block chain can spell every writer
+/// the same way.
+pub fn write_streaminfo(info: &StreamInfo) -> Result<Vec<u8>> {
+    info.write()
 }
 
 #[cfg(test)]
@@ -2795,5 +2929,187 @@ mod tests {
         buf[6] = 0x00;
         assert_eq!(app.data, vec![0xAA, 0xBB, 0xCC]);
         assert_eq!(app.id, 0x1234_5678);
+    }
+
+    /// Helper: a representative STREAMINFO covering every field with
+    /// a non-default value so a writer-truncation regression shows
+    /// up on the round-trip.
+    fn sample_streaminfo() -> StreamInfo {
+        StreamInfo {
+            min_block_size: 4096,
+            max_block_size: 4096,
+            min_frame_size: 100,
+            max_frame_size: 1252,
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            total_samples: 1_234_567,
+            md5: [
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+                0x32, 0x10,
+            ],
+        }
+    }
+
+    #[test]
+    fn streaminfo_write_payload_len() {
+        // RFC 9639 §8.1 Table 2 sums to 272 bits = 34 bytes.
+        let bytes = sample_streaminfo().write().expect("writer");
+        assert_eq!(bytes.len(), StreamInfo::PAYLOAD_LEN);
+    }
+
+    #[test]
+    fn streaminfo_write_round_trip() {
+        // write -> parse must reproduce every typed field byte-exact.
+        let info = sample_streaminfo();
+        let bytes = info.write().expect("writer");
+        let back = StreamInfo::parse(&bytes).expect("parser");
+        assert_eq!(back.min_block_size, info.min_block_size);
+        assert_eq!(back.max_block_size, info.max_block_size);
+        assert_eq!(back.min_frame_size, info.min_frame_size);
+        assert_eq!(back.max_frame_size, info.max_frame_size);
+        assert_eq!(back.sample_rate, info.sample_rate);
+        assert_eq!(back.channels, info.channels);
+        assert_eq!(back.bits_per_sample, info.bits_per_sample);
+        assert_eq!(back.total_samples, info.total_samples);
+        assert_eq!(back.md5, info.md5);
+    }
+
+    #[test]
+    fn streaminfo_write_free_function_alias() {
+        // write_streaminfo is documented as a free-function alias for
+        // StreamInfo::write so the metadata-block chain reads
+        // uniformly across writers.
+        let info = sample_streaminfo();
+        let via_method = info.write().expect("writer");
+        let via_fn = write_streaminfo(&info).expect("writer");
+        assert_eq!(via_method, via_fn);
+    }
+
+    #[test]
+    fn streaminfo_write_matches_existing_parser_round_trip_fixture() {
+        // The hand-built block in `parse_streaminfo_round_trip` above
+        // is the canonical small fixture. Building the same fixture
+        // through the new writer and re-parsing must match exactly,
+        // proving the writer's bit packing matches the parser.
+        let info = StreamInfo {
+            min_block_size: 4096,
+            max_block_size: 4096,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: 48_000,
+            channels: 2,
+            bits_per_sample: 16,
+            total_samples: 96_000,
+            md5: [0u8; 16],
+        };
+        let bytes = info.write().expect("writer");
+        // Re-parsed must equal the originals.
+        let back = StreamInfo::parse(&bytes).expect("parser");
+        assert_eq!(back.sample_rate, 48_000);
+        assert_eq!(back.channels, 2);
+        assert_eq!(back.bits_per_sample, 16);
+        assert_eq!(back.total_samples, 96_000);
+        // And the packed 8 bytes for sr/ch/bps/total must match the
+        // hand-built value in `parse_streaminfo_round_trip` exactly.
+        let expected_packed: u64 = (48_000u64 << 44) | (1u64 << 41) | (15u64 << 36) | 96_000u64;
+        assert_eq!(&bytes[10..18], &expected_packed.to_be_bytes());
+    }
+
+    #[test]
+    fn streaminfo_write_rejects_oversized_sample_rate() {
+        let mut info = sample_streaminfo();
+        info.sample_rate = StreamInfo::MAX_SAMPLE_RATE + 1;
+        assert!(info.write().is_err());
+        info.sample_rate = StreamInfo::MAX_SAMPLE_RATE;
+        // Boundary value: still serialisable.
+        assert!(info.write().is_ok());
+    }
+
+    #[test]
+    fn streaminfo_write_rejects_oversized_total_samples() {
+        let mut info = sample_streaminfo();
+        info.total_samples = StreamInfo::MAX_TOTAL_SAMPLES + 1;
+        assert!(info.write().is_err());
+        info.total_samples = StreamInfo::MAX_TOTAL_SAMPLES;
+        assert!(info.write().is_ok());
+    }
+
+    #[test]
+    fn streaminfo_write_rejects_out_of_range_channels() {
+        let mut info = sample_streaminfo();
+        info.channels = 0;
+        assert!(info.write().is_err());
+        info.channels = 9;
+        assert!(info.write().is_err());
+        info.channels = StreamInfo::MAX_CHANNELS;
+        assert!(info.write().is_ok());
+        info.channels = StreamInfo::MIN_CHANNELS;
+        assert!(info.write().is_ok());
+    }
+
+    #[test]
+    fn streaminfo_write_rejects_out_of_range_bps() {
+        let mut info = sample_streaminfo();
+        info.bits_per_sample = 0;
+        assert!(info.write().is_err());
+        info.bits_per_sample = 33;
+        assert!(info.write().is_err());
+        info.bits_per_sample = StreamInfo::MAX_BPS;
+        assert!(info.write().is_ok());
+        info.bits_per_sample = StreamInfo::MIN_BPS;
+        assert!(info.write().is_ok());
+    }
+
+    #[test]
+    fn streaminfo_write_rejects_oversized_frame_sizes() {
+        let mut info = sample_streaminfo();
+        info.min_frame_size = StreamInfo::MAX_FRAME_SIZE + 1;
+        assert!(info.write().is_err());
+        info.min_frame_size = StreamInfo::MAX_FRAME_SIZE;
+        assert!(info.write().is_ok());
+
+        let mut info = sample_streaminfo();
+        info.max_frame_size = StreamInfo::MAX_FRAME_SIZE + 1;
+        assert!(info.write().is_err());
+        info.max_frame_size = StreamInfo::MAX_FRAME_SIZE;
+        assert!(info.write().is_ok());
+    }
+
+    #[test]
+    fn streaminfo_write_preserves_md5_bytes() {
+        let info = sample_streaminfo();
+        let bytes = info.write().expect("writer");
+        // MD5 sits in the last 16 bytes of the 34-byte payload.
+        assert_eq!(&bytes[18..34], &info.md5);
+    }
+
+    #[test]
+    fn streaminfo_write_packs_max_field_values() {
+        // Build a payload at every field's wire-format ceiling and
+        // confirm the parser reads the same values back. Catches a
+        // writer that silently masks the top bit of a field.
+        let info = StreamInfo {
+            min_block_size: u16::MAX,
+            max_block_size: u16::MAX,
+            min_frame_size: StreamInfo::MAX_FRAME_SIZE,
+            max_frame_size: StreamInfo::MAX_FRAME_SIZE,
+            sample_rate: StreamInfo::MAX_SAMPLE_RATE,
+            channels: StreamInfo::MAX_CHANNELS,
+            bits_per_sample: StreamInfo::MAX_BPS,
+            total_samples: StreamInfo::MAX_TOTAL_SAMPLES,
+            md5: [0xFFu8; 16],
+        };
+        let bytes = info.write().expect("writer");
+        let back = StreamInfo::parse(&bytes).expect("parser");
+        assert_eq!(back.min_block_size, u16::MAX);
+        assert_eq!(back.max_block_size, u16::MAX);
+        assert_eq!(back.min_frame_size, StreamInfo::MAX_FRAME_SIZE);
+        assert_eq!(back.max_frame_size, StreamInfo::MAX_FRAME_SIZE);
+        assert_eq!(back.sample_rate, StreamInfo::MAX_SAMPLE_RATE);
+        assert_eq!(back.channels, StreamInfo::MAX_CHANNELS);
+        assert_eq!(back.bits_per_sample, StreamInfo::MAX_BPS);
+        assert_eq!(back.total_samples, StreamInfo::MAX_TOTAL_SAMPLES);
+        assert_eq!(back.md5, [0xFFu8; 16]);
     }
 }

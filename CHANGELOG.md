@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- metadata: round-252 typed `StreamInfo` writer — `StreamInfo::write`
+  (with a `metadata::write_streaminfo` free-function alias for
+  symmetry with the other top-level writers) serialises a
+  `StreamInfo` back into the exact 34-byte RFC 9639 §8.1 block
+  payload, round-tripping through `StreamInfo::parse` bit-for-bit.
+  Closes the parser-only gap noted in the round-241 entry: every
+  RFC 9639 §8 block type whose payload has a spec-defined
+  structural split (STREAMINFO / SEEKTABLE / VORBIS_COMMENT /
+  CUESHEET / PICTURE / PADDING / APPLICATION) now has a parser +
+  writer pair. The writer enforces every wire-format ceiling its
+  packed-bit fields can carry: `sample_rate` against
+  `MAX_SAMPLE_RATE` (20-bit, 1_048_575), `total_samples` against
+  `MAX_TOTAL_SAMPLES` (36-bit), `channels` against
+  `MIN_CHANNELS..=MAX_CHANNELS` (3-bit `channels − 1`, range 1..=8),
+  `bits_per_sample` against `MIN_BPS..=MAX_BPS` (5-bit `bps − 1`,
+  range 1..=32), and both frame-size fields against `MAX_FRAME_SIZE`
+  (24-bit). New `PAYLOAD_LEN` const advertises the spec's 34-byte
+  fixed length so callers walking the metadata-block chain do not
+  hard-code the literal. The encoder's internal
+  `build_streaminfo_metadata_block` now delegates the 34-byte
+  payload pack to this typed writer so both code paths share the
+  same packer; the wire bytes the encoder hands the muxer are
+  byte-identical to the pre-r252 output. Eleven unit tests cover
+  the round trip, the free-function alias agreement, the matching
+  payload-length, MD5 preservation, every per-field boundary
+  (low + high), and the canonical small fixture's packed
+  sr/ch/bps/total bytes match the hand-built reference.
 - metadata: round-244 typed `Application` accessor + writer —
   `metadata::parse_application` and `metadata::write_application`
   round-trip a RFC 9639 §8.4 APPLICATION block payload through a new
