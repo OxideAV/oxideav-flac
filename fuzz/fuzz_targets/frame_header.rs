@@ -11,7 +11,7 @@
 //! `FrameScanner` walks a candidate sync byte) and the decoder's
 //! per-packet entry point. The eight prior cargo-fuzz harnesses cover
 //! the demuxer pipeline (`panic_free_decode`, `decode`),
-//! encode/decode self-consistency (`roundtrip`), the libavcodec
+//! encode/decode self-consistency (`roundtrip`), the external
 //! cross-decode oracle, the metadata chain (`metadata_walker`),
 //! encoder construction extradata (`encoder_options`), the MD5
 //! primitive (`md5_streaming`), and the UTF-8 varint codec
