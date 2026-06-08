@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-259 `frame_header` cargo-fuzz target — ninth target,
+  focused stress on `oxideav_flac::frame::parse_frame_header`
+  (the RFC 9639 §9.1 frame sync header: sync code + reserved bits +
+  blocking strategy + block-size code + sample-rate code + channel
+  assignment + sample-size code + UTF-8-shaped coded number +
+  CRC-8 footer). The eight prior targets either feed full streams
+  through the demuxer (`panic_free_decode` / `decode` /
+  `flac_oracle_decode` / `roundtrip`) — only reaching the
+  conservative subset of code-tuples the encoder actually emits —
+  or exercise one field in isolation (`utf8_varint` only sees the
+  coded-number varint outside any framing / CRC). The harness
+  builds a syntactically valid header from fuzzer-controlled
+  `(blocking, block_size_code, sample_rate_code, channel_code,
+  sample_size_code, immediate-tail bytes, coded_number)` and
+  asserts `parse_frame_header` recovers the exact
+  `(block_size, sample_rate, channels, bps, coded_number,
+  blocking_strategy, header_byte_len)` tuple the constructor
+  emitted. Every iteration unconditionally sweeps all
+  (block-size-code × sample-rate-code × channel-code ×
+  sample-size-code) combinations at seven coded-number boundary
+  values (0, 0x7F, 0x80, 0xFFFF, 0x10000, 0xFFFFFFFF, 0xF_FFFFFFFF)
+  in both fixed and variable blocking — ~24 K well-formed headers
+  per iter — so a regression on any code-table entry is reached
+  before the fuzzer's corpus has converged. Reserved-code
+  rejection is asserted for every spec-marked-reserved value
+  (block_size_code 0, sample_rate_code 15, sample_size_code 3 + 7,
+  channel_code 11..=15). A 14-position single-bit-flip sweep on
+  the constructed header asserts CRC-8 verification stability
+  under arbitrary corruption (a CRC that didn't actually verify
+  the payload would let an attacker steer the decoder into a
+  frame whose tuple disagrees with STREAMINFO — historically a
+  class of bugs that leaked uninitialised subframe-buffer memory
+  into output PCM). Finally, the raw input is fed to
+  `parse_frame_header` at four sliding offsets for panic-freedom
+  on hand-crafted bytes (continuation bytes, reserved `0xFF`
+  lead, mis-aligned sync prefixes). All construction +
+  expected-tuple logic is computed directly from the RFC 9639
+  §9.1 tables (Table 11 block size, Table 12 sample rate,
+  Table 13 channel assignment, Table 14 sample size) — no
+  external implementation consulted.
+
 - bench: round-255 `md5` Criterion harness — fifth depth-mode bench
   binary alongside `decode` / `encode` / `roundtrip` / `crc` / `seek`,
   exercising the FLAC STREAMINFO MD5 validator (RFC 9639 §8.2) on the

@@ -322,7 +322,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries eight `cargo-fuzz` targets that all share the same
+`fuzz/` carries nine `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -402,6 +402,33 @@ on malformed input, never panic, abort, or OOM:
   re-encode and re-parse; canonical-form stability guards
   against codec drift at values the writer can produce but a
   hand-built input encoded in a longer-than-necessary form.
+- **`frame_header`** *(r259)* — focused stress on
+  `frame::parse_frame_header` (RFC 9639 §9.1). The host-pipeline
+  targets only see whatever (block_size_code, sample_rate_code,
+  channel_code, sample_size_code) tuple the encoder happened to
+  emit — a narrow steady-state subset of the 16×16×16×8 reachable
+  combinations — and `utf8_varint` only exercises the coded-number
+  field outside any header framing or CRC verification. This
+  harness builds a syntactically valid header from
+  fuzzer-controlled `(blocking, code values, immediate-tail bytes,
+  coded_number)` and asserts the parser recovers the exact tuple
+  the constructor emitted (block_size, sample_rate, channels, bps,
+  coded_number, blocking_strategy, header_byte_len). Every
+  iteration unconditionally sweeps all (block-size-code ×
+  sample-rate-code × channel-code × sample-size-code) combinations
+  at seven coded-number boundary values (0, 0x7F, 0x80, 0xFFFF,
+  0x10000, 0xFFFFFFFF, 0xF_FFFFFFFF) in both blocking strategies —
+  ~24 K well-formed headers per iter — so any regression on a
+  code-table entry surfaces before the fuzzer's corpus has
+  converged. Asserts spec reserved-code rejection for every
+  spec-marked-reserved value (block_size_code 0, sample_rate_code
+  15, sample_size_code 3 + 7, channel_code 11..=15). A 14-position
+  single-bit-flip sweep on the constructed header asserts CRC-8
+  verification stability — a CRC that didn't actually verify the
+  payload would let an attacker steer the decoder into a frame
+  whose tuple disagrees with STREAMINFO. Finally, the raw input
+  is fed to `parse_frame_header` at four sliding offsets for
+  panic-freedom on hand-crafted bytes.
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the

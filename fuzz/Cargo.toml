@@ -166,3 +166,33 @@ name = "utf8_varint"
 path = "fuzz_targets/utf8_varint.rs"
 test = false
 doc = false
+
+# Target 9 (round 259): focused stress on
+# `oxideav_flac::frame::parse_frame_header` — the RFC 9639 §9.1
+# frame sync header. The host-pipeline targets only see whatever
+# (block_size_code, sample_rate_code, channel_code, sample_size_code)
+# tuple the encoder happened to emit (the encoder picks code values
+# from a narrow steady-state subset of the 16×16×16×8 reachable
+# combinations); `utf8_varint` only exercises the coded-number
+# field in isolation outside any header framing or CRC verification.
+# This harness builds a syntactically valid header from
+# fuzzer-controlled (blocking + 4 code values + immediates +
+# coded_number) and asserts the parser recovers the exact tuple
+# the constructor emitted (block_size, sample_rate, channels, bps,
+# coded_number, blocking_strategy, header_byte_len). Every iteration
+# unconditionally sweeps all (block-size-code × sample-rate-code ×
+# channel-code × sample-size-code) combinations at seven
+# coded-number boundaries (~24 K well-formed headers per iter) so
+# a regression on any code-table entry is reached even before the
+# fuzzer's corpus has converged. Reserved-code rejection is
+# asserted for every spec-marked-reserved value (block_size_code 0,
+# sample_rate_code 15, sample_size_code 3 + 7, channel_code 11..=15).
+# A 14-position single-bit-flip sweep on the constructed header
+# asserts CRC verification stability under arbitrary corruption.
+# Finally, the raw fuzz input is fed to `parse_frame_header` at
+# four sliding offsets for panic-freedom on hand-crafted bytes.
+[[bin]]
+name = "frame_header"
+path = "fuzz_targets/frame_header.rs"
+test = false
+doc = false
