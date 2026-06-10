@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- metadata: round-274 typed PICTURE picture-type taxonomy + URI
+  accessors (RFC 9639 §8.8 / Table 13). The `Picture` struct stored
+  `picture_type` only as a raw `u32`, leaving callers to memorise the
+  21 ID3v2-shared type codes and to re-detect the `"-->"` URI sentinel
+  by hand. The new `PictureType` enum names every defined code (0
+  `Other` through 20 `PublisherLogo`, including the value-17 oddity
+  Table 13 retains for compatibility) and folds all reserved /
+  out-of-range values into a single `Reserved(u32)` variant that
+  preserves the raw code, so `PictureType::from_code(x).code() == x`
+  for every `u32` — a parsed value re-emits unchanged. `Picture`
+  gains: `picture_kind()` (raw code → typed `PictureType`);
+  `is_uri()` / `uri()` (test for and decode the `"-->"` sentinel
+  block, returning the URI as `Option<&str>` only when the data bytes
+  are valid UTF-8, else `None` with the raw bytes still reachable via
+  `data`); the named sentinel constant `Picture::URI_SENTINEL = "-->"`;
+  and `Picture::FILE_ICON_DIMENSION = 32` for the type-1 32×32 PNG
+  file icon Table 13 fixes. `PictureType::is_unique_per_file()` flags
+  the two codes (1, 2) Table 13 limits to one occurrence per file, for
+  a muxer assembling a metadata block list. Pure typed-accessor
+  surface — no wire-format change, no parser/writer behaviour change.
+  9 new unit tests cover the full 0..=20 code round-trip, the named
+  rows, reserved-value preservation, the unique-per-file split, the
+  URI decode / non-UTF-8-rejection / embedded-image branches, and the
+  file-icon dimension constant.
 - metadata: round-267 typed CUESHEET sub-field accessors (RFC 9639
   §8.7 / §8.7.1). Until now the `CueSheet` / `CueSheetTrack` structs
   exposed the catalog and ISRC fields only as raw byte arrays

@@ -882,6 +882,149 @@ pub fn write_application(app: &Application) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The defined PICTURE-block picture types (RFC 9639 §8.8, Table 13).
+///
+/// The on-wire `picture_type` field is a 32-bit unsigned integer, but
+/// only values 0 through 20 carry a defined meaning; Table 13 says
+/// "values other than those listed in the table are reserved". This
+/// enum names the 21 defined codes and keeps every other (reserved or
+/// out-of-range) value in the catch-all [`Reserved`](Self::Reserved)
+/// variant, which preserves the raw `u32` so an application can re-emit
+/// a value it parsed without loss.
+///
+/// The taxonomy is shared with the ID3v2 `APIC` frame, which is why the
+/// numbering has the historical curiosity at value 17 ("A bright
+/// colored fish"); RFC 9639 §8.8 notes the origin of that value is
+/// unclear and that it was copied to maintain compatibility, and
+/// discourages applications from offering it to users.
+///
+/// Two of the codes carry a file-level multiplicity constraint that
+/// this value-level enum does not police: Table 13 states "there MAY
+/// only be one each of picture types 1 and 2 in a file". That is a
+/// chain-level invariant the demuxer/muxer would enforce across a
+/// metadata block list, not a property of a single decoded block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PictureType {
+    /// 0 — Other.
+    Other,
+    /// 1 — PNG file icon of 32×32 pixels (RFC 9639 §8.8 cites
+    /// [RFC2083]). Subject to the "one per file" constraint.
+    FileIcon32,
+    /// 2 — General file icon. Subject to the "one per file" constraint.
+    GeneralFileIcon,
+    /// 3 — Front cover. Players commonly display this during playback.
+    FrontCover,
+    /// 4 — Back cover.
+    BackCover,
+    /// 5 — Liner notes page.
+    LinerNotes,
+    /// 6 — Media label (e.g. CD, Vinyl or Cassette label).
+    MediaLabel,
+    /// 7 — Lead artist, lead performer, or soloist.
+    LeadArtist,
+    /// 8 — Artist or performer.
+    Artist,
+    /// 9 — Conductor.
+    Conductor,
+    /// 10 — Band or orchestra.
+    Band,
+    /// 11 — Composer.
+    Composer,
+    /// 12 — Lyricist or text writer.
+    Lyricist,
+    /// 13 — Recording location.
+    RecordingLocation,
+    /// 14 — During recording.
+    DuringRecording,
+    /// 15 — During performance.
+    DuringPerformance,
+    /// 16 — Movie or video screen capture.
+    ScreenCapture,
+    /// 17 — "A bright colored fish". Origin unclear; retained for
+    /// ID3v2 compatibility, discouraged for new use (RFC 9639 §8.8).
+    BrightColoredFish,
+    /// 18 — Illustration.
+    Illustration,
+    /// 19 — Band or artist logotype.
+    BandLogo,
+    /// 20 — Publisher or studio logotype.
+    PublisherLogo,
+    /// Any value outside the defined `0..=20` range. RFC 9639 §8.8
+    /// reserves these; the raw code is preserved so a parsed value can
+    /// be re-emitted unchanged.
+    Reserved(u32),
+}
+
+impl PictureType {
+    /// Map a raw on-wire `picture_type` code to its typed variant.
+    /// Codes outside the defined `0..=20` range map to
+    /// [`Reserved`](Self::Reserved) carrying the raw value.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::Other,
+            1 => Self::FileIcon32,
+            2 => Self::GeneralFileIcon,
+            3 => Self::FrontCover,
+            4 => Self::BackCover,
+            5 => Self::LinerNotes,
+            6 => Self::MediaLabel,
+            7 => Self::LeadArtist,
+            8 => Self::Artist,
+            9 => Self::Conductor,
+            10 => Self::Band,
+            11 => Self::Composer,
+            12 => Self::Lyricist,
+            13 => Self::RecordingLocation,
+            14 => Self::DuringRecording,
+            15 => Self::DuringPerformance,
+            16 => Self::ScreenCapture,
+            17 => Self::BrightColoredFish,
+            18 => Self::Illustration,
+            19 => Self::BandLogo,
+            20 => Self::PublisherLogo,
+            other => Self::Reserved(other),
+        }
+    }
+
+    /// The raw on-wire `picture_type` code for this variant. For
+    /// [`Reserved`](Self::Reserved) this is the preserved raw value, so
+    /// `PictureType::from_code(x).code() == x` for every `u32`.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Other => 0,
+            Self::FileIcon32 => 1,
+            Self::GeneralFileIcon => 2,
+            Self::FrontCover => 3,
+            Self::BackCover => 4,
+            Self::LinerNotes => 5,
+            Self::MediaLabel => 6,
+            Self::LeadArtist => 7,
+            Self::Artist => 8,
+            Self::Conductor => 9,
+            Self::Band => 10,
+            Self::Composer => 11,
+            Self::Lyricist => 12,
+            Self::RecordingLocation => 13,
+            Self::DuringRecording => 14,
+            Self::DuringPerformance => 15,
+            Self::ScreenCapture => 16,
+            Self::BrightColoredFish => 17,
+            Self::Illustration => 18,
+            Self::BandLogo => 19,
+            Self::PublisherLogo => 20,
+            Self::Reserved(v) => v,
+        }
+    }
+
+    /// True for the two codes (1 = 32×32 PNG file icon, 2 = general
+    /// file icon) that RFC 9639 §8.8 / Table 13 limits to at most one
+    /// occurrence per file. A muxer assembling a metadata block list
+    /// can use this to enforce that constraint.
+    pub fn is_unique_per_file(self) -> bool {
+        matches!(self, Self::FileIcon32 | Self::GeneralFileIcon)
+    }
+}
+
 /// Parsed PICTURE metadata block contents (RFC 9639 §8.8).
 ///
 /// FLAC reuses the ID3v2 `APIC` taxonomy for `picture_type` (so the
@@ -1114,6 +1257,60 @@ pub fn write_picture(pic: &Picture) -> Result<Vec<u8>> {
     out.extend_from_slice(&pic.data);
     debug_assert_eq!(out.len(), total);
     Ok(out)
+}
+
+impl Picture {
+    /// The MIME-type sentinel `"-->"` that, when stored in
+    /// [`mime_type`](Self::mime_type), signals that [`data`](Self::data)
+    /// holds a URI string pointing at the image rather than the encoded
+    /// image bytes themselves (RFC 9639 §8.8).
+    pub const URI_SENTINEL: &'static str = "-->";
+
+    /// The pixel width and height of the type-1 ("PNG file icon")
+    /// picture, which RFC 9639 §8.8 / Table 13 fixes at 32×32. A muxer
+    /// emitting a [`PictureType::FileIcon32`] block can use this to fill
+    /// the `width`/`height` fields; a reader can use it to validate one.
+    pub const FILE_ICON_DIMENSION: u32 = 32;
+
+    /// The typed [`PictureType`] for this block's raw `picture_type`
+    /// code (RFC 9639 §8.8, Table 13). Codes outside the defined
+    /// `0..=20` range come back as [`PictureType::Reserved`] carrying
+    /// the raw value, so this never discards information.
+    pub fn picture_kind(&self) -> PictureType {
+        PictureType::from_code(self.picture_type)
+    }
+
+    /// True when this block carries a URI reference rather than embedded
+    /// image bytes — i.e. when [`mime_type`](Self::mime_type) is the
+    /// `"-->"` sentinel (RFC 9639 §8.8). In that case
+    /// [`data`](Self::data) is the URI's bytes; callers wanting it as a
+    /// string should use [`uri`](Self::uri).
+    pub fn is_uri(&self) -> bool {
+        self.mime_type == Self::URI_SENTINEL
+    }
+
+    /// The image URI when this block is a URI reference, or `None` when
+    /// it carries embedded image data.
+    ///
+    /// Returns `Some` only when [`is_uri`](Self::is_uri) holds and the
+    /// stored [`data`](Self::data) bytes are valid UTF-8 (a URI is a
+    /// text string per RFC 9639 §8.8 / [RFC3986]); a URI block whose
+    /// data is not valid UTF-8 is malformed and returns `None`, leaving
+    /// the raw bytes available through [`data`](Self::data). For a
+    /// block holding embedded image bytes this always returns `None`.
+    ///
+    /// RFC 9639 §8.8 notes a URI may be absolute or relative (resolved
+    /// against the FLAC content's own URI) and that applications MUST
+    /// obtain explicit user approval before retrieving remote or
+    /// out-of-directory images; this accessor only surfaces the string
+    /// and performs no retrieval.
+    pub fn uri(&self) -> Option<&str> {
+        if self.is_uri() {
+            std::str::from_utf8(&self.data).ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// Parsed VORBIS_COMMENT metadata block contents (RFC 9639 §8.6).
@@ -2648,6 +2845,119 @@ mod tests {
         let bytes = write_picture(&pic).expect("write");
         let parsed = parse_picture(&bytes).expect("parse");
         assert_eq!(parsed, pic);
+    }
+
+    #[test]
+    fn picture_type_code_round_trip_all_defined() {
+        // RFC 9639 §8.8 Table 13 defines codes 0..=20. Each must map to
+        // a named variant and back to its own code with no loss.
+        for code in 0u32..=20 {
+            let kind = PictureType::from_code(code);
+            assert!(
+                !matches!(kind, PictureType::Reserved(_)),
+                "code {code} should be a defined variant, got {kind:?}"
+            );
+            assert_eq!(kind.code(), code);
+        }
+    }
+
+    #[test]
+    fn picture_type_named_codes_match_table_13() {
+        // Spot-check the named variants against Table 13's exact rows so
+        // a typo in the dispatch table is caught.
+        assert_eq!(PictureType::from_code(0), PictureType::Other);
+        assert_eq!(PictureType::from_code(1), PictureType::FileIcon32);
+        assert_eq!(PictureType::from_code(2), PictureType::GeneralFileIcon);
+        assert_eq!(PictureType::from_code(3), PictureType::FrontCover);
+        assert_eq!(PictureType::from_code(4), PictureType::BackCover);
+        assert_eq!(PictureType::from_code(17), PictureType::BrightColoredFish);
+        assert_eq!(PictureType::from_code(20), PictureType::PublisherLogo);
+    }
+
+    #[test]
+    fn picture_type_reserved_preserves_raw_value() {
+        // Codes outside 0..=20 are reserved; the raw value must survive
+        // a from_code/code cycle so a parsed block re-emits unchanged.
+        for code in [21u32, 100, 0xFFFF, u32::MAX] {
+            let kind = PictureType::from_code(code);
+            assert_eq!(kind, PictureType::Reserved(code));
+            assert_eq!(kind.code(), code);
+        }
+    }
+
+    #[test]
+    fn picture_type_unique_per_file_only_icons() {
+        // Table 13: "there MAY only be one each of picture types 1 and
+        // 2 in a file" — and no others carry that constraint.
+        for code in 0u32..=20 {
+            let kind = PictureType::from_code(code);
+            let expect = code == 1 || code == 2;
+            assert_eq!(
+                kind.is_unique_per_file(),
+                expect,
+                "code {code} unique-per-file mismatch"
+            );
+        }
+        assert!(!PictureType::Reserved(99).is_unique_per_file());
+    }
+
+    #[test]
+    fn picture_kind_accessor_reflects_field() {
+        let pic = Picture {
+            picture_type: 3,
+            mime_type: "image/png".into(),
+            description: String::new(),
+            width: 600,
+            height: 600,
+            depth: 24,
+            colour_count: 0,
+            data: b"PNG".to_vec(),
+        };
+        assert_eq!(pic.picture_kind(), PictureType::FrontCover);
+        assert!(!pic.is_uri());
+        assert_eq!(pic.uri(), None);
+    }
+
+    #[test]
+    fn picture_uri_accessor_decodes_sentinel_block() {
+        let pic = Picture {
+            picture_type: 0,
+            mime_type: Picture::URI_SENTINEL.into(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+            colour_count: 0,
+            data: b"https://example.invalid/cover.jpg".to_vec(),
+        };
+        assert!(pic.is_uri());
+        assert_eq!(pic.uri(), Some("https://example.invalid/cover.jpg"));
+    }
+
+    #[test]
+    fn picture_uri_accessor_rejects_non_utf8_uri_bytes() {
+        // A "-->" block whose data is not valid UTF-8 is malformed; the
+        // accessor returns None rather than lossily decoding, leaving
+        // the raw bytes reachable through `data`.
+        let pic = Picture {
+            picture_type: 0,
+            mime_type: Picture::URI_SENTINEL.into(),
+            description: String::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+            colour_count: 0,
+            data: vec![0xFF, 0xFE, 0x80],
+        };
+        assert!(pic.is_uri());
+        assert_eq!(pic.uri(), None);
+        assert_eq!(pic.data, vec![0xFF, 0xFE, 0x80]);
+    }
+
+    #[test]
+    fn picture_file_icon_dimension_constant() {
+        // RFC 9639 §8.8 / Table 13 fixes the type-1 file icon at 32×32.
+        assert_eq!(Picture::FILE_ICON_DIMENSION, 32);
     }
 
     #[test]
