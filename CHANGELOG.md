@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- metadata: round-267 typed CUESHEET sub-field accessors (RFC 9639
+  §8.7 / §8.7.1). Until now the `CueSheet` / `CueSheetTrack` structs
+  exposed the catalog and ISRC fields only as raw byte arrays
+  (`[u8; 128]` / `[u8; 12]`), leaving every caller to re-implement the
+  printable-leading-run decode and the all-zero "absent" detection by
+  hand. The new convenience accessors fold those spec rules into typed
+  methods: `CueSheet::media_catalog()` returns the catalog as
+  `Option<&str>` (leading printable-ASCII run up to the first `0x00`
+  terminator, `None` when empty or when the run contains a
+  non-printable byte — the same character-class rule `write_cuesheet`
+  enforces, so any value it returns `Some` for round-trips through a
+  write/parse cycle); `CueSheetTrack::isrc_str()` returns the 12-byte
+  ISRC as `Option<&str>` (`None` for the all-zero absent encoding or any
+  field with embedded NULs / non-printable bytes). Two lead-out-track
+  sentinels are named as associated constants
+  (`CueSheetTrack::CDDA_LEAD_OUT = 170`,
+  `CueSheetTrack::NON_CDDA_LEAD_OUT = 255`) with
+  `CueSheetTrack::is_lead_out()` testing a track number against both;
+  `CueSheet::lead_out()` returns the trailing terminator track and
+  `CueSheet::playable_tracks()` iterates the selectable (non-lead-out)
+  tracks, dropping the terminator. Pure typed-accessor surface — no
+  wire-format change, no parser/writer behaviour change. 13 new unit
+  tests cover the printable-run / absent / non-printable / embedded-NUL
+  / high-bit branches plus a write→parse media-catalog round-trip and
+  the lead-out / playable-tracks split for both the sentinel-terminated
+  and hand-built-without-terminator shapes.
 - fuzz: round-259 `frame_header` cargo-fuzz target — ninth target,
   focused stress on `oxideav_flac::frame::parse_frame_header`
   (the RFC 9639 §9.1 frame sync header: sync code + reserved bits +

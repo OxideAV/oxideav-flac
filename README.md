@@ -192,6 +192,24 @@ non-Subset):
   point list — is also retained on the demuxer for callers needing
   CD-DA fidelity. A malformed CUESHEET is non-fatal: the demuxer
   drops it and returns an empty chapter list instead of erroring out.
+- **CUESHEET typed sub-field accessors** *(r267)*: the parsed
+  `CueSheet` / `CueSheetTrack` structs carry the catalog and ISRC as
+  raw byte arrays (`[u8; 128]` / `[u8; 12]`) for byte-exact fidelity;
+  the convenience accessors fold the RFC 9639 §8.7 / §8.7.1 decode
+  rules into typed methods so callers don't re-implement them.
+  `CueSheet::media_catalog()` returns the media catalog number as
+  `Option<&str>` (leading printable-ASCII run up to the first `0x00`,
+  `None` when empty or non-printable — matching the character class
+  `write_cuesheet` enforces, so any value it returns survives a
+  write/parse cycle). `CueSheetTrack::isrc_str()` returns the ISRC as
+  `Option<&str>` (`None` for the spec's all-zero "absent" encoding or
+  a field with embedded NULs / non-printable bytes). The two lead-out
+  track sentinels are named constants (`CueSheetTrack::CDDA_LEAD_OUT`
+  = 170, `CueSheetTrack::NON_CDDA_LEAD_OUT` = 255) with
+  `CueSheetTrack::is_lead_out()`; `CueSheet::lead_out()` returns the
+  trailing terminator and `CueSheet::playable_tracks()` iterates the
+  selectable non-lead-out tracks. Pure accessor surface — no
+  wire-format or parser/writer behaviour change.
 - **CUESHEET writer**: `metadata::write_cuesheet` serialises a
   `CueSheet` back into a RFC 9639 §8.7-conformant block payload.
   Round-trips through `metadata::parse_cuesheet` bit-for-bit; reserved

@@ -215,6 +215,65 @@ pub struct CueSheet {
     pub tracks: Vec<CueSheetTrack>,
 }
 
+impl CueSheetTrack {
+    /// Track number reserved by Red Book for the CD-DA lead-out
+    /// (RFC 9639 §8.7.1). The lead-out is always the trailing track and
+    /// carries the total audio sample count in `offset_samples` with an
+    /// empty `indices` list.
+    pub const CDDA_LEAD_OUT: u8 = 170;
+
+    /// Track number reserved for the non-CD-DA lead-out (RFC 9639
+    /// §8.7.1). Used in place of [`CDDA_LEAD_OUT`](Self::CDDA_LEAD_OUT)
+    /// when the enclosing [`CueSheet::is_cdda`] flag is false.
+    pub const NON_CDDA_LEAD_OUT: u8 = 255;
+
+    /// True when this track's number is one of the two spec-defined
+    /// lead-out sentinels (170 for CD-DA, 255 for non-CD-DA per RFC 9639
+    /// §8.7.1). The lead-out is a structural terminator, not a playable
+    /// track: it carries the stream's total sample count in
+    /// `offset_samples` and no index points.
+    ///
+    /// This is a *value* test on the track number alone — it does not
+    /// consult position in the track list or the CD-DA flag, so it
+    /// answers "could this number denote a lead-out" rather than "is this
+    /// the trailing entry". A well-formed [`CueSheet`] only ever places a
+    /// lead-out-numbered track last, so on parser output the two notions
+    /// coincide; callers building a `CueSheet` by hand should keep them
+    /// aligned.
+    pub fn is_lead_out(&self) -> bool {
+        self.number == Self::CDDA_LEAD_OUT || self.number == Self::NON_CDDA_LEAD_OUT
+    }
+
+    /// The 12-byte International Standard Recording Code as a printable
+    /// string, or `None` when the field is absent.
+    ///
+    /// RFC 9639 §8.7.1 permits an all-zero ISRC to denote "absent"; this
+    /// accessor maps that case (and only that case) to `None`. A
+    /// non-absent ISRC is returned only when every byte of the 12-byte
+    /// field is printable ASCII (`0x20..=0x7E`) — the character class the
+    /// ISRC standard (a 2-char country code + 3-char registrant + 2-digit
+    /// year + 5-digit designation) lives within. A field with embedded
+    /// NULs or other non-printable bytes is neither all-zero nor a clean
+    /// string, so it returns `None`; callers needing the raw bytes in
+    /// that case read [`isrc`](Self::isrc) directly.
+    ///
+    /// Unlike the media catalog number there is no NUL-termination
+    /// convention here: the ISRC field is exactly 12 bytes wide and a
+    /// real ISRC fills all 12, so the accessor treats the whole field as
+    /// one unit rather than slicing at a terminator.
+    pub fn isrc_str(&self) -> Option<&str> {
+        if self.isrc.iter().all(|&b| b == 0) {
+            return None;
+        }
+        if self.isrc.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+            // All bytes printable ASCII ⇒ valid UTF-8 by construction.
+            std::str::from_utf8(&self.isrc).ok()
+        } else {
+            None
+        }
+    }
+}
+
 impl CueSheet {
     /// Spec maximum overall track count (99 + lead-out for CD-DA, but
     /// the on-wire `num_tracks` field is u8 so 256 is the absolute
@@ -222,6 +281,77 @@ impl CueSheet {
     /// not enforced as a parse-rejection threshold because non-CD-DA
     /// CUESHEETs can legitimately use the full u8 range.
     pub const MAX_TRACKS: usize = 256;
+
+    /// The media catalog number as a printable string, or `None` when the
+    /// field is absent.
+    ///
+    /// RFC 9639 §8.7 stores the catalog as 128 bytes of printable ASCII
+    /// (`0x20..=0x7E`) right-padded with `0x00`; an all-zero field means
+    /// "the originator declined to record one". This accessor returns the
+    /// leading run of bytes up to the first `0x00` terminator, decoded as
+    /// a string. It returns `None` when:
+    ///
+    /// * the field is empty (first byte is `0x00`, i.e. no catalog), or
+    /// * any byte in the leading run is outside the printable-ASCII range
+    ///   (a malformed catalog — callers wanting the raw bytes in that case
+    ///   read [`media_catalog_number`](Self::media_catalog_number)
+    ///   directly).
+    ///
+    /// Because the returned run is all printable ASCII it is always valid
+    /// UTF-8, so the `str` conversion cannot fail. This mirrors the
+    /// printable-leading-run rule [`write_cuesheet`] enforces when
+    /// serialising, so a catalog this accessor returns `Some` for will
+    /// round-trip through a write/parse cycle unchanged.
+    pub fn media_catalog(&self) -> Option<&str> {
+        let leading = self
+            .media_catalog_number
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.media_catalog_number.len());
+        if leading == 0 {
+            return None;
+        }
+        let run = &self.media_catalog_number[..leading];
+        if run.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+            std::str::from_utf8(run).ok()
+        } else {
+            None
+        }
+    }
+
+    /// The trailing lead-out track, or `None` when the track list is
+    /// empty.
+    ///
+    /// Per RFC 9639 §8.7 the lead-out is always the last entry in the
+    /// track list and carries the stream's total audio sample count in
+    /// its `offset_samples` with no index points. Parser output always
+    /// satisfies this (the writer requires a non-empty list and the
+    /// parser requires `num_tracks ≥ 1`), so on a parsed `CueSheet` this
+    /// returns `Some`. It does not verify the trailing track's *number*
+    /// is a lead-out sentinel — use
+    /// [`CueSheetTrack::is_lead_out`](CueSheetTrack::is_lead_out) on the
+    /// result if that distinction matters.
+    pub fn lead_out(&self) -> Option<&CueSheetTrack> {
+        self.tracks.last()
+    }
+
+    /// Iterator over the playable (non-lead-out) tracks, in order.
+    ///
+    /// Skips the trailing lead-out terminator (RFC 9639 §8.7), yielding
+    /// only the audio/data tracks a player would expose as selectable
+    /// entries. Equivalent to `tracks` with the final element dropped
+    /// when that element's number is a lead-out sentinel; if the trailing
+    /// track is *not* lead-out-numbered (a hand-built `CueSheet` that
+    /// omitted the terminator) every track is yielded.
+    pub fn playable_tracks(&self) -> impl Iterator<Item = &CueSheetTrack> {
+        let drop_last = self.tracks.last().is_some_and(CueSheetTrack::is_lead_out);
+        let keep = if drop_last {
+            self.tracks.len() - 1
+        } else {
+            self.tracks.len()
+        };
+        self.tracks[..keep].iter()
+    }
 }
 
 /// Parse a CUESHEET metadata block payload (RFC 9639 §8.7).
@@ -1676,6 +1806,167 @@ mod tests {
         assert!(bytes[137..395].iter().all(|&b| b == 0));
         let cs_out = parse_cuesheet(&bytes).unwrap();
         assert_eq!(cs_in, cs_out);
+    }
+
+    fn track(number: u8, isrc: [u8; 12]) -> CueSheetTrack {
+        CueSheetTrack {
+            offset_samples: 0,
+            number,
+            isrc,
+            is_audio: true,
+            pre_emphasis: false,
+            indices: vec![CueSheetIndex {
+                offset_samples: 0,
+                number: 1,
+            }],
+        }
+    }
+
+    fn lead_out(number: u8) -> CueSheetTrack {
+        CueSheetTrack {
+            offset_samples: 1_000_000,
+            number,
+            isrc: [0u8; 12],
+            is_audio: true,
+            pre_emphasis: false,
+            indices: vec![],
+        }
+    }
+
+    #[test]
+    fn cuesheet_track_is_lead_out_recognises_both_sentinels() {
+        assert!(lead_out(CueSheetTrack::CDDA_LEAD_OUT).is_lead_out());
+        assert!(lead_out(CueSheetTrack::NON_CDDA_LEAD_OUT).is_lead_out());
+        assert_eq!(CueSheetTrack::CDDA_LEAD_OUT, 170);
+        assert_eq!(CueSheetTrack::NON_CDDA_LEAD_OUT, 255);
+        // A normal audio track number is not a lead-out.
+        assert!(!track(1, [0u8; 12]).is_lead_out());
+        assert!(!track(99, [0u8; 12]).is_lead_out());
+        assert!(!track(254, [0u8; 12]).is_lead_out());
+    }
+
+    #[test]
+    fn cuesheet_track_isrc_str_round_trips_printable() {
+        let t = track(2, *b"GBAYE0601477");
+        assert_eq!(t.isrc_str(), Some("GBAYE0601477"));
+    }
+
+    #[test]
+    fn cuesheet_track_isrc_str_absent_is_none() {
+        // All-zero ISRC is the spec's "absent" encoding.
+        assert_eq!(track(1, [0u8; 12]).isrc_str(), None);
+    }
+
+    #[test]
+    fn cuesheet_track_isrc_str_rejects_embedded_nul_and_nonprintable() {
+        // A field that is neither all-zero nor all-printable (embedded
+        // NUL mid-run, or a control byte) yields None — callers read the
+        // raw `isrc` bytes in that case.
+        let mut isrc = *b"GBAYE0601477";
+        isrc[5] = 0x00; // embedded NUL -> not all-zero, not all-printable
+        assert_eq!(track(1, isrc).isrc_str(), None);
+        let mut ctrl = *b"GBAYE0601477";
+        ctrl[0] = 0x07; // BEL control char
+        assert_eq!(track(1, ctrl).isrc_str(), None);
+        let mut hi = *b"GBAYE0601477";
+        hi[0] = 0x80; // high bit set
+        assert_eq!(track(1, hi).isrc_str(), None);
+    }
+
+    #[test]
+    fn cuesheet_media_catalog_returns_leading_printable_run() {
+        let cs = CueSheet {
+            media_catalog_number: {
+                let mut m = [0u8; 128];
+                m[..13].copy_from_slice(b"0123456789012");
+                m
+            },
+            lead_in_samples: 0,
+            is_cdda: true,
+            tracks: vec![lead_out(CueSheetTrack::CDDA_LEAD_OUT)],
+        };
+        assert_eq!(cs.media_catalog(), Some("0123456789012"));
+    }
+
+    #[test]
+    fn cuesheet_media_catalog_empty_is_none() {
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![lead_out(CueSheetTrack::NON_CDDA_LEAD_OUT)],
+        };
+        assert_eq!(cs.media_catalog(), None);
+    }
+
+    #[test]
+    fn cuesheet_media_catalog_rejects_nonprintable_leading_run() {
+        let cs = CueSheet {
+            media_catalog_number: {
+                let mut m = [0u8; 128];
+                m[..4].copy_from_slice(&[b'A', 0x07, b'C', b'D']); // BEL in run
+                m
+            },
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![lead_out(CueSheetTrack::NON_CDDA_LEAD_OUT)],
+        };
+        assert_eq!(cs.media_catalog(), None);
+    }
+
+    #[test]
+    fn cuesheet_media_catalog_round_trips_through_writer() {
+        // A catalog media_catalog() accepts must survive write + parse.
+        let cs_in = CueSheet {
+            media_catalog_number: {
+                let mut m = [0u8; 128];
+                m[..13].copy_from_slice(b"0123456789012");
+                m
+            },
+            lead_in_samples: 0,
+            is_cdda: true,
+            tracks: vec![lead_out(CueSheetTrack::CDDA_LEAD_OUT)],
+        };
+        let bytes = write_cuesheet(&cs_in).unwrap();
+        let cs_out = parse_cuesheet(&bytes).unwrap();
+        assert_eq!(cs_in.media_catalog(), cs_out.media_catalog());
+        assert_eq!(cs_out.media_catalog(), Some("0123456789012"));
+    }
+
+    #[test]
+    fn cuesheet_lead_out_and_playable_tracks() {
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: true,
+            tracks: vec![
+                track(1, [0u8; 12]),
+                track(2, *b"GBAYE0601477"),
+                lead_out(CueSheetTrack::CDDA_LEAD_OUT),
+            ],
+        };
+        // lead_out() is the trailing entry.
+        assert_eq!(cs.lead_out().map(|t| t.number), Some(170));
+        assert!(cs.lead_out().unwrap().is_lead_out());
+        // playable_tracks() drops the lead-out terminator.
+        let playable: Vec<u8> = cs.playable_tracks().map(|t| t.number).collect();
+        assert_eq!(playable, vec![1, 2]);
+    }
+
+    #[test]
+    fn cuesheet_playable_tracks_keeps_all_when_no_leadout_sentinel() {
+        // A hand-built cuesheet whose trailing track is NOT lead-out
+        // numbered: every track is playable.
+        let cs = CueSheet {
+            media_catalog_number: [0u8; 128],
+            lead_in_samples: 0,
+            is_cdda: false,
+            tracks: vec![track(1, [0u8; 12]), track(2, [0u8; 12])],
+        };
+        let playable: Vec<u8> = cs.playable_tracks().map(|t| t.number).collect();
+        assert_eq!(playable, vec![1, 2]);
+        assert_eq!(cs.lead_out().map(|t| t.number), Some(2));
+        assert!(!cs.lead_out().unwrap().is_lead_out());
     }
 
     #[test]
