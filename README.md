@@ -314,6 +314,36 @@ non-Subset):
   the parser's character-class check on every field name so a
   hand-constructed value cannot silently round-trip through a
   writer / parser pair that disagree on the rules.
+- **Typed metadata-chain parser + writer** *(r279)*:
+  `metadata::MetadataChain::parse` / `::write` (with
+  `parse_metadata_chain` / `write_metadata_chain` free-function
+  aliases) round-trip the **entire** metadata block chain — every
+  block between the `fLaC` marker and the first audio frame —
+  through a typed `MetadataBlock` enum that wraps the existing
+  per-block parsers / writers (`StreamInfo`, `Padding(len)`,
+  `Application`, `SeekTable { points, placeholder_count }`,
+  `VorbisComment`, `CueSheet`, `Picture`, and an opaque
+  `Reserved { code, payload }` for the §8.1 Table 2 codes 7..=126
+  which RFC 9639 §5 says a future format version may use — a chain
+  editor carries them through unmodified rather than dropping
+  them). Parse and write both enforce the chain-level structural
+  rules the per-block parsers cannot see, each a MUST in RFC 9639:
+  at least one block with STREAMINFO first (§8), no more than one
+  STREAMINFO (§8.2) / SEEKTABLE (§8.5) / VORBIS_COMMENT (§8.6), no
+  more than one each of picture types 1 and 2 (§8.8 Table 13 — the
+  invariant the `PictureType` taxonomy documented as chain-level in
+  r274), and the forbidden block-type 127 rejected anywhere (§8.1
+  Table 2). The `last` flag (§8.1) is managed by the chain itself:
+  the parser stops after the flagged block (reporting consumed
+  bytes so a caller knows where frames begin; trailing bytes are
+  untouched) and the writer flags exactly the final block, so a
+  hand-assembled chain cannot mis-place it. A SEEKTABLE's
+  placeholder tail is carried as a count so the re-written block
+  keeps its reserved on-wire size. The encoder's `extradata` is
+  exactly a chain without the marker and parses directly;
+  `MetadataChain::validate` is public for checking a hand-built
+  chain without serialising, and `stream_info()` returns the
+  mandatory first block's typed contents.
 
 ### CRC validators
 

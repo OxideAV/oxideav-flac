@@ -132,7 +132,7 @@ impl BlockHeader {
 }
 
 /// Parsed STREAMINFO block contents.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamInfo {
     pub min_block_size: u16,
     pub max_block_size: u16,
@@ -1755,6 +1755,379 @@ impl StreamInfo {
 /// the same way.
 pub fn write_streaminfo(info: &StreamInfo) -> Result<Vec<u8>> {
     info.write()
+}
+
+/// One typed metadata block in a FLAC metadata chain (RFC 9639 §8).
+///
+/// Each variant wraps the typed contents this module already
+/// parses / writes for the matching block kind, so a caller editing
+/// a metadata chain works entirely at the typed level and never
+/// touches the 4-byte block-header framing by hand:
+///
+/// * [`StreamInfo`](MetadataBlock::StreamInfo) — §8.2, via
+///   [`StreamInfo::parse`] / [`StreamInfo::write`];
+/// * [`Padding`](MetadataBlock::Padding) — §8.3, the payload byte
+///   count (the payload content is all-zero by definition, so the
+///   length is the only degree of freedom);
+/// * [`Application`](MetadataBlock::Application) — §8.4, via
+///   [`parse_application`] / [`write_application`];
+/// * [`SeekTable`](MetadataBlock::SeekTable) — §8.5, via
+///   [`parse_seektable`] / [`write_seektable`]. The placeholder
+///   count is carried alongside the real points so a table with a
+///   pre-reserved placeholder tail keeps its on-wire size across a
+///   parse / write cycle (the parser drops placeholder entries from
+///   the point list, as it must per §8.5.1);
+/// * [`VorbisComment`](MetadataBlock::VorbisComment) — §8.6, via
+///   [`parse_vorbis_comment`] / [`write_vorbis_comment`];
+/// * [`CueSheet`](MetadataBlock::CueSheet) — §8.7, via
+///   [`parse_cuesheet`] / [`write_cuesheet`];
+/// * [`Picture`](MetadataBlock::Picture) — §8.8, via
+///   [`parse_picture`] / [`write_picture`];
+/// * [`Reserved`](MetadataBlock::Reserved) — block-type codes
+///   7..=126, which §8.1 Table 2 reserves for future versions of the
+///   format. RFC 9639 §5 says future versions MAY use the reserved
+///   space without breaking older streams, so a chain editor MUST
+///   NOT destroy blocks it does not recognise: the payload is kept
+///   as opaque bytes and re-emitted unchanged.
+///
+/// Block-type code 127 has no variant: §8.1 Table 2 marks it
+/// forbidden (it would collide with the frame sync code), so
+/// [`MetadataChain::parse`] rejects it and the writer cannot be
+/// asked to produce it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetadataBlock {
+    /// STREAMINFO (§8.2) — the mandatory first block.
+    StreamInfo(StreamInfo),
+    /// PADDING (§8.3) — `len` zero bytes of reserved space.
+    Padding(u32),
+    /// APPLICATION (§8.4) — registered ID + opaque payload.
+    Application(Application),
+    /// SEEKTABLE (§8.5) — real seek points plus the number of
+    /// trailing placeholder entries (§8.5.1) the on-wire table
+    /// reserves for future insertions.
+    SeekTable {
+        /// Real (non-placeholder) seek points.
+        points: Vec<SeekPoint>,
+        /// Number of placeholder entries at the table's tail.
+        placeholder_count: usize,
+    },
+    /// VORBIS_COMMENT (§8.6) — vendor string + tag fields.
+    VorbisComment(VorbisComment),
+    /// CUESHEET (§8.7) — track / index-point structure.
+    CueSheet(CueSheet),
+    /// PICTURE (§8.8) — attached picture or picture URI.
+    Picture(Picture),
+    /// Reserved block-type codes 7..=126 (§8.1 Table 2), preserved
+    /// opaque so future-format blocks survive a chain rewrite.
+    Reserved {
+        /// The 7-bit block-type code (7..=126).
+        code: u8,
+        /// The unmodified block payload.
+        payload: Vec<u8>,
+    },
+}
+
+impl MetadataBlock {
+    /// The [`BlockType`] this block serialises under (§8.1 Table 2).
+    pub fn block_type(&self) -> BlockType {
+        match self {
+            Self::StreamInfo(_) => BlockType::StreamInfo,
+            Self::Padding(_) => BlockType::Padding,
+            Self::Application(_) => BlockType::Application,
+            Self::SeekTable { .. } => BlockType::SeekTable,
+            Self::VorbisComment(_) => BlockType::VorbisComment,
+            Self::CueSheet(_) => BlockType::CueSheet,
+            Self::Picture(_) => BlockType::Picture,
+            Self::Reserved { code, .. } => BlockType::Reserved(*code),
+        }
+    }
+
+    /// Serialise this block's **payload** (no 4-byte header) through
+    /// the matching typed writer. Each writer enforces its own
+    /// wire-format invariants; see [`write_seektable`],
+    /// [`write_cuesheet`], [`write_picture`],
+    /// [`write_vorbis_comment`], [`write_application`],
+    /// [`write_padding`], and [`StreamInfo::write`]. A `Reserved`
+    /// payload is returned unchanged after the 24-bit length-ceiling
+    /// check every other writer applies.
+    pub fn write_payload(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::StreamInfo(si) => si.write(),
+            Self::Padding(len) => write_padding(*len as usize),
+            Self::Application(app) => write_application(app),
+            Self::SeekTable {
+                points,
+                placeholder_count,
+            } => write_seektable(points, *placeholder_count),
+            Self::VorbisComment(vc) => write_vorbis_comment(vc),
+            Self::CueSheet(cs) => write_cuesheet(cs),
+            Self::Picture(pic) => write_picture(pic),
+            Self::Reserved { payload, .. } => {
+                if payload.len() > BlockHeader::MAX_LENGTH as usize {
+                    return Err(Error::invalid(format!(
+                        "FLAC reserved metadata block: payload size {} exceeds 24-bit \
+                         metadata length max ({})",
+                        payload.len(),
+                        BlockHeader::MAX_LENGTH
+                    )));
+                }
+                Ok(payload.clone())
+            }
+        }
+    }
+}
+
+/// A complete FLAC metadata block chain (RFC 9639 §8): every block
+/// between the `fLaC` stream marker and the first audio frame.
+///
+/// [`MetadataChain::parse`] / [`MetadataChain::write`] round-trip the
+/// chain through the typed [`MetadataBlock`] representation and both
+/// enforce the stream-level structural rules the per-block parsers
+/// cannot see, each a MUST in RFC 9639:
+///
+/// * §8: at least one metadata block is present and the first one is
+///   a streaminfo block;
+/// * §8.2: no more than one streaminfo block;
+/// * §8.5: no more than one seek table block;
+/// * §8.6: no more than one Vorbis comment block;
+/// * §8.8 Table 13: no more than one each of picture types 1 and 2
+///   (the 32×32 file icon and the general file icon);
+/// * §5 / §8.1 Table 2: block-type code 127 is forbidden anywhere in
+///   the chain;
+/// * §8.1: the `last` flag is set on exactly the final block — the
+///   parser stops after the flagged block and the writer places the
+///   flag itself, so a hand-assembled chain cannot mis-place it.
+///
+/// The chain bytes start at the first block **header** — i.e.
+/// immediately after the 4-byte [`FLAC_MAGIC`] in a native FLAC file,
+/// or byte 0 of the `extradata` this crate's encoder produces and its
+/// muxer consumes (extradata is exactly a metadata chain without the
+/// marker).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataChain {
+    /// The chain's blocks in stream order. Directly editable;
+    /// [`MetadataChain::write`] re-validates before emitting bytes.
+    pub blocks: Vec<MetadataBlock>,
+}
+
+impl MetadataChain {
+    /// Parse a metadata block chain starting at a block header (the
+    /// byte after the `fLaC` marker, or `extradata` byte 0).
+    ///
+    /// Walks block headers until the block with the `last` flag set
+    /// (§8.1), parsing each payload through its typed parser, then
+    /// validates the chain-level rules (see [`MetadataChain::validate`]).
+    /// Returns the chain plus the number of bytes consumed, so a
+    /// caller positioned at the start of a file body knows where the
+    /// first audio frame begins; trailing bytes after the last block
+    /// are not touched.
+    ///
+    /// Returns `Error::NeedMore` when the bytes run out before a
+    /// `last`-flagged block completes, and `Error::invalid` for the
+    /// forbidden block-type 127 (§8.1 Table 2), a payload its typed
+    /// parser rejects, or a chain-rule violation.
+    ///
+    /// Two §8.5.1 placeholder-tail notes: placeholder seek points are
+    /// represented as a count (not as points), and a spec-violating
+    /// table that interleaved placeholders mid-table parses to the
+    /// same count and re-writes with the placeholders moved to the
+    /// tail where they MUST occur. Similarly, a PADDING payload is
+    /// represented by its length alone: §8.3 defines the content as
+    /// all-zero bits, so a (non-conformant) producer's non-zero
+    /// padding bytes are not preserved and re-write as zeros.
+    pub fn parse(bytes: &[u8]) -> Result<(Self, usize)> {
+        let mut blocks = Vec::new();
+        let mut pos = 0usize;
+        loop {
+            if bytes.len() < pos + 4 {
+                return Err(Error::NeedMore);
+            }
+            let hdr = BlockHeader::parse(&bytes[pos..])?;
+            if hdr.block_type == BlockType::Invalid {
+                return Err(Error::invalid(
+                    "FLAC metadata chain: block-type code 127 is forbidden (RFC 9639 §8.1)",
+                ));
+            }
+            let start = pos + 4;
+            let end = start
+                .checked_add(hdr.length as usize)
+                .ok_or(Error::NeedMore)?;
+            if bytes.len() < end {
+                return Err(Error::NeedMore);
+            }
+            let payload = &bytes[start..end];
+            let block = match hdr.block_type {
+                BlockType::StreamInfo => MetadataBlock::StreamInfo(StreamInfo::parse(payload)?),
+                BlockType::Padding => MetadataBlock::Padding(hdr.length),
+                BlockType::Application => MetadataBlock::Application(parse_application(payload)?),
+                BlockType::SeekTable => {
+                    let points = parse_seektable(payload);
+                    // Entries the parser dropped were placeholders
+                    // (sentinel sample number, §8.5.1); a partial
+                    // trailing entry (length not a multiple of 18)
+                    // is ignored by the parser and not counted.
+                    let placeholder_count = payload.len() / 18 - points.len();
+                    MetadataBlock::SeekTable {
+                        points,
+                        placeholder_count,
+                    }
+                }
+                BlockType::VorbisComment => {
+                    MetadataBlock::VorbisComment(parse_vorbis_comment(payload)?)
+                }
+                BlockType::CueSheet => MetadataBlock::CueSheet(parse_cuesheet(payload)?),
+                BlockType::Picture => MetadataBlock::Picture(parse_picture(payload)?),
+                BlockType::Reserved(code) => MetadataBlock::Reserved {
+                    code,
+                    payload: payload.to_vec(),
+                },
+                BlockType::Invalid => unreachable!("rejected above"),
+            };
+            blocks.push(block);
+            pos = end;
+            if hdr.last {
+                break;
+            }
+        }
+        let chain = Self { blocks };
+        chain.validate()?;
+        Ok((chain, pos))
+    }
+
+    /// Validate the chain-level structural rules (each a MUST in
+    /// RFC 9639; see the type-level docs for the rule list). Called
+    /// by both [`MetadataChain::parse`] and [`MetadataChain::write`];
+    /// public so a caller assembling a chain by hand can check it
+    /// without serialising.
+    pub fn validate(&self) -> Result<()> {
+        // §8: "one or more metadata blocks MUST be present ... The
+        // first metadata block MUST be a streaminfo metadata block."
+        match self.blocks.first() {
+            None => {
+                return Err(Error::invalid(
+                    "FLAC metadata chain: at least one metadata block must be present \
+                     (RFC 9639 §8)",
+                ));
+            }
+            Some(MetadataBlock::StreamInfo(_)) => {}
+            Some(other) => {
+                return Err(Error::invalid(format!(
+                    "FLAC metadata chain: first block must be STREAMINFO (RFC 9639 §8), \
+                     got {:?}",
+                    other.block_type()
+                )));
+            }
+        }
+        let mut streaminfo = 0usize;
+        let mut seektables = 0usize;
+        let mut vorbis_comments = 0usize;
+        let mut icon_32 = 0usize; // picture type 1
+        let mut icon_other = 0usize; // picture type 2
+        for b in &self.blocks {
+            match b {
+                MetadataBlock::StreamInfo(_) => streaminfo += 1,
+                MetadataBlock::SeekTable { .. } => seektables += 1,
+                MetadataBlock::VorbisComment(_) => vorbis_comments += 1,
+                MetadataBlock::Picture(p) if p.picture_kind().is_unique_per_file() => {
+                    // Table 13 limits exactly two codes to one
+                    // occurrence per file: 1 (32×32 file icon) and
+                    // 2 (general file icon).
+                    if p.picture_type == 1 {
+                        icon_32 += 1;
+                    } else {
+                        icon_other += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if streaminfo > 1 {
+            return Err(Error::invalid(format!(
+                "FLAC metadata chain: no more than one STREAMINFO block (RFC 9639 §8.2), \
+                 got {streaminfo}"
+            )));
+        }
+        if seektables > 1 {
+            return Err(Error::invalid(format!(
+                "FLAC metadata chain: no more than one SEEKTABLE block (RFC 9639 §8.5), \
+                 got {seektables}"
+            )));
+        }
+        if vorbis_comments > 1 {
+            return Err(Error::invalid(format!(
+                "FLAC metadata chain: no more than one VORBIS_COMMENT block (RFC 9639 §8.6), \
+                 got {vorbis_comments}"
+            )));
+        }
+        if icon_32 > 1 || icon_other > 1 {
+            return Err(Error::invalid(format!(
+                "FLAC metadata chain: no more than one each of picture types 1 and 2 \
+                 (RFC 9639 §8.8 Table 13); got {icon_32} of type 1 and {icon_other} of type 2"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Serialise the chain back into on-wire bytes: each block's
+    /// 4-byte header (§8.1) followed by its payload, with the `last`
+    /// flag set on exactly the final block. Validates the chain-level
+    /// rules first (see [`MetadataChain::validate`]) and then defers
+    /// each payload to its typed writer, so every per-block invariant
+    /// those writers enforce applies here too.
+    ///
+    /// The output starts at the first block header — prepend
+    /// [`FLAC_MAGIC`] for a full native-FLAC stream prefix, or use it
+    /// directly as muxer `extradata`.
+    pub fn write(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut out = Vec::new();
+        let final_index = self.blocks.len() - 1;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let payload = block.write_payload()?;
+            let length = u32::try_from(payload.len()).map_err(|_| {
+                Error::invalid(format!(
+                    "FLAC metadata chain: block payload size {} exceeds 24-bit \
+                     metadata length max ({})",
+                    payload.len(),
+                    BlockHeader::MAX_LENGTH
+                ))
+            })?;
+            BlockHeader {
+                last: i == final_index,
+                block_type: block.block_type(),
+                length,
+            }
+            .write_into(&mut out)?;
+            out.extend_from_slice(&payload);
+        }
+        Ok(out)
+    }
+
+    /// The chain's STREAMINFO contents, when the first block is one
+    /// (always true for a chain [`MetadataChain::validate`] accepts;
+    /// `None` only for a hand-built chain that would fail validation).
+    pub fn stream_info(&self) -> Option<&StreamInfo> {
+        match self.blocks.first() {
+            Some(MetadataBlock::StreamInfo(si)) => Some(si),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a FLAC metadata block chain (RFC 9639 §8).
+///
+/// Free-function alias for [`MetadataChain::parse`] — kept for
+/// symmetry with the other top-level parsers in this module.
+pub fn parse_metadata_chain(bytes: &[u8]) -> Result<(MetadataChain, usize)> {
+    MetadataChain::parse(bytes)
+}
+
+/// Serialise a [`MetadataChain`] back into on-wire bytes.
+///
+/// Free-function alias for [`MetadataChain::write`] — kept for
+/// symmetry with the other top-level writers in this module.
+pub fn write_metadata_chain(chain: &MetadataChain) -> Result<Vec<u8>> {
+    chain.write()
 }
 
 #[cfg(test)]
@@ -3712,5 +4085,322 @@ mod tests {
         assert_eq!(back.bits_per_sample, StreamInfo::MAX_BPS);
         assert_eq!(back.total_samples, StreamInfo::MAX_TOTAL_SAMPLES);
         assert_eq!(back.md5, [0xFFu8; 16]);
+    }
+
+    // --- MetadataChain (RFC 9639 §8 chain-level rules) -----------------
+
+    fn chain_streaminfo() -> StreamInfo {
+        StreamInfo {
+            min_block_size: 4096,
+            max_block_size: 4096,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            total_samples: 44_100,
+            md5: [0u8; 16],
+        }
+    }
+
+    fn chain_picture(picture_type: u32) -> Picture {
+        Picture {
+            picture_type,
+            mime_type: "image/png".into(),
+            description: "cover".into(),
+            width: 32,
+            height: 32,
+            depth: 24,
+            colour_count: 0,
+            data: vec![0x89, 0x50, 0x4E, 0x47],
+        }
+    }
+
+    #[test]
+    fn metadata_chain_full_round_trip() {
+        // One of every defined block kind plus a reserved block, in a
+        // legal arrangement; write → parse must reproduce the chain
+        // and report consuming exactly the written byte count.
+        let chain = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::Application(Application {
+                    id: 0x4154_4348,
+                    data: vec![1, 2, 3],
+                }),
+                MetadataBlock::SeekTable {
+                    points: vec![
+                        SeekPoint {
+                            sample_number: 0,
+                            offset: 0,
+                            frame_samples: 4096,
+                        },
+                        SeekPoint {
+                            sample_number: 8192,
+                            offset: 4242,
+                            frame_samples: 4096,
+                        },
+                    ],
+                    placeholder_count: 3,
+                },
+                MetadataBlock::VorbisComment(VorbisComment {
+                    vendor: "oxideav-flac test".into(),
+                    comments: vec![("TITLE".into(), "chain".into())],
+                }),
+                MetadataBlock::Picture(chain_picture(3)),
+                MetadataBlock::Reserved {
+                    code: 42,
+                    payload: vec![0xAA, 0xBB],
+                },
+                MetadataBlock::Padding(64),
+            ],
+        };
+        let bytes = chain.write().expect("write");
+        let (back, consumed) = MetadataChain::parse(&bytes).expect("parse");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(back, chain);
+        // Second generation is byte-stable.
+        assert_eq!(back.write().expect("re-write"), bytes);
+        // The free-function aliases dispatch to the same paths.
+        let (back2, _) = parse_metadata_chain(&bytes).expect("alias parse");
+        assert_eq!(write_metadata_chain(&back2).expect("alias write"), bytes);
+        assert_eq!(back.stream_info(), Some(&chain_streaminfo()));
+    }
+
+    #[test]
+    fn metadata_chain_last_flag_on_final_block_only() {
+        let chain = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::Padding(8),
+                MetadataBlock::Padding(4),
+            ],
+        };
+        let bytes = chain.write().expect("write");
+        // Walk the three headers by hand: STREAMINFO(34), PADDING(8),
+        // PADDING(4). §8.1: high bit of byte 0 is the `last` flag.
+        assert_eq!(bytes[0] & 0x80, 0, "first block must not be last");
+        let second = 4 + 34;
+        assert_eq!(bytes[second] & 0x80, 0, "middle block must not be last");
+        let third = second + 4 + 8;
+        assert_ne!(bytes[third] & 0x80, 0, "final block must carry last flag");
+        assert_eq!(bytes.len(), third + 4 + 4);
+    }
+
+    #[test]
+    fn metadata_chain_trailing_bytes_left_untouched() {
+        let chain = MetadataChain {
+            blocks: vec![MetadataBlock::StreamInfo(chain_streaminfo())],
+        };
+        let mut bytes = chain.write().expect("write");
+        let chain_len = bytes.len();
+        bytes.extend_from_slice(&[0xFF, 0xF8, 0x00]); // pretend frame data
+        let (back, consumed) = MetadataChain::parse(&bytes).expect("parse");
+        assert_eq!(consumed, chain_len);
+        assert_eq!(back.blocks.len(), 1);
+    }
+
+    #[test]
+    fn metadata_chain_rejects_empty_and_wrong_first_block() {
+        // §8: at least one block, and the first MUST be STREAMINFO.
+        let empty = MetadataChain { blocks: vec![] };
+        assert!(empty.validate().is_err());
+        assert!(empty.write().is_err());
+        let padding_first = MetadataChain {
+            blocks: vec![
+                MetadataBlock::Padding(8),
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+            ],
+        };
+        assert!(padding_first.validate().is_err());
+        assert!(padding_first.write().is_err());
+        // Same rule on the parse side: a chain whose first block is
+        // PADDING parses block-wise but fails chain validation.
+        let mut bytes = Vec::new();
+        BlockHeader {
+            last: true,
+            block_type: BlockType::Padding,
+            length: 2,
+        }
+        .write_into(&mut bytes)
+        .unwrap();
+        bytes.extend_from_slice(&[0, 0]);
+        assert!(MetadataChain::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn metadata_chain_rejects_duplicate_singleton_blocks() {
+        // §8.2 / §8.5 / §8.6: at most one STREAMINFO / SEEKTABLE /
+        // VORBIS_COMMENT per stream.
+        let dup_streaminfo = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+            ],
+        };
+        assert!(dup_streaminfo.validate().is_err());
+        let seektable = MetadataBlock::SeekTable {
+            points: vec![],
+            placeholder_count: 1,
+        };
+        let dup_seektable = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                seektable.clone(),
+                seektable,
+            ],
+        };
+        assert!(dup_seektable.validate().is_err());
+        let vc = MetadataBlock::VorbisComment(VorbisComment::default());
+        let dup_vc = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                vc.clone(),
+                vc,
+            ],
+        };
+        assert!(dup_vc.validate().is_err());
+    }
+
+    #[test]
+    fn metadata_chain_picture_type_1_and_2_once_per_file() {
+        // §8.8 Table 13: at most one each of picture types 1 and 2;
+        // every other type may repeat freely.
+        for unique_type in [1u32, 2] {
+            let dup = MetadataChain {
+                blocks: vec![
+                    MetadataBlock::StreamInfo(chain_streaminfo()),
+                    MetadataBlock::Picture(chain_picture(unique_type)),
+                    MetadataBlock::Picture(chain_picture(unique_type)),
+                ],
+            };
+            assert!(dup.validate().is_err(), "type {unique_type} must be unique");
+        }
+        // One of each unique type together is fine, as are repeated
+        // non-unique types.
+        let ok = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::Picture(chain_picture(1)),
+                MetadataBlock::Picture(chain_picture(2)),
+                MetadataBlock::Picture(chain_picture(3)),
+                MetadataBlock::Picture(chain_picture(3)),
+            ],
+        };
+        assert!(ok.validate().is_ok());
+        let bytes = ok.write().expect("write");
+        assert_eq!(MetadataChain::parse(&bytes).expect("parse").0, ok);
+    }
+
+    #[test]
+    fn metadata_chain_parse_rejects_forbidden_type_127() {
+        // §8.1 Table 2: code 127 is forbidden (frame-sync collision).
+        // Header byte 0x7F = last:0 + type:127.
+        let bytes = [0x7Fu8, 0, 0, 0];
+        assert!(MetadataChain::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn metadata_chain_parse_needs_complete_last_flagged_block() {
+        let chain = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::Padding(16),
+            ],
+        };
+        let bytes = chain.write().expect("write");
+        // Truncations at every interesting boundary: mid-header,
+        // mid-payload, and exactly before the final block — all must
+        // report NeedMore rather than succeed or panic.
+        for cut in [0, 2, 4, 20, 4 + 34, 4 + 34 + 2, bytes.len() - 1] {
+            assert!(
+                matches!(MetadataChain::parse(&bytes[..cut]), Err(Error::NeedMore)),
+                "cut at {cut} must yield NeedMore"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_chain_seektable_placeholders_keep_block_size() {
+        // §8.5.1: placeholders reserve table space. The typed chain
+        // carries them as a count so the re-written block occupies the
+        // same number of bytes as the original.
+        let chain = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::SeekTable {
+                    points: vec![SeekPoint {
+                        sample_number: 0,
+                        offset: 0,
+                        frame_samples: 4096,
+                    }],
+                    placeholder_count: 7,
+                },
+            ],
+        };
+        let bytes = chain.write().expect("write");
+        let (back, _) = MetadataChain::parse(&bytes).expect("parse");
+        assert_eq!(
+            back.blocks[1],
+            MetadataBlock::SeekTable {
+                points: vec![SeekPoint {
+                    sample_number: 0,
+                    offset: 0,
+                    frame_samples: 4096,
+                }],
+                placeholder_count: 7,
+            }
+        );
+        assert_eq!(back.write().expect("re-write").len(), bytes.len());
+    }
+
+    #[test]
+    fn metadata_chain_parses_encoder_extradata() {
+        // The encoder's extradata is a metadata chain without the
+        // fLaC marker; the chain parser must accept it directly.
+        use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+        let mut params = CodecParameters::audio(CodecId::new("flac"));
+        params.channels = Some(1);
+        params.sample_rate = Some(8_000);
+        params.sample_format = Some(SampleFormat::S16);
+        let enc = crate::encoder::make_encoder(&params).expect("encoder");
+        let extradata = enc.output_params().extradata.clone();
+        let (chain, consumed) = MetadataChain::parse(&extradata).expect("parse extradata");
+        assert_eq!(consumed, extradata.len());
+        let si = chain.stream_info().expect("streaminfo first");
+        assert_eq!(si.channels, 1);
+        assert_eq!(si.sample_rate, 8_000);
+        assert_eq!(si.bits_per_sample, 16);
+    }
+
+    #[test]
+    fn metadata_chain_reserved_block_payload_survives_round_trip() {
+        // RFC 9639 §5: future versions may use reserved space; a chain
+        // editor must carry unknown blocks through unchanged.
+        let chain = MetadataChain {
+            blocks: vec![
+                MetadataBlock::StreamInfo(chain_streaminfo()),
+                MetadataBlock::Reserved {
+                    code: 126,
+                    payload: (0u8..=255).collect(),
+                },
+            ],
+        };
+        let bytes = chain.write().expect("write");
+        let (back, _) = MetadataChain::parse(&bytes).expect("parse");
+        assert_eq!(back, chain);
+        // The forbidden / out-of-range codes are unwritable.
+        for bad_code in [127u8, 128, 200] {
+            let bad = MetadataChain {
+                blocks: vec![
+                    MetadataBlock::StreamInfo(chain_streaminfo()),
+                    MetadataBlock::Reserved {
+                        code: bad_code,
+                        payload: vec![],
+                    },
+                ],
+            };
+            assert!(bad.write().is_err(), "code {bad_code} must not serialise");
+        }
     }
 }

@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- metadata: round-279 typed metadata-chain parser + writer
+  (RFC 9639 §8 / §8.1 / §8.2 / §8.5 / §8.6 / §8.8 Table 13). Every
+  individual block kind already had a typed parse / write pair, but
+  nothing owned the chain level: callers (and our own demuxer, muxer
+  and fuzz harness) each re-implemented the header walk, and none of
+  the spec's *stream-level* MUSTs had an enforcement point. The new
+  `MetadataBlock` enum wraps the existing typed contents per kind —
+  `StreamInfo`, `Padding(len)`, `Application`,
+  `SeekTable { points, placeholder_count }`, `VorbisComment`,
+  `CueSheet`, `Picture`, plus an opaque `Reserved { code, payload }`
+  for table-2 codes 7..=126 (RFC 9639 §5 reserves that space for
+  future format versions, so a chain editor must carry unknown
+  blocks through unchanged, not drop them) — and
+  `MetadataChain::parse` / `::write` (free-function aliases
+  `parse_metadata_chain` / `write_metadata_chain`) round-trip the
+  whole chain. Both directions enforce the chain-level rules: at
+  least one block and STREAMINFO first (§8), at most one STREAMINFO
+  (§8.2), at most one SEEKTABLE (§8.5), at most one VORBIS_COMMENT
+  (§8.6), at most one each of picture types 1 and 2 (§8.8 Table 13 —
+  closing the invariant the r274 `PictureType` taxonomy explicitly
+  deferred to the chain level), and block-type 127 forbidden
+  anywhere (§8.1 Table 2 / §5 forbidden-patterns list). The §8.1
+  `last` flag is owned by the chain: the parser stops at the flagged
+  block and reports bytes consumed (so callers know where audio
+  frames begin; trailing bytes untouched, truncation surfaces as
+  `Error::NeedMore` at every boundary), and the writer sets the flag
+  on exactly the final block. A SEEKTABLE placeholder tail (§8.5.1)
+  is carried as a count so a parse / write cycle keeps the block's
+  reserved on-wire size; a (non-conformant) mid-table placeholder
+  re-writes at the tail where the spec requires it, and PADDING is
+  carried as its length (its content is all-zero by §8.3
+  definition). `MetadataChain::validate` is public for checking a
+  hand-assembled chain without serialising; `stream_info()` returns
+  the mandatory first block. The encoder's `extradata` is exactly a
+  marker-less chain and parses directly (regression-tested).
+  `StreamInfo` additionally gains `PartialEq` / `Eq` so chains are
+  comparable. 11 new unit tests: full eight-block write→parse→write
+  byte-stability, last-flag placement, trailing-byte tolerance,
+  empty / wrong-first-block rejection on both directions, all three
+  singleton-block duplicates, picture-type-1/2 multiplicity (and
+  repeated non-unique types accepted), forbidden type 127 on parse,
+  a seven-boundary truncation sweep yielding `NeedMore`,
+  placeholder-tail size stability, encoder-extradata parse, and
+  reserved-block opacity + unwritable-code rejection (127, 128, 200).
 - metadata: round-274 typed PICTURE picture-type taxonomy + URI
   accessors (RFC 9639 §8.8 / Table 13). The `Picture` struct stored
   `picture_type` only as a raw `u32`, leaving callers to memorise the
