@@ -373,6 +373,10 @@ impl CueSheet {
 ///
 /// Returns `Error::invalid` when:
 ///   * payload is shorter than the 396-byte fixed prefix,
+///   * the media catalog number's leading run (up to the first NUL)
+///     contains a byte outside printable ASCII `0x20..=0x7E`
+///     (RFC 9639 §8.7; mirrors the [`write_cuesheet`] check so every
+///     accepted block re-writes cleanly through its own writer),
 ///   * any reserved bit/byte is non-zero,
 ///   * the declared track count would consume more bytes than the
 ///     payload contains,
@@ -390,6 +394,26 @@ pub fn parse_cuesheet(bytes: &[u8]) -> Result<CueSheet> {
     }
     let mut media_catalog_number = [0u8; 128];
     media_catalog_number.copy_from_slice(&bytes[0..128]);
+    // RFC 9639 §8.7: "Media catalog number in ASCII printable
+    // characters 0x20-0x7E", right-padded with 0x00 when shorter
+    // than 128 bytes. Enforce the printable rule on the leading run
+    // (up to the first NUL) — exactly the check `write_cuesheet`
+    // applies — so every CUESHEET this parser accepts can be
+    // re-emitted by its own writer. Without this the chain-level
+    // round-trip breaks: `MetadataChain::parse` would accept a
+    // block that `MetadataChain::write` then refuses.
+    let catalog_leading = media_catalog_number
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(media_catalog_number.len());
+    for &b in &media_catalog_number[..catalog_leading] {
+        if !(0x20..=0x7E).contains(&b) {
+            return Err(Error::invalid(format!(
+                "FLAC CUESHEET: media catalog byte 0x{b:02X} outside printable \
+                 ASCII range 0x20..=0x7E (RFC 9639 §8.7)"
+            )));
+        }
+    }
     let lead_in_samples = u64::from_be_bytes(bytes[128..136].try_into().expect("8 bytes"));
     let flags = bytes[136];
     if flags & 0x7F != 0 {
@@ -1931,7 +1955,11 @@ impl MetadataChain {
     /// represented as a count (not as points), and a spec-violating
     /// table that interleaved placeholders mid-table parses to the
     /// same count and re-writes with the placeholders moved to the
-    /// tail where they MUST occur. Similarly, a PADDING payload is
+    /// tail where they MUST occur. Real seek points that are not
+    /// strictly ascending by sample number are rejected outright
+    /// (§8.5.1 sorted + unique MUSTs — the same rules
+    /// [`write_seektable`] enforces, so every accepted chain can
+    /// re-write). Similarly, a PADDING payload is
     /// represented by its length alone: §8.3 defines the content as
     /// all-zero bits, so a (non-conformant) producer's non-zero
     /// padding bytes are not preserved and re-write as zeros.
@@ -1962,6 +1990,27 @@ impl MetadataChain {
                 BlockType::Application => MetadataBlock::Application(parse_application(payload)?),
                 BlockType::SeekTable => {
                     let points = parse_seektable(payload);
+                    // §8.5.1: "Seek points within a table MUST be
+                    // sorted in ascending order by sample number"
+                    // and "MUST be unique by sample number, with the
+                    // exception of placeholder points". The
+                    // block-level `parse_seektable` has no error
+                    // channel (it returns a bare `Vec` and tolerates
+                    // wire-order quirks), but the typed chain must
+                    // reject a violating table here: `write_seektable`
+                    // enforces both MUSTs, so accepting the block
+                    // would produce a chain that parses Ok yet fails
+                    // its own `write` — breaking the parse/write
+                    // round-trip contract this type documents.
+                    if points
+                        .windows(2)
+                        .any(|p| p[0].sample_number >= p[1].sample_number)
+                    {
+                        return Err(Error::invalid(
+                            "FLAC metadata chain: SEEKTABLE seek points must be strictly \
+                             ascending by sample number (RFC 9639 §8.5.1)",
+                        ));
+                    }
                     // Entries the parser dropped were placeholders
                     // (sentinel sample number, §8.5.1); a partial
                     // trailing entry (length not a multiple of 18)
@@ -4352,6 +4401,129 @@ mod tests {
             }
         );
         assert_eq!(back.write().expect("re-write").len(), bytes.len());
+    }
+
+    /// Serialise a typed chain by hand (header + payload per block,
+    /// `last` on the final one) WITHOUT going through
+    /// `MetadataChain::write`, so parser-side rejection tests aren't
+    /// circular with the writer's own validation.
+    fn assemble_chain_bytes(blocks: &[MetadataBlock]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            let payload = b.write_payload().expect("payload");
+            BlockHeader {
+                last: i + 1 == blocks.len(),
+                block_type: b.block_type(),
+                length: payload.len() as u32,
+            }
+            .write_into(&mut out)
+            .expect("header");
+            out.extend_from_slice(&payload);
+        }
+        out
+    }
+
+    #[test]
+    fn cuesheet_parser_rejects_nonprintable_catalog_byte() {
+        // Fuzz regression (r283 `metadata_chain` target): the parser
+        // accepted a media catalog number whose leading run carried a
+        // non-printable byte, but `write_cuesheet` rejects exactly
+        // that — so a parsed CUESHEET could fail its own re-write.
+        // RFC 9639 §8.7 requires printable ASCII 0x20..=0x7E; the
+        // parser now mirrors the writer's check.
+        let good = synth_cuesheet(b"1234567890123", false, &[(0, 255, 0)]);
+        assert!(parse_cuesheet(&good).is_ok());
+
+        let mut bad = good.clone();
+        bad[0] = 0x01; // non-printable byte in the leading run
+        assert!(
+            parse_cuesheet(&bad).is_err(),
+            "non-printable catalog byte must be rejected at parse time"
+        );
+
+        // Bytes after the first NUL terminator are right-padding
+        // (§8.7) and stay outside the check — exactly the leniency
+        // boundary `write_cuesheet` applies, so parse/write stay
+        // symmetric.
+        let mut padded = good.clone();
+        padded[13] = 0x00;
+        padded[14] = 0x01; // garbage after the terminator
+        let cs = parse_cuesheet(&padded).expect("post-NUL bytes are padding, not catalog");
+        let rewritten = write_cuesheet(&cs).expect("parser-accepted block must re-write");
+        assert_eq!(parse_cuesheet(&rewritten).expect("re-parse"), cs);
+    }
+
+    #[test]
+    fn metadata_chain_rejects_unsorted_seektable_points() {
+        // Fuzz regression (r283 `metadata_chain` target): §8.5.1 says
+        // seek points MUST be sorted ascending and unique by sample
+        // number. `parse_seektable` has no error channel, so the chain
+        // parser accepted an out-of-order table that `write_seektable`
+        // (and therefore `MetadataChain::write`) then refused —
+        // breaking the parse-Ok ⇒ write-Ok contract.
+        let si = MetadataBlock::StreamInfo(chain_streaminfo());
+        let point = |n: u64| SeekPoint {
+            sample_number: n,
+            offset: n * 2,
+            frame_samples: 4096,
+        };
+        let table_payload = |numbers: &[u64]| -> Vec<u8> {
+            let mut p = Vec::new();
+            for &n in numbers {
+                p.extend_from_slice(&point(n).sample_number.to_be_bytes());
+                p.extend_from_slice(&point(n).offset.to_be_bytes());
+                p.extend_from_slice(&point(n).frame_samples.to_be_bytes());
+            }
+            p
+        };
+        let chain_with_table = |numbers: &[u64]| -> Vec<u8> {
+            let mut out = assemble_chain_bytes(std::slice::from_ref(&si));
+            out[0] &= 0x7F; // clear `last` on STREAMINFO
+            let payload = table_payload(numbers);
+            BlockHeader {
+                last: true,
+                block_type: BlockType::SeekTable,
+                length: payload.len() as u32,
+            }
+            .write_into(&mut out)
+            .expect("header");
+            out.extend_from_slice(&payload);
+            out
+        };
+
+        // Descending order: must be rejected.
+        assert!(MetadataChain::parse(&chain_with_table(&[8192, 0])).is_err());
+        // Duplicate sample number: must be rejected (uniqueness MUST).
+        assert!(MetadataChain::parse(&chain_with_table(&[0, 0])).is_err());
+        // Strictly ascending: accepted, and the accepted chain must
+        // survive its own write + re-parse.
+        let (chain, consumed) =
+            MetadataChain::parse(&chain_with_table(&[0, 4096, 8192])).expect("sorted table");
+        assert_eq!(consumed, chain_with_table(&[0, 4096, 8192]).len());
+        let rewritten = chain.write().expect("parse-Ok chain must re-write");
+        let (back, _) = MetadataChain::parse(&rewritten).expect("re-parse");
+        assert_eq!(back, chain);
+    }
+
+    #[test]
+    fn metadata_chain_rejects_cuesheet_with_nonprintable_catalog() {
+        // Chain-level pin for the same r283 finding: the whole-chain
+        // parser must surface the §8.7 catalog rule so a parsed chain
+        // can always be re-written.
+        let si = MetadataBlock::StreamInfo(chain_streaminfo());
+        let mut out = assemble_chain_bytes(std::slice::from_ref(&si));
+        out[0] &= 0x7F; // clear `last` on STREAMINFO
+        let mut payload = synth_cuesheet(b"CATALOG", false, &[(0, 255, 0)]);
+        payload[0] = 0x07; // non-printable leading catalog byte
+        BlockHeader {
+            last: true,
+            block_type: BlockType::CueSheet,
+            length: payload.len() as u32,
+        }
+        .write_into(&mut out)
+        .expect("header");
+        out.extend_from_slice(&payload);
+        assert!(MetadataChain::parse(&out).is_err());
     }
 
     #[test]

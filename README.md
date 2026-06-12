@@ -370,7 +370,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries nine `cargo-fuzz` targets that all share the same
+`fuzz/` carries ten `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -477,6 +477,29 @@ on malformed input, never panic, abort, or OOM:
   whose tuple disagrees with STREAMINFO. Finally, the raw input
   is fed to `parse_frame_header` at four sliding offsets for
   panic-freedom on hand-crafted bytes.
+- **`metadata_chain`** *(r283)* — whole-chain `MetadataChain`
+  parse/write round-trip with a structure-preserving mutation
+  oracle. The typed chain API (r279) owns RFC 9639 §8's
+  *stream-level* MUSTs (STREAMINFO first, singleton STREAMINFO /
+  SEEKTABLE / VORBIS_COMMENT, at most one each of picture types 1
+  and 2 per Table 13, forbidden block-type 127, `last`-flag
+  placement) — none of which `metadata_walker` (which predates the
+  API) can reach. Three phases per iteration: raw bytes into
+  `MetadataChain::parse` asserting the full parse-Ok ⇒ validate-Ok
+  ⇒ write-Ok ⇒ equal-re-parse ⇒ byte-stable-re-write contract; a
+  typed-chain synthesizer (writer-acceptable field values,
+  fuzzer-controlled chain *shape*) checked against an independent
+  re-statement of the §8 rules, with invalid shapes refused by both
+  writer and parser; and structure-preserving mutations of the
+  valid wire image (`last`-flag truncation with a typed-prefix
+  oracle, forbidden-127 header rewrite, §8.3 PADDING scrub-to-zero
+  oracle, arbitrary single-byte XOR). Landed with two contract
+  fixes it motivated: `parse_cuesheet` now enforces the §8.7
+  printable-ASCII media-catalog rule its own writer applies, and
+  `MetadataChain::parse` rejects SEEKTABLE points violating the
+  §8.5.1 sorted/unique MUSTs `write_seektable` enforces — both were
+  parse-accepts/write-refuses divergences that broke the chain
+  rewrite contract.
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the

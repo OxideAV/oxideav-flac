@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- metadata: two round-283 parse-accepts/write-refuses contract
+  divergences surfaced while building the `metadata_chain` fuzz
+  target, both breaking the chain rewrite (read → edit → re-emit)
+  path the r279 `MetadataChain` API promises:
+  - `parse_cuesheet` accepted a media catalog number whose leading
+    run (up to the first NUL) contained non-printable bytes, while
+    `write_cuesheet` refuses exactly those bytes — RFC 9639 §8.7
+    requires printable ASCII `0x20..=0x7E`. The parser now applies
+    the writer's check, so every CUESHEET it accepts can be
+    re-emitted. Post-NUL right-padding bytes remain outside the
+    check on both sides (§8.7 defines them as padding).
+  - `MetadataChain::parse` accepted SEEKTABLE blocks whose real
+    seek points violate the RFC 9639 §8.5.1 sorted-ascending /
+    unique-by-sample-number MUSTs that `write_seektable` (and
+    therefore `MetadataChain::write`) enforces. The chain parser
+    now rejects such tables; the block-level `parse_seektable`
+    keeps its lenient no-error-channel signature unchanged.
+
+  Both pinned by unit regressions
+  (`cuesheet_parser_rejects_nonprintable_catalog_byte`,
+  `metadata_chain_rejects_unsorted_seektable_points`,
+  `metadata_chain_rejects_cuesheet_with_nonprintable_catalog`).
+
 ### Added
 
+- fuzz: round-283 `metadata_chain` target (target 10) — whole-chain
+  `MetadataChain::parse` / `::write` round-trip under a
+  structure-preserving mutation oracle. Three phases per iteration:
+  raw bytes asserting parse-Ok ⇒ validate-Ok ⇒ write-Ok ⇒
+  equal-re-parse ⇒ byte-stable-re-write; a typed-chain synthesizer
+  with writer-acceptable field values but fuzzer-controlled chain
+  shape, checked against an independent re-statement of the §8
+  stream-level rules (invalid shapes must be refused by both writer
+  and parser); and wire-image mutations with exact oracles —
+  `last`-flag promotion (typed-prefix truncation), forbidden
+  block-type 127 rewrite, PADDING-content corruption (§8.3
+  scrub-to-zero), arbitrary single-byte XOR. Daily fuzz workflow
+  budget re-split across the ten targets.
 - metadata: round-279 typed metadata-chain parser + writer
   (RFC 9639 §8 / §8.1 / §8.2 / §8.5 / §8.6 / §8.8 Table 13). Every
   individual block kind already had a typed parse / write pair, but

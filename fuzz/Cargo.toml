@@ -196,3 +196,32 @@ name = "frame_header"
 path = "fuzz_targets/frame_header.rs"
 test = false
 doc = false
+
+# Target 10 (round 283): whole-chain `MetadataChain` parse / write
+# round-trip with a structure-preserving mutation oracle. The typed
+# chain API (r279) owns RFC 9639 §8's *stream-level* MUSTs —
+# STREAMINFO first, singleton STREAMINFO / SEEKTABLE /
+# VORBIS_COMMENT, at most one each of picture types 1 and 2
+# (Table 13), forbidden block-type 127, `last`-flag placement —
+# none of which `metadata_walker` (which predates the API) can see.
+# Three phases per iteration: (1) raw bytes into
+# `MetadataChain::parse` with the full parse-Ok ⇒ validate-Ok ⇒
+# write-Ok ⇒ equal-re-parse ⇒ byte-stable-re-write contract;
+# (2) a typed-chain synthesizer whose field values are always
+# writer-acceptable but whose chain *shape* is fuzzer-controlled,
+# checked against an independent re-statement of the §8 rules —
+# valid shapes must round-trip, invalid shapes must be refused by
+# BOTH the writer and the parser (via hand-assembled wire bytes);
+# (3) structure-preserving mutations of the valid wire image —
+# `last`-flag truncation (typed-prefix oracle), forbidden-127
+# header rewrite, PADDING-content corruption (§8.3 scrub-to-zero
+# oracle), and arbitrary single-byte XOR. Shipped alongside two
+# fixes it motivated: `parse_cuesheet` now enforces the §8.7
+# printable-ASCII media-catalog rule its own writer applies, and
+# `MetadataChain::parse` now rejects SEEKTABLE points violating
+# the §8.5.1 sorted/unique MUSTs `write_seektable` enforces.
+[[bin]]
+name = "metadata_chain"
+path = "fuzz_targets/metadata_chain.rs"
+test = false
+doc = false
