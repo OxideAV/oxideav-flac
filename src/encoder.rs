@@ -294,6 +294,24 @@ pub fn make_encoder_with_options(
     if !(1..=8).contains(&channels) {
         return Err(Error::invalid("FLAC encoder: channels must be 1..=8"));
     }
+    // RFC 9639 §8.2: the STREAMINFO sample-rate field is 20 bits
+    // wide, and "the sample rate MUST NOT be 0 when the FLAC file
+    // contains audio". Frame headers fall back to sample-rate code
+    // 0b0000 ("get from STREAMINFO") for rates without a direct or
+    // escape coding, so the STREAMINFO ceiling is the binding bound
+    // at construction. Daily-fuzz regression (`encoder_options`
+    // harness, 2026-06-11 run): `sample_rate == u32::MAX` previously
+    // flowed unchecked into the STREAMINFO writer inside
+    // `build_extradata`, whose bounds check was consumed by an
+    // `expect` — panicking instead of returning the `Err` the
+    // constructor contract promises.
+    if sample_rate == 0 || sample_rate > StreamInfo::MAX_SAMPLE_RATE {
+        return Err(Error::invalid(format!(
+            "FLAC encoder: sample_rate {} outside spec range 1..={} (RFC 9639 §8.2)",
+            sample_rate,
+            StreamInfo::MAX_SAMPLE_RATE
+        )));
+    }
     // Validate padding length up front so the failure point is
     // construction, not the first call to `flush`.
     if let Some(n) = options.padding_bytes {
@@ -381,7 +399,17 @@ fn build_streaminfo_metadata_block(
         sample_rate,
         channels,
         bits_per_sample: bps,
-        total_samples,
+        // §8.2: the 36-bit total-samples field reserves 0 as the
+        // "unknown" sentinel. A stream longer than 2^36 − 1 samples
+        // cannot be represented, so degrade to "unknown" instead of
+        // tripping the writer's bounds check at flush time (every
+        // other field is constructor-validated or physically bounded
+        // below its wire width).
+        total_samples: if total_samples > StreamInfo::MAX_TOTAL_SAMPLES {
+            0
+        } else {
+            total_samples
+        },
         md5: *md5,
     };
     let payload = info
@@ -3444,6 +3472,31 @@ mod tests {
             msg.contains("padding_bytes") && msg.contains("24-bit"),
             "error message should mention padding_bytes and the 24-bit cap: {msg}"
         );
+    }
+
+    #[test]
+    fn make_encoder_rejects_out_of_range_sample_rate() {
+        // Daily-fuzz regression (`encoder_options` harness,
+        // 2026-06-11 run): sample_rate == u32::MAX flowed unchecked
+        // into the STREAMINFO writer inside `build_extradata` and
+        // panicked through an `expect` instead of returning `Err`.
+        // RFC 9639 §8.2: the field is 20 bits and MUST NOT be 0 when
+        // the file contains audio.
+        for bad in [0u32, StreamInfo::MAX_SAMPLE_RATE + 1, u32::MAX] {
+            let p = build_audio_params(2, bad, SampleFormat::S16);
+            assert!(
+                make_encoder(&p).is_err(),
+                "sample_rate {bad} must be rejected at construction time"
+            );
+        }
+        // 1 Hz and the 20-bit ceiling are both inside the spec range.
+        for good in [1u32, StreamInfo::MAX_SAMPLE_RATE] {
+            let p = build_audio_params(2, good, SampleFormat::S16);
+            assert!(
+                make_encoder(&p).is_ok(),
+                "sample_rate {good} is spec-legal and must construct"
+            );
+        }
     }
 
     #[test]

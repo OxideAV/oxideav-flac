@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- encoder: `make_encoder` / `make_encoder_with_options` panicked
+  (instead of returning `Err`) when `CodecParameters::sample_rate`
+  was 0 or above the RFC 9639 §8.2 20-bit STREAMINFO ceiling
+  (1_048_575) — the unvalidated rate flowed into the STREAMINFO
+  writer inside `build_extradata`, whose bounds check was consumed
+  by an `expect`. Found by the daily `encoder_options` fuzz run
+  (2026-06-11, `sample_rate == u32::MAX` arm); the constructor now
+  rejects out-of-range rates up front
+  (`make_encoder_rejects_out_of_range_sample_rate` regression).
+  Flush-time STREAMINFO rebuilds additionally degrade a
+  total-sample count above the 36-bit field to the §8.2 "unknown"
+  sentinel (0) instead of being able to trip the same writer check.
+
 - metadata: two round-283 parse-accepts/write-refuses contract
   divergences surfaced while building the `metadata_chain` fuzz
   target, both breaking the chain rewrite (read → edit → re-emit)
