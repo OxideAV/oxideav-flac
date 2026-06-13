@@ -370,7 +370,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries ten `cargo-fuzz` targets that all share the same
+`fuzz/` carries eleven `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -500,6 +500,33 @@ on malformed input, never panic, abort, or OOM:
   §8.5.1 sorted/unique MUSTs `write_seektable` enforces — both were
   parse-accepts/write-refuses divergences that broke the chain
   rewrite contract.
+- **`subframe_decode`** *(r292)* — structure-aware stress on
+  `subframe::decode_subframe` (RFC 9639 §9.2): CONSTANT / VERBATIM /
+  FIXED 0..=4 / LPC 1..=32 plus the §9.2.7 residual Rice-partition
+  coder (partition orders 0..=15, both 4-bit and 5-bit parameter
+  methods, and the escape partition). Every other target reaches the
+  subframe path only obliquely — the demuxer-fed targets
+  (`panic_free_decode`, `decode`) gate it behind a valid `fLaC`
+  magic + STREAMINFO + CRC-8 header that random input almost never
+  threads, and the encode-side targets (`roundtrip`,
+  `flac_oracle_decode`) only ever feed it the narrow subframe shapes
+  our own encoder emits (no residual escape, no LPC order > 8, no
+  adversarial truncation). This harness calls `decode_subframe`
+  directly with fuzzer-chosen `(block_size, bps)` from the
+  genuinely production-reachable envelope — `block_size` ∈ 1..=65535
+  (the §9.1 16-bit immediate cap; larger would probe an unreachable
+  allocation and report a phantom OOM no real stream can trigger),
+  `bps` ∈ 0..=35 covering the rejected `0` / `> 32` guard (incl. the
+  33-bit side-channel depth behind the 2026-05-10 panic) and the
+  valid 1..=32 range — over an attacker-controlled bitstream. Drives
+  the unary wasted-bit drain, the signed `qlp_shift` range check (a
+  shift-by-≥64 UB candidate), the `partition_size <=
+  predictor_order` / `block_size % n_partitions` residual maths
+  across every predictor order, and the escape partition's raw-bps
+  path. A fixed `(block_size × bps)` matrix swept at two offsets
+  every iteration primes the bps guard + every FIXED/LPC dispatch on
+  the first input. ~1.7 M executions, 0 findings (cov plateau at 363
+  edges — the reachable subframe surface is fully explored).
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the

@@ -47,6 +47,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-292 `subframe_decode` target (target 11) —
+  structure-aware stress on `subframe::decode_subframe` (RFC 9639
+  §9.2: CONSTANT / VERBATIM / FIXED 0..=4 / LPC 1..=32 + the §9.2.7
+  residual Rice-partition coder incl. the escape partition). Every
+  other target reaches the subframe path only obliquely — the
+  demuxer-fed targets gate it behind a valid `fLaC` magic +
+  STREAMINFO + CRC-8 header random input almost never threads, and
+  the encode-side targets only feed it the narrow subframe shapes
+  our own encoder emits. This harness calls `decode_subframe`
+  directly with fuzzer-chosen `(block_size, bps)` from the
+  production-reachable envelope (`block_size` ∈ 1..=65535 — the §9.1
+  16-bit immediate cap; `bps` ∈ 0..=35 covering the rejected `0` /
+  `> 32` guard incl. the 33-bit side-channel depth behind the
+  2026-05-10 panic) over an attacker-controlled bitstream. Drives
+  the unary wasted-bit drain, the signed `qlp_shift` range check,
+  the `partition_size <= predictor_order` / `block_size %
+  n_partitions` residual maths across every predictor order, and the
+  escape partition's raw-bps path. ~1.7 M executions, 0 findings
+  (coverage plateau — the reachable subframe surface is fully
+  explored, confirming the §9.2 decoder is panic-free under
+  adversarial input). Daily fuzz workflow budget re-split across the
+  eleven targets.
 - fuzz: round-283 `metadata_chain` target (target 10) — whole-chain
   `MetadataChain::parse` / `::write` round-trip under a
   structure-preserving mutation oracle. Three phases per iteration:

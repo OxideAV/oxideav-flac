@@ -225,3 +225,33 @@ name = "metadata_chain"
 path = "fuzz_targets/metadata_chain.rs"
 test = false
 doc = false
+
+# Target 11 (round 292): structure-aware stress on
+# `oxideav_flac::subframe::decode_subframe` — the RFC 9639 §9.2 subframe
+# decoder (CONSTANT / VERBATIM / FIXED 0..=4 / LPC 1..=32 + the §9.2.7
+# residual Rice-partition coder incl. the escape partition). Every prior
+# target reaches the subframe path only obliquely: the demuxer-fed targets
+# (`panic_free_decode`, `decode`) gate it behind a valid `fLaC` magic +
+# STREAMINFO + CRC-8 header that random input almost never threads, and the
+# encode-side targets (`roundtrip`, `flac_oracle_decode`) only ever feed it
+# the narrow subframe shapes our own encoder emits (no residual escape, no
+# LPC order > 8, no adversarial truncation). This harness calls
+# `decode_subframe` directly with fuzzer-chosen `(block_size, bps)` pulled
+# from the genuinely production-reachable envelope — `block_size` ∈
+# 1..=65535 (the §9.1 16-bit immediate cap; larger would probe an
+# unreachable allocation and report a phantom OOM), `bps` ∈ 0..=35 covering
+# the rejected 0 / >32 guard (incl. the 33-bit side-channel depth that was
+# the 2026-05-10 panic) and the valid 1..=32 range — over an
+# attacker-controlled bitstream. Drives the unary wasted-bit drain, the
+# signed `qlp_shift` range check (shift-by-≥64 UB candidate), the
+# `partition_size <= predictor_order` / `block_size % n_partitions`
+# residual-partition maths across every predictor order, and the escape
+# partition's raw-bps path. Contract: pure panic-freedom — every
+# `(block_size, bps, bitstream)` combination returns a `Result`. A fixed
+# `(block_size × bps)` sweep at two offsets primes the bps guard + every
+# FIXED/LPC order on the first input.
+[[bin]]
+name = "subframe_decode"
+path = "fuzz_targets/subframe_decode.rs"
+test = false
+doc = false
