@@ -370,7 +370,7 @@ non-Subset):
 
 ## Fuzzing
 
-`fuzz/` carries eleven `cargo-fuzz` targets that all share the same
+`fuzz/` carries twelve `cargo-fuzz` targets that all share the same
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM:
 
@@ -527,6 +527,27 @@ on malformed input, never panic, abort, or OOM:
   every iteration primes the bps guard + every FIXED/LPC dispatch on
   the first input. ~1.7 M executions, 0 findings (cov plateau at 363
   edges — the reachable subframe surface is fully explored).
+- **`application`** *(r299)* — focused stress on the APPLICATION
+  metadata block (`metadata::{parse_application, write_application,
+  Application}`, RFC 9639 §8.4). The typed APPLICATION pair (added
+  r244) was the last typed metadata-block surface with no direct fuzz
+  coverage: `metadata_walker`'s `try_typed_round_trip` explicitly
+  no-ops on `BlockType::Application`, and `metadata_chain` reaches
+  `parse_application` only behind a structurally valid full-chain gate
+  that random input almost never threads. This harness drives both
+  directions directly — raw-byte `parse_application` for panic-freedom
+  (only a sub-4-byte payload may reject; §8.4 admits a zero-length data
+  run), the positional byte-stability round-trip
+  (`write_application(parse_application(x)) == x` for every accepted
+  `x`, plus second-pass determinism), and a synthesised-struct writer
+  drive (fuzzer-chosen `id` + bounded data run) so the writer sees
+  shapes the parser never produces. The 24-bit `BlockHeader::MAX_LENGTH`
+  over-ceiling reject branch is left to `metadata::tests` (reproducing
+  it here would force a ~16 MiB allocation per iteration). ~24 M
+  executions, 0 findings (cov plateau at 76 edges — the parser/writer
+  surface is small and fully explored). Together with `metadata_walker`
+  + `metadata_chain` this closes every typed metadata-block parser /
+  writer pair under direct fuzz coverage.
 
 Daily 30-minute split run in `.github/workflows/fuzz.yml`. The
 historical wins from the harnesses include the

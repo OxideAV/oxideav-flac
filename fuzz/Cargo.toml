@@ -255,3 +255,25 @@ name = "subframe_decode"
 path = "fuzz_targets/subframe_decode.rs"
 test = false
 doc = false
+
+# Target 12 (round 299): focused stress on the FLAC APPLICATION metadata
+# block — `oxideav_flac::metadata::{parse_application, write_application,
+# Application}` (RFC 9639 §8.4). The typed APPLICATION pair (added r244)
+# is the only typed metadata-block surface with no direct fuzz coverage:
+# `metadata_walker`'s `try_typed_round_trip` explicitly no-ops on
+# `BlockType::Application`, and `metadata_chain` only reaches the parser
+# behind a structurally valid full-chain gate. This harness drives both
+# directions directly — raw-byte parse for panic-freedom (only a < 4-byte
+# payload may reject; §8.4 admits a zero-length data run), the positional
+# byte-stability round-trip (`write(parse(x)) == x` for any accepted `x`),
+# and a synthesised-struct writer drive (fuzzer-chosen id + bounded data
+# run) so the writer sees shapes the parser never produces. The 24-bit
+# `BlockHeader::MAX_LENGTH` ceiling-reject branch is left to
+# `metadata::tests` (reproducing it here would force a ~16 MiB allocation
+# per iteration). Contract: pure panic-freedom + parse/write contract
+# agreement on every input.
+[[bin]]
+name = "application"
+path = "fuzz_targets/application.rs"
+test = false
+doc = false

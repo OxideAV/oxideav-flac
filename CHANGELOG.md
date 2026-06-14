@@ -47,6 +47,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: round-299 `application` target (target 12) — focused stress
+  on the APPLICATION metadata block (`metadata::{parse_application,
+  write_application, Application}`, RFC 9639 §8.4). The typed
+  APPLICATION parser / writer pair (added r244) was the last typed
+  metadata-block surface with no direct fuzz coverage:
+  `metadata_walker`'s `try_typed_round_trip` explicitly no-ops on
+  `BlockType::Application`, and `metadata_chain` reaches
+  `parse_application` only behind a structurally valid full-chain
+  gate random input almost never threads. The harness drives both
+  directions directly — raw-byte parse for panic-freedom (only a
+  sub-4-byte payload may reject; §8.4 admits a zero-length data run),
+  the positional byte-stability round-trip
+  (`write_application(parse_application(x)) == x` for every accepted
+  `x`, plus second-pass determinism), and a synthesised-struct writer
+  drive (fuzzer-chosen `id` + bounded data run) so the writer sees
+  shapes the parser never produces. The 24-bit `BlockHeader::MAX_LENGTH`
+  over-ceiling reject branch is left to `metadata::tests` (reproducing
+  it would force a ~16 MiB allocation per iteration). ~24 M
+  executions, 0 findings (cov plateau at 76 edges — the parser /
+  writer surface is small and fully explored). Closes every typed
+  metadata-block parser / writer pair under direct fuzz coverage.
+
 - fuzz: round-292 `subframe_decode` target (target 11) —
   structure-aware stress on `subframe::decode_subframe` (RFC 9639
   §9.2: CONSTANT / VERBATIM / FIXED 0..=4 / LPC 1..=32 + the §9.2.7
