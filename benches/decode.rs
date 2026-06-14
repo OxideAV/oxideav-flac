@@ -42,6 +42,14 @@
 //!     the `read_unary -> read_u32(k)` hot path and the
 //!     escape-partition raw-bits branch (RFC 9639 §9.2.7) that the
 //!     tone-plus-noise scenarios rarely touch.
+//!   - **decode_mono_wasted_s16_44k1_1s** *(r307)*: 1 s of mono S16 PCM
+//!     whose samples all carry 4 trailing zero bits, so the encoder
+//!     tags a nonzero wasted-bits count on every subframe and the
+//!     decoder runs its post-predict left-shift-back loop
+//!     (`subframe::decode_subframe`'s `wasted > 0` branch, RFC 9639
+//!     §9.2.2) on every block — a leg the tone-plus-noise scenarios
+//!     bypass because their residual noise leaves no consistent
+//!     trailing zeros.
 //!   - **decode_stereo_s32_96k_250ms** *(r195)*: 0.25 s of stereo S32
 //!     PCM at 96 kHz — exercises the 32-bit sample-width path through
 //!     the residual reader, LPC inverse, and S32 little-endian
@@ -323,6 +331,59 @@ fn bench_decode_mono_noise_s16_44k1_1s(c: &mut Criterion) {
     g.finish();
 }
 
+/// Build per-channel PCM whose samples all carry `shift` trailing zero
+/// bits — i.e. every value is a multiple of `1 << shift`. This forces
+/// the encoder's wasted-bits detector (RFC 9639 §9.2.2) to tag a
+/// nonzero count on every subframe, which in turn makes the **decoder**
+/// run its post-predict left-shift-back loop (`subframe::decode_subframe`
+/// `wasted > 0` branch) on every block. The decode benches that
+/// round-trip ordinary tone-plus-noise PCM almost never trip that branch
+/// (the xorshift noise term leaves no consistent trailing zeros), so the
+/// shift-back leg was previously unmeasured.
+fn build_wasted_pcm_per_channel(
+    n_samples: usize,
+    channels: u16,
+    bits_per_sample: u16,
+    shift: u32,
+) -> Vec<Vec<i32>> {
+    // Start from the ordinary tone-plus-noise generator, then clear the
+    // low `shift` bits of every sample so each channel has exactly
+    // `shift` wasted bits. Done by shifting right then left so the
+    // payload still fits the container after the encoder re-shifts.
+    let base = build_pcm_per_channel(n_samples, channels, bits_per_sample);
+    base.into_iter()
+        .map(|ch| ch.into_iter().map(|s| (s >> shift) << shift).collect())
+        .collect()
+}
+
+/// **Round 307 addition** — wasted-bits decode path. Every sample in the
+/// stream carries 4 trailing zero bits, so the encoder emits a nonzero
+/// wasted-bits header on each subframe and the decoder runs its
+/// post-predict left-shift-back loop (`subframe::decode_subframe`'s
+/// `wasted > 0` branch, RFC 9639 §9.2.2) on every decoded block — a leg
+/// the existing tone-plus-noise scenarios bypass because their residual
+/// noise leaves no consistent trailing zeros to waste.
+fn bench_decode_mono_wasted_s16_44k1_1s(c: &mut Criterion) {
+    let n = 44_100;
+    let pcm = build_wasted_pcm_per_channel(n, 1, 16, 4);
+    let (dec_params, packets) = prepare_flac_stream(SampleFormat::S16, 1, 44_100, &pcm);
+    let mut g = c.benchmark_group("decode_mono_wasted_s16_44k1_1s");
+    g.throughput(Throughput::Bytes((n * 2) as u64));
+    g.bench_function(
+        BenchmarkId::from_parameter("mono/wasted4/s16/44k1/1s"),
+        |b| {
+            b.iter(|| {
+                let bytes = run_decode(
+                    criterion::black_box(&dec_params),
+                    criterion::black_box(&packets),
+                );
+                criterion::black_box(bytes);
+            });
+        },
+    );
+    g.finish();
+}
+
 /// **Round 195 addition** — full-width 32-bit sample scenario. The
 /// existing scenarios cap at S24; this one exercises the 32-bit
 /// branch of the residual reader, LPC inverse, and the S32 little-
@@ -353,6 +414,7 @@ criterion_group!(
     bench_decode_6ch_s16_48k_250ms,
     bench_decode_mono_s24_48k_500ms,
     bench_decode_mono_noise_s16_44k1_1s,
+    bench_decode_mono_wasted_s16_44k1_1s,
     bench_decode_stereo_s32_96k_250ms,
 );
 criterion_main!(benches);

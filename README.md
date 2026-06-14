@@ -577,9 +577,17 @@ A/B against without rerunning the full docs corpus:
   detector + narrowed-bps subframe path) and `mono/constant/s16/44k1/1s`
   (DC content, short-circuiting each subframe to CONSTANT — a
   regression guard for per-frame setup work).
-- **`decode`** — same four scenarios on the decode-only side (the
-  encode step is outside the timed region; only `send_packet ->
-  receive_frame` is measured).
+- **`decode`** — eight decode-only scenarios (the encode step is
+  outside the timed region; only `send_packet -> receive_frame` is
+  measured): the original four (mono S16, stereo S16, stereo S24,
+  6-channel S16), the round-195 trio (mono S24, mono uniform-noise,
+  stereo S32), plus a round-307 `mono/wasted4/s16/44k1/1s` scenario
+  whose samples all carry 4 trailing zero bits — the encoder tags a
+  nonzero wasted-bits count on every subframe, so the decoder runs its
+  post-predict left-shift-back loop (`subframe::decode_subframe`'s
+  `wasted > 0` branch, RFC 9639 §9.2.2) on every block. The other
+  decode scenarios bypass that leg because their residual noise leaves
+  no consistent trailing zeros to waste.
 - **`roundtrip`** — encode + decode back-to-back, with each iteration
   asserting that the recovered byte count equals the input so a
   state-machine drift would surface as a `panic!` in the bench

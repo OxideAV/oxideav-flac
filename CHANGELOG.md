@@ -47,6 +47,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- bench: round-307 `decode_mono_wasted_s16_44k1_1s` decode scenario —
+  every sample carries 4 trailing zero bits, so the encoder tags a
+  nonzero wasted-bits count on every subframe and the decoder runs its
+  post-predict left-shift-back loop (`subframe::decode_subframe`'s
+  `wasted > 0` branch, RFC 9639 §9.2.2) on every block. The existing
+  tone-plus-noise decode scenarios bypass that leg because their
+  residual noise leaves no consistent trailing zeros to waste, so the
+  wasted-bits decode path was previously unmeasured on the decode-only
+  side. ~389 µs/iter (release, Darwin aarch64). A profiling-guided
+  rewrite of the `apply_lpc` / `apply_fixed_predictor` inner loops
+  (slice-window / `iter().rev()` zip forms) was prototyped and
+  measured against all eight decode scenarios but reverted — it
+  regressed several scenarios 10-20% versus the existing direct-index
+  form, which LLVM already lowers well.
+
 - fuzz: round-299 `application` target (target 12) — focused stress
   on the APPLICATION metadata block (`metadata::{parse_application,
   write_application, Application}`, RFC 9639 §8.4). The typed
