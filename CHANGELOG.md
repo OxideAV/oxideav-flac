@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: opt-in higher LPC predictor orders via
+  `FlacEncoderOptions::max_lpc_order` (RFC 9639 §9.2.6). `None` (the
+  default) keeps the historical search ceiling of 12 — exactly the
+  streamable-subset boundary for ≤ 48 kHz audio (RFC 9639 §7) — and is
+  byte-for-byte unchanged. `Some(k)` lifts the per-subframe LPC search
+  ceiling up to the spec maximum of 32 (requests clamped into
+  `1..=32`), letting content with a long impulse response (echoes,
+  high-order AR signals) select an order the default search never
+  reaches. The minimum-bit `best_subframe` driver guarantees a higher
+  ceiling can only shrink or tie the output. New regression tests:
+  `higher_lpc_order_wins_on_ar20_signal` (an AR signal with a dominant
+  lag-20 tap is captured by orders 13..=24 but not 1..=12),
+  `higher_lpc_order_roundtrips_bit_exact` (lossless through the lifted
+  path at order ≤ 32), and `max_lpc_order_request_is_clamped_to_spec_range`
+  (clamp bounds + `None` == `Some(12)` byte equivalence).
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-flac/compare/v0.0.10...v0.0.11) - 2026-06-15
 
 ### Other

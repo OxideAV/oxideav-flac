@@ -103,15 +103,29 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   smallest total subframe size.
 - **Predictors**: per subframe the encoder tries CONSTANT, FIXED
   orders 0..=4, LPC orders 1..=12 and VERBATIM, and keeps the
-  smallest. The default LPC ceiling is 12 (RFC 9639 §9.2.6 permits up
-  to 32, but the gain curve flattens past ~12 while per-frame cost
-  grows quadratically). For each LPC order the encoder searches three
-  analysis windows (Welch, Hann, shallow Tukey) before
+  smallest. The default LPC ceiling is 12 — which is also the
+  streamable-subset boundary for sample rates ≤ 48 kHz (RFC 9639 §7)
+  and the point past which the gain curve flattens while per-frame
+  cost grows quadratically. For each LPC order the encoder searches
+  three analysis windows (Welch, Hann, shallow Tukey) before
   Levinson-Durbin and keeps the smallest; the window choice has no
   on-wire footprint. LPC coefficient precision is also searched per
   subframe within the legal `[5, 15]` range. Output is always fully
   valid and lossless — any compliant decoder recovers the original
   PCM bit-exactly.
+- **Higher LPC orders (opt-in)**:
+  `encoder::make_encoder_with_options(params, FlacEncoderOptions {
+  max_lpc_order: Some(k), .. })` lifts the per-subframe LPC search
+  ceiling above the default 12 up to the §9.2.6 maximum of 32
+  (requests are clamped into `1..=32`). Content with a long impulse
+  response — strong echoes, AR processes whose autocorrelation does
+  not decay before lag 12 — can pick an order the default search never
+  reaches. The `best_subframe` driver always keeps the minimum-bit
+  plan, so a higher ceiling can only shrink or tie the output; the
+  trade is encode cost (Levinson-Durbin is O(order²)) and, for ≤ 48
+  kHz audio that actually selects an order above 12, **subset
+  membership** (RFC 9639 §7). The default `None` is byte-for-byte
+  identical to the historical encoder and stays subset-compliant.
 - **Wasted bits per sample**: detected per subframe (largest `k` such
   that every sample is divisible by `2^k`) and folded into the spec's
   wasted-bits unary header.

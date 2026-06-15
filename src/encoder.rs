@@ -76,20 +76,57 @@ pub struct FlacEncoderOptions {
     /// bytes remain a valid FLAC stream that any spec-complete decoder —
     /// including this crate's — recovers bit-exactly.
     pub allow_non_subset_partition_order: bool,
+
+    /// Highest LPC predictor order (RFC 9639 §9.2.6) the per-subframe
+    /// search will try. `None` (the default) keeps the historical
+    /// ceiling of 12, which is also the streamable-subset boundary for
+    /// audio with a sample rate ≤ 48000 Hz (RFC 9639 §7: "Linear
+    /// prediction subframes ... MUST have a predictor order less than or
+    /// equal to 12").
+    ///
+    /// `Some(k)` raises the search ceiling to `k`, clamped to the spec
+    /// maximum of 32 (the subframe-type field stores `order - 1` in 5
+    /// bits, so 32 is the largest representable order); a value below 1
+    /// is treated as 1. The `best_subframe` driver always keeps the
+    /// minimum-bit plan across every order it tries, so a higher ceiling
+    /// can only ever shrink or tie the output — orders that don't earn
+    /// their warm-up + coefficient overhead are silently discarded.
+    ///
+    /// The trade is encode cost (Levinson-Durbin is O(order²) and the
+    /// per-order residual search is linear in order) and, for ≤48 kHz
+    /// audio, **subset membership**: a stream that actually picks an
+    /// order above 12 is no longer streamable-subset, so this is opt-in.
+    /// The produced bytes stay a valid FLAC stream that any spec-complete
+    /// decoder — including this crate's, which reads the full 5-bit order
+    /// field — recovers bit-exactly. For audio above 48 kHz the subset
+    /// already permits orders up to 32, so raising the ceiling there
+    /// stays inside the subset.
+    pub max_lpc_order: Option<usize>,
 }
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
-/// Highest LPC order the encoder will try. The decoder (and RFC 9639
-/// §9.2.6) supports up to 32, but the gain curve flattens fast: most
-/// content tops out somewhere between order 6 and order 12. We search
-/// 1..=12, which captures the long tail of harmonic / vocal content
-/// that benefits from a longer impulse response while keeping the
-/// per-frame encode cost bounded (Levinson-Durbin is O(order^2),
+/// Default highest LPC order the encoder will try. The decoder (and
+/// RFC 9639 §9.2.6) supports up to 32, but the gain curve flattens
+/// fast: most content tops out somewhere between order 6 and order 12.
+/// We search 1..=12, which captures the long tail of harmonic / vocal
+/// content that benefits from a longer impulse response while keeping
+/// the per-frame encode cost bounded (Levinson-Durbin is O(order^2),
 /// residual search is linear in order). The `best_subframe` driver
 /// picks the minimum-bit plan, so adding higher orders can only ever
 /// shrink (or tie) the output: orders that don't earn their
 /// coefficient overhead are silently discarded.
-const MAX_LPC_ORDER: usize = 12;
+///
+/// This is also exactly the streamable-subset boundary for audio with
+/// a sample rate ≤ 48000 Hz (RFC 9639 §7: "Linear prediction subframes
+/// ... MUST have a predictor order less than or equal to 12"), so it is
+/// the default ceiling. Callers wanting higher orders opt in via
+/// [`FlacEncoderOptions::max_lpc_order`].
+const SUBSET_MAX_LPC_ORDER: usize = 12;
+/// Highest LPC order RFC 9639 §9.2.6 permits at all: the subframe-type
+/// bits store `order - 1` in 5 bits, so the largest representable order
+/// is 32. The encoder's search ceiling is clamped to this regardless of
+/// what [`FlacEncoderOptions::max_lpc_order`] requests.
+const SPEC_MAX_LPC_ORDER: usize = 32;
 /// Highest LPC coefficient precision the encoder will quantise to.
 /// The 4-bit `qlp_precis` field stores `precision - 1`, and the
 /// all-ones encoding `0b1111` (precision 16) is forbidden by RFC 9639
@@ -155,6 +192,17 @@ struct SubframeScratch {
     /// streamable-subset residuals; the production encoder overrides it
     /// from [`FlacEncoderOptions::allow_non_subset_partition_order`].
     max_partition_order: u32,
+    /// Highest LPC order the per-subframe search may try (RFC 9639
+    /// §9.2.6). Like `max_partition_order` this is a per-encoder
+    /// configuration value carried on the scratch struct so it rides the
+    /// same call chain the candidate sweep already threads, rather than
+    /// adding a parallel parameter. `Default` sets it to
+    /// [`SUBSET_MAX_LPC_ORDER`] (12) — the streamable-subset boundary for
+    /// ≤48 kHz audio (RFC 9639 §7) — so every reference / test path that
+    /// builds a `SubframeScratch::default()` keeps the historical search
+    /// ceiling; the production encoder overrides it from
+    /// [`FlacEncoderOptions::max_lpc_order`].
+    max_lpc_order: usize,
     /// Residual values: `samples[order..] - prediction` for FIXED and LPC.
     residuals: Vec<i32>,
     /// Zigzag-encoded view of `residuals` so the partition search reads
@@ -192,6 +240,7 @@ impl Default for SubframeScratch {
     fn default() -> Self {
         SubframeScratch {
             max_partition_order: SUBSET_MAX_PARTITION_ORDER,
+            max_lpc_order: SUBSET_MAX_LPC_ORDER,
             residuals: Vec::new(),
             zigzag: Vec::new(),
             prefix: Vec::new(),
@@ -427,6 +476,14 @@ pub fn make_encoder_with_options(
                 MAX_PARTITION_ORDER
             } else {
                 SUBSET_MAX_PARTITION_ORDER
+            },
+            // Lift the LPC-order search ceiling above the streamable-subset
+            // bound (12, for ≤48 kHz) only when the caller opted in. The
+            // requested ceiling is clamped to the spec maximum of 32 and
+            // floored at 1; `None` keeps the historical default of 12.
+            max_lpc_order: match options.max_lpc_order {
+                Some(k) => k.clamp(1, SPEC_MAX_LPC_ORDER),
+                None => SUBSET_MAX_LPC_ORDER,
             },
             ..SubframeScratch::default()
         },
@@ -963,8 +1020,8 @@ impl SubframePlan {
 }
 
 /// Build the smallest-footprint subframe for `samples`, trying
-/// CONSTANT, FIXED orders 0..=4, LPC orders 1..=MAX_LPC_ORDER and
-/// VERBATIM.
+/// CONSTANT, FIXED orders 0..=4, LPC orders 1..=`scratch.max_lpc_order`
+/// and VERBATIM.
 ///
 /// Detects "wasted bits per sample" (the count of trailing zero bits
 /// shared by every sample) and subtracts that bit width from the
@@ -1046,7 +1103,7 @@ fn best_subframe_with_wasted_s(
         }
     }
 
-    let max_lpc = MAX_LPC_ORDER.min(n.saturating_sub(1));
+    let max_lpc = scratch.max_lpc_order.min(n.saturating_sub(1));
     for order in 1..=max_lpc {
         if let Some(plan) = encode_lpc_plan_s(samples, bps, order, wasted, scratch) {
             if plan.bits < best.bits {
@@ -2849,7 +2906,7 @@ mod tests {
         ];
         let ceiling = lpc_precision_for(n);
         for samples in &signals {
-            for order in 1..=MAX_LPC_ORDER.min(n - 1) {
+            for order in 1..=SUBSET_MAX_LPC_ORDER.min(n - 1) {
                 // Old behaviour: a single plan at the heuristic precision
                 // under the historical Welch window.
                 let coeffs = match levinson_durbin(samples, order, ApodizationWindow::Welch) {
@@ -3087,9 +3144,9 @@ mod tests {
         roundtrip(vec![l, r], sr, 16);
     }
 
-    /// Lifting MAX_LPC_ORDER from 8 to 12 must not regress on a
+    /// Lifting SUBSET_MAX_LPC_ORDER from 8 to 12 must not regress on a
     /// content type where the lower orders already win — the encoder
-    /// considers every order in 1..=MAX_LPC_ORDER and keeps the
+    /// considers every order in 1..=SUBSET_MAX_LPC_ORDER and keeps the
     /// smallest, so adding orders can only ever shrink (or tie) the
     /// output. A clean sine has its energy concentrated at a single
     /// harmonic, so order ≈ 2..4 already captures the bulk of the
@@ -3122,7 +3179,7 @@ mod tests {
         }
         assert!(
             plan_full.bits <= best_low,
-            "raising MAX_LPC_ORDER must not inflate the plan: {} > {}",
+            "raising SUBSET_MAX_LPC_ORDER must not inflate the plan: {} > {}",
             plan_full.bits,
             best_low
         );
@@ -3270,7 +3327,7 @@ mod tests {
     /// AR(11) recursion. AR processes of order p have an
     /// autocorrelation that doesn't decay before lag p, so a p-tap
     /// LPC fits much better than anything shorter. With
-    /// MAX_LPC_ORDER raised from 8 to 12 the encoder gets to try
+    /// SUBSET_MAX_LPC_ORDER raised from 8 to 12 the encoder gets to try
     /// orders in 9..=12, and at least one of them should produce a
     /// strictly smaller plan than the best in 1..=8 — otherwise the
     /// raised cap buys nothing on the workload it targets.
@@ -3333,7 +3390,7 @@ mod tests {
             best
         };
         let best_low = welch_min_over(1..=8);
-        let best_high = welch_min_over(9..=MAX_LPC_ORDER);
+        let best_high = welch_min_over(9..=SUBSET_MAX_LPC_ORDER);
         assert!(
             best_high < best_low,
             "expected order 9..=12 to beat order 1..=8 on an AR(11) signal \
@@ -3380,7 +3437,7 @@ mod tests {
             .collect();
 
         let bps = 16u32;
-        for order in 9..=MAX_LPC_ORDER {
+        for order in 9..=SUBSET_MAX_LPC_ORDER {
             let plan = encode_lpc_plan(&samples, bps, order, 0)
                 .unwrap_or_else(|| panic!("encode_lpc_plan failed at order {order}"));
             // Decode the subframe payload back and check bit-exact
@@ -3396,6 +3453,201 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Build a deterministic order-`p` AR signal
+    /// `y[n] = sum_k a[k]·y[n-k] plus drive[n]`, with `drive` an xorshift
+    /// LCG. AR(p) processes have an autocorrelation that does not decay
+    /// before lag `p`, so a `p`-tap LPC fits them much better than anything
+    /// shorter — the workload that makes a higher LPC ceiling pay.
+    #[cfg(test)]
+    fn ar_signal(n: usize, a: &[f64], seed: u64) -> Vec<i32> {
+        let mut y = vec![0.0f64; n];
+        let mut rng = seed;
+        for i in 0..n {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let drive = ((rng as i64) as f64) / (i64::MAX as f64);
+            let mut acc = drive * 2000.0;
+            for (k, &ak) in a.iter().enumerate() {
+                if i > k {
+                    acc += ak * y[i - 1 - k];
+                }
+            }
+            y[i] = acc;
+        }
+        y.iter()
+            .map(|&v| v.clamp(-30_000.0, 30_000.0) as i32)
+            .collect()
+    }
+
+    /// With `FlacEncoderOptions::max_lpc_order` lifted above the default
+    /// ceiling of 12 (RFC 9639 §9.2.6 permits up to 32), the encoder gets
+    /// to try orders in 13..=24 on content engineered to need a longer
+    /// impulse response (an AR(20) recursion). At least one of those
+    /// orders should produce a strictly smaller plan than the best in
+    /// 1..=12 — otherwise the lifted cap buys nothing on the workload it
+    /// targets. As with the AR(11) baseline we pin a single window (Welch)
+    /// to isolate the order-cap question from the apodization search.
+    #[test]
+    fn higher_lpc_order_wins_on_ar20_signal() {
+        let n = 4096usize;
+        // Stable order-20 AR with a *dominant high-lag tap*: a mild lag-1
+        // pole plus a strong lag-20 echo (`y[n] ≈ 0.5·y[n-1] − 0.78·y[n-20]
+        // + drive`). The lag-20 energy is invisible to any predictor of
+        // order < 20, so orders 1..=12 cannot capture it while orders
+        // 13..=24 can — exactly the regime the lifted ceiling targets.
+        let mut a = vec![0.0f64; 20];
+        a[0] = 0.5; // lag-1
+        a[19] = -0.78; // lag-20 echo
+        let samples = ar_signal(n, &a, 0x2bad_c0de_f00d_1357);
+
+        let welch_min_over = |orders: std::ops::RangeInclusive<usize>| -> u64 {
+            let mut best = u64::MAX;
+            for order in orders {
+                let Some(coeffs) = levinson_durbin(&samples, order, ApodizationWindow::Welch)
+                else {
+                    continue;
+                };
+                let ceiling = lpc_precision_for(n);
+                let floor = ceiling
+                    .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+                    .max(MIN_LPC_QLP_PRECISION);
+                for p in floor..=ceiling {
+                    if let Some(plan) = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, p) {
+                        best = best.min(plan.bits);
+                    }
+                }
+            }
+            best
+        };
+        let best_low = welch_min_over(1..=SUBSET_MAX_LPC_ORDER);
+        let best_high = welch_min_over((SUBSET_MAX_LPC_ORDER + 1)..=24);
+        assert!(
+            best_high < best_low,
+            "expected order 13..=24 to beat order 1..=12 on an AR(20) signal \
+             (Welch-pinned baseline), got best_high={best_high} best_low={best_low}"
+        );
+    }
+
+    /// The `make_encoder_with_options` path with the LPC ceiling lifted to
+    /// the §9.2.6 maximum of 32 must recover the input PCM bit-exactly —
+    /// FLAC is lossless regardless of the predictor order the encoder
+    /// chose. The predictor order is a pure rate decision the decoder
+    /// reads from the 5-bit subframe-type field, so a higher order changes
+    /// only the byte count, never the recovered samples. An AR(20) drive
+    /// makes a high order actually competitive so the lifted code path is
+    /// genuinely exercised.
+    #[test]
+    fn higher_lpc_order_roundtrips_bit_exact() {
+        let sr = 96_000u32;
+        let n = 4096usize;
+        let mut a = vec![0.0f64; 20];
+        a[0] = 0.5;
+        a[19] = -0.78;
+        let samples = ar_signal(n, &a, 0x51c0_ffee_d00d_2468);
+        let mut pcm = Vec::with_capacity(n * 2);
+        for &s in &samples {
+            pcm.extend_from_slice(&(s as i16).to_le_bytes());
+        }
+
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            max_lpc_order: Some(32),
+            ..FlacEncoderOptions::default()
+        };
+        let mut enc = make_encoder_with_options(&p, opts).unwrap();
+        let af = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.clone()],
+        };
+        enc.send_frame(&Frame::Audio(af)).unwrap();
+        enc.flush().unwrap();
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        assert!(!frames.is_empty(), "encoder produced no packets");
+
+        let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+        dparams.extradata = enc.output_params().extradata.clone();
+        let mut dec = decoder::make_decoder(&dparams).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        for f in frames {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+            pkt.pts = Some(0);
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                out.extend_from_slice(&a.data[0]);
+            }
+        }
+        assert_eq!(out, pcm, "lifted-LPC-order output is not lossless");
+    }
+
+    /// `max_lpc_order` is clamped to the spec's representable range: a
+    /// request above 32 is held at 32 (the 5-bit subframe-type field can
+    /// only encode `order - 1` up to 31), and a request of 0 is floored
+    /// to order 1. The clamp lives on the encoder's scratch ceiling, so we
+    /// observe it through the constructed encoder rather than re-deriving it.
+    #[test]
+    fn max_lpc_order_request_is_clamped_to_spec_range() {
+        let p = build_audio_params(1, 48_000, SampleFormat::S16);
+
+        let over = make_encoder_with_options(
+            &p,
+            FlacEncoderOptions {
+                max_lpc_order: Some(99),
+                ..FlacEncoderOptions::default()
+            },
+        );
+        assert!(
+            over.is_ok(),
+            "an over-large LPC order must clamp, not error"
+        );
+
+        let zero = make_encoder_with_options(
+            &p,
+            FlacEncoderOptions {
+                max_lpc_order: Some(0),
+                ..FlacEncoderOptions::default()
+            },
+        );
+        assert!(zero.is_ok(), "a zero LPC order must floor to 1, not error");
+
+        // A `None` ceiling and an explicit `Some(12)` must be byte-for-byte
+        // identical (the default is exactly the subset boundary of 12).
+        let pcm: Vec<u8> = (0..4096i32)
+            .flat_map(|i| (((i * 7) % 9001 - 4500) as i16).to_le_bytes())
+            .collect();
+        let emit = |opts: FlacEncoderOptions| -> Vec<u8> {
+            let mut enc = make_encoder_with_options(&p, opts).unwrap();
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: 4096,
+                pts: Some(0),
+                data: vec![pcm.clone()],
+            }))
+            .unwrap();
+            enc.flush().unwrap();
+            let mut bytes = Vec::new();
+            while let Ok(pkt) = enc.receive_packet() {
+                bytes.extend_from_slice(&pkt.data);
+            }
+            bytes
+        };
+        let default_bytes = emit(FlacEncoderOptions::default());
+        let explicit_12 = emit(FlacEncoderOptions {
+            max_lpc_order: Some(SUBSET_MAX_LPC_ORDER),
+            ..FlacEncoderOptions::default()
+        });
+        assert_eq!(
+            default_bytes, explicit_12,
+            "max_lpc_order: None must match Some(12) byte-for-byte"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3480,7 +3732,7 @@ mod tests {
         };
 
         for samples in &signals {
-            for order in 1..=MAX_LPC_ORDER.min(n - 1) {
+            for order in 1..=SUBSET_MAX_LPC_ORDER.min(n - 1) {
                 let Some(welch) = welch_only_min(samples, order) else {
                     continue;
                 };
@@ -3538,7 +3790,7 @@ mod tests {
         let mut any_strict_win = false;
         let mut welch_total: u64 = 0;
         let mut search_total: u64 = 0;
-        for order in 1..=MAX_LPC_ORDER {
+        for order in 1..=SUBSET_MAX_LPC_ORDER {
             let Some(welch) = welch_only_min(order) else {
                 continue;
             };
@@ -4090,7 +4342,7 @@ mod tests {
 
         for (name, samples) in &cases {
             for window in APODIZATION_WINDOWS.iter().copied() {
-                for order in 1..=MAX_LPC_ORDER {
+                for order in 1..=SUBSET_MAX_LPC_ORDER {
                     let opt = levinson_durbin(samples, order, window);
                     let refc = levinson_durbin_reference(samples, order, window);
                     assert_eq!(
