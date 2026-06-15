@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-flac/compare/v0.0.10...v0.0.11) - 2026-06-15
+
+### Other
+
+- opt-in non-subset partition orders (RFC 9639 §9.2.7, up to 15)
+- round-307 decode wasted-bits scenario — exercise the §9.2.2 shift-back leg
+- round-299 application target — direct stress on the APPLICATION metadata block (RFC 9639 §8.4)
+- add subframe_decode target — structure-aware §9.2 subframe decoder stress
+- reject out-of-range sample_rate at construction (daily-fuzz crash fix)
+- r283 metadata_chain target — whole-chain parse/write mutation oracle + two parse/write contract fixes
+- typed MetadataChain parser + writer enforcing RFC 9639 §8 chain-level rules
+- flac metadata: typed PICTURE picture-type taxonomy + URI accessors (RFC 9639 §8.8 / Table 13)
+- r267 typed CUESHEET sub-field accessors (RFC 9639 §8.7)
+- scrub libavcodec naming from frame_header doc-comment prose
+- round-259 frame_header target — focused stress on `parse_frame_header` (RFC 9639 §9.1)
+- round-255 md5 harness for STREAMINFO MD5 (RFC 9639 §8.2)
+- round-252 typed StreamInfo writer (RFC 9639 §8.1)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round-244 typed Application accessor + writer
+- round-241 typed VorbisComment accessor + writer
+- round-237 utf8_varint target — writer ↔ reader roundtrip + byte-length stability for the FLAC §9.1.5 varint
+- round-232 md5_streaming target — streaming-vs-oneshot equivalence (RFC 9639 §8.2)
+- round-228 encoder_options target — FlacEncoderOptions construction + extradata invariants
+- round-223 seek harness for SEEKTABLE binary-search + sync-walk
+- round-218 crc harness for streaming Crc8 / Crc16 validators
+- streaming CRC-8 / CRC-16 validators for chunked-input callers
+- round-207 roundtrip coverage for mono-S24 / noise / S32
+- round-200 metadata_walker — writer-direction round-trip target
+
 ### Fixed
 
 - encoder: `make_encoder` / `make_encoder_with_options` panicked
