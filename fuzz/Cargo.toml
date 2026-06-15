@@ -277,3 +277,30 @@ name = "application"
 path = "fuzz_targets/application.rs"
 test = false
 doc = false
+
+# Target 13 (round 318): panic-freedom of the demuxer seek path —
+# `<FlacDemuxer as Demuxer>::seek_to` + post-seek packet drain. No
+# existing target ever calls `seek_to`: the host-pipeline targets
+# (`panic_free_decode`, `decode`) only walk `next_packet` linearly, and
+# `benches/seek.rs` exercises seeking but only over a valid
+# encoder-produced stream whose SEEKTABLE was built by `write_seektable`
+# (which enforces the §8.5.1 sorted/unique/in-range MUSTs). This harness
+# reaches the seek arithmetic with adversarial input two ways: (Path A)
+# raw fuzz bytes into the demuxer + a seek-target sweep (covers the
+# magic-reject / no-SEEKTABLE / stream-index-out-of-range error arms
+# cheaply); (Path B) a synthesised *valid, decodable* mono stream whose
+# SEEKTABLE seekpoints are hand-assembled verbatim from fuzzer bytes (18
+# B each), bypassing `write_seektable`'s guard so unsorted / placeholder
+# / out-of-range points reach `seek_points.partition_point(...)`, the
+# unchecked `first_frame_offset + byte_offset` (u64 overflow + past-EOF
+# candidate), and `scan.reset_to(anchor_sample)` followed by the
+# CRC-verified post-seek frame walk. Each seek target is followed by a
+# bounded packet drain (decode included) so the recovery path runs.
+# Targets always include the fixed boundary values (i64::MIN / -1 / 0 /
+# 1 / i64::MAX) so the `pts.max(0)` clamp + partition extremes are hit
+# regardless of input length. Contract: pure panic-freedom.
+[[bin]]
+name = "seek"
+path = "fuzz_targets/seek.rs"
+test = false
+doc = false

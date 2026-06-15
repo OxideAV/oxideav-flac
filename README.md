@@ -211,15 +211,17 @@ Helpers `BlockType::to_byte`, `BlockHeader::write_into` /
 
 ## Fuzzing
 
-`fuzz/` carries twelve `cargo-fuzz` targets sharing one
+`fuzz/` carries thirteen `cargo-fuzz` targets sharing one
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM: `panic_free_decode`,
 `decode`, `roundtrip`, `flac_oracle_decode` (cross-decode against an
 optional system black-box validator loaded via `libloading`, skipped
 silently when absent), `metadata_walker`, `encoder_options`,
 `md5_streaming`, `utf8_varint`, `frame_header`, `metadata_chain`,
-`subframe_decode`, and `application`. Daily split run in
-`.github/workflows/fuzz.yml`.
+`subframe_decode`, `application`, and `seek` (demuxer `seek_to` +
+post-seek packet drain against unsorted / placeholder / out-of-range
+SEEKTABLE points the §8.5.1-enforcing writer never emits). Daily split
+run in `.github/workflows/fuzz.yml`.
 
 ## Benchmarks
 

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- fuzz: thirteenth `cargo-fuzz` target `seek` hardening the demuxer
+  seek path (`<FlacDemuxer as Demuxer>::seek_to` + post-seek packet
+  drain) for panic-freedom (RFC 9639 §8.5 SEEKTABLE). No prior target
+  ever calls `seek_to`: the host-pipeline targets walk `next_packet`
+  linearly and `benches/seek.rs` only seeks over a valid
+  encoder-produced stream whose SEEKTABLE was built by `write_seektable`
+  (which enforces the §8.5.1 sorted / unique / in-range MUSTs). The new
+  target reaches the seek arithmetic with adversarial input two ways:
+  (A) raw fuzz bytes into the demuxer plus a seek-target sweep (covers
+  the magic-reject / no-SEEKTABLE / stream-index-out-of-range error
+  arms); (B) a synthesised valid mono stream whose SEEKTABLE seekpoints
+  are hand-assembled verbatim from fuzzer bytes (18 B each), bypassing
+  the writer's guard so unsorted / placeholder
+  (`sample_number == u64::MAX`, §8.5.2) / out-of-range points reach
+  `seek_points.partition_point(...)`, the unchecked
+  `first_frame_offset + byte_offset` (u64-overflow + past-EOF
+  candidate), and `scan.reset_to(...)` followed by the CRC-verified
+  post-seek frame walk. Seek targets always include the fixed boundary
+  values (`i64::MIN` / `-1` / `0` / `1` / `i64::MAX`) so the
+  `pts.max(0)` clamp and the partition extremes are hit every
+  iteration. Validated locally panic-free over ~11 K executions.
 - encoder: opt-in higher LPC predictor orders via
   `FlacEncoderOptions::max_lpc_order` (RFC 9639 §9.2.6). `None` (the
   default) keeps the historical search ceiling of 12 — exactly the
