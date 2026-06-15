@@ -11,7 +11,9 @@
 //! inputs it evaluates independent L/R alongside the three decorrelated
 //! layouts (left-side, right-side, mid-side) and keeps the smallest
 //! total. Each subframe's residual is partitioned-Rice coded with a full
-//! search over partition orders 0..=8 and both Rice methods, with each
+//! search over partition orders 0..=8 (the streamable-subset ceiling;
+//! `FlacEncoderOptions::allow_non_subset_partition_order` raises it to
+//! the full 4-bit field range 0..=15) and both Rice methods, with each
 //! partition free to fall back to a raw "escape" coding. An MD5 signature
 //! over the input PCM (in FLAC's native byte order) is accumulated during
 //! encode and written into STREAMINFO at flush time.
@@ -52,6 +54,28 @@ pub struct FlacEncoderOptions {
     /// `make_encoder_with_options` returns `Error::invalid` rather
     /// than silently truncating.
     pub padding_bytes: Option<usize>,
+
+    /// Allow the partitioned-Rice residual coder (RFC 9639 §9.2.7) to
+    /// search partition orders above the FLAC streamable-subset ceiling
+    /// of 8 (RFC 9639 §7), up to the full 4-bit field range of 15.
+    ///
+    /// The default (`false`) keeps every emitted stream inside the
+    /// streamable subset: the residual search caps the partition order
+    /// at 8, exactly the pre-this-round behaviour. Setting it to `true`
+    /// lifts the encoder's search ceiling to 15, letting content whose
+    /// residual statistics vary on a fine scale (quiet passages abutting
+    /// transients within one block) pick a tighter Rice parameter per
+    /// region. A finer split only ever wins when it encodes fewer bits —
+    /// the search keeps the smallest layout — so the option can only
+    /// shrink or tie the residual payload, never inflate it. The trade is
+    /// that the resulting stream is **no longer streamable-subset**: a
+    /// decoder that relied on the subset's resource bounds (this crate's
+    /// own decoder does not — it reads the full 4-bit field) might reject
+    /// it, so the higher ceiling is opt-in. RFC 9639 §9.2.7 defines the
+    /// field as 4 bits regardless of subset membership, so the produced
+    /// bytes remain a valid FLAC stream that any spec-complete decoder —
+    /// including this crate's — recovers bit-exactly.
+    pub allow_non_subset_partition_order: bool,
 }
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
@@ -119,8 +143,18 @@ const LPC_PRECISION_SEARCH_SPAN: u32 = 4;
 /// (`-a[j]` for `j=1..=order`) that `levinson_durbin_s` would have
 /// returned by `Vec`; the candidate-precision sweep in
 /// `encode_lpc_plan_s` borrows it as `&[f64]` instead of cloning.
-#[derive(Default)]
 struct SubframeScratch {
+    /// Highest partition order the residual search may try (RFC 9639
+    /// §9.2.7). This is a per-encoder configuration value, not a reused
+    /// buffer: it rides along on the scratch struct because the scratch
+    /// is already threaded through every function in the subframe
+    /// candidate sweep, so carrying the cap here avoids adding a parallel
+    /// parameter to the same eight-deep call chain. `Default` sets it to
+    /// [`SUBSET_MAX_PARTITION_ORDER`] (8) so every reference / test path
+    /// that builds a `SubframeScratch::default()` keeps emitting
+    /// streamable-subset residuals; the production encoder overrides it
+    /// from [`FlacEncoderOptions::allow_non_subset_partition_order`].
+    max_partition_order: u32,
     /// Residual values: `samples[order..] - prediction` for FIXED and LPC.
     residuals: Vec<i32>,
     /// Zigzag-encoded view of `residuals` so the partition search reads
@@ -146,6 +180,30 @@ struct SubframeScratch {
     qcoeffs: Vec<i32>,
     /// Wasted-bits-shifted sample buffer used by `best_subframe_s`.
     shifted: Vec<i32>,
+}
+
+impl Default for SubframeScratch {
+    /// All buffers start empty (they grow to capacity on first use) and
+    /// the partition-order ceiling starts at the streamable-subset value
+    /// so any caller that builds a default scratch (every `#[cfg(test)]`
+    /// reference helper does) keeps the historical subset behaviour. The
+    /// production encoder overrides `max_partition_order` after building
+    /// the encoder when the caller opted into non-subset output.
+    fn default() -> Self {
+        SubframeScratch {
+            max_partition_order: SUBSET_MAX_PARTITION_ORDER,
+            residuals: Vec::new(),
+            zigzag: Vec::new(),
+            prefix: Vec::new(),
+            raw_bits: Vec::new(),
+            windowed: Vec::new(),
+            autoc: Vec::new(),
+            lpc_state: Vec::new(),
+            lpc_coeffs: Vec::new(),
+            qcoeffs: Vec::new(),
+            shifted: Vec::new(),
+        }
+    }
 }
 
 /// Analysis windows the encoder applies to a subframe before computing
@@ -361,7 +419,17 @@ pub fn make_encoder_with_options(
         max_frame_size: 0,
         eof: false,
         padding_bytes: options.padding_bytes,
-        scratch: SubframeScratch::default(),
+        scratch: SubframeScratch {
+            // Lift the residual-search partition-order ceiling above the
+            // streamable-subset bound (8) only when the caller opted in.
+            // Everything else stays at the `Default` (empty buffers).
+            max_partition_order: if options.allow_non_subset_partition_order {
+                MAX_PARTITION_ORDER
+            } else {
+                SUBSET_MAX_PARTITION_ORDER
+            },
+            ..SubframeScratch::default()
+        },
     }))
 }
 
@@ -1276,7 +1344,19 @@ fn bits_snapshot(w: BitWriter, total_bits: u32) -> SubframePlan {
 /// samples can never split beyond order 12 (4096 = 2^12); going further
 /// only buys diminishing returns at quadratic search cost, so 8 is the
 /// conventional ceiling (256 partitions of a 4096-sample block).
-const MAX_PARTITION_ORDER: u32 = 8;
+/// Partitioned-Rice search ceiling for streamable-subset output
+/// (RFC 9639 §7: "The Rice partition order ... MUST be less than or
+/// equal to 8"). This is the default the encoder uses unless the caller
+/// opts into non-subset output via
+/// [`FlacEncoderOptions::allow_non_subset_partition_order`].
+const SUBSET_MAX_PARTITION_ORDER: u32 = 8;
+/// Partitioned-Rice search ceiling when the caller has opted out of the
+/// streamable subset: the full 4-bit `partition order` field range of
+/// RFC 9639 §9.2.7 (`2^(partition order)` partitions, field width 4
+/// bits → orders 0..=15). The per-order legality check (block size
+/// divisible by `2^p`, first partition non-empty after warmup) still
+/// gates which orders are actually reachable for a given block.
+const MAX_PARTITION_ORDER: u32 = 15;
 
 /// One partition's chosen coding: either a Rice parameter `k`, or an
 /// escape partition storing each residual raw at `raw_bps` bits.
@@ -1637,10 +1717,11 @@ fn partition_layout_cost_zp(
 
 /// Emit the partitioned-Rice residual for one subframe and return the
 /// exact number of bits written. Searches every legal partition order
-/// (0..=MAX_PARTITION_ORDER) under both Rice methods (4-bit and 5-bit
-/// parameters), keeping the layout with the smallest total payload, and
-/// lets each partition independently fall back to an escape (raw) coding
-/// when that is cheaper than Rice. RFC 9639 §9.2.5.
+/// (`0..=scratch.max_partition_order`, the subset default 8 or the
+/// opt-in non-subset ceiling 15) under both Rice methods (4-bit and
+/// 5-bit parameters), keeping the layout with the smallest total
+/// payload, and lets each partition independently fall back to an
+/// escape (raw) coding when that is cheaper than Rice. RFC 9639 §9.2.5.
 #[cfg(test)]
 fn encode_rice_residual(
     w: &mut BitWriter,
@@ -1697,9 +1778,15 @@ fn encode_rice_residual_s(
     build_partition_tables_into(residuals, &zigzag, &mut prefix, &mut raw_bits);
 
     // Find the (method, partition_order) pair with the smallest payload.
+    // The search ceiling is the caller-configured `max_partition_order`
+    // (subset default 8, opt-in non-subset up to 15); higher orders that
+    // turn out illegal for this block size break out below. Detach the
+    // value before the borrow loop so the immutable `&zigzag` etc. and
+    // the `scratch` field read don't conflict.
+    let max_po = scratch.max_partition_order;
     let mut best: Option<(u32, u32, u32, u32, u64)> = None; // method, param_bits, k_max, p, cost
     for (method, param_bits, k_max) in [(0u32, 4u32, 14u32), (1u32, 5u32, 30u32)] {
-        for p in 0..=MAX_PARTITION_ORDER {
+        for p in 0..=max_po {
             let Some(cost) = partition_layout_cost_zp(
                 &zigzag,
                 &prefix,
@@ -3041,6 +3128,143 @@ mod tests {
         );
     }
 
+    /// Residuals whose statistics flip on a finer scale than the
+    /// streamable-subset partition-order ceiling (8) can resolve: a
+    /// 4096-sample span carved into 64-sample runs that alternate between
+    /// near-zero (Rice `k` ≈ 0) and wide (large `k`). Partition order 8
+    /// gives 256-sample partitions, each straddling two quiet + two loud
+    /// runs, so every partition is forced to a compromise `k`. Order 12
+    /// gives 1-sample partitions — far finer than needed — but order 6
+    /// (64-sample partitions) already isolates each run, and order 6 is
+    /// inside the subset, so the win here comes specifically from letting
+    /// the *search* see orders above 8 where the optimum sits for this
+    /// shape. We assert the non-subset ceiling emits no more bits than
+    /// the subset ceiling on this content (it must, since order ≤ 8 is a
+    /// strict subset of the orders order ≤ 15 searches) and strictly
+    /// fewer on a span tuned so the minimum lands above 8.
+    #[test]
+    fn non_subset_partition_order_never_inflates_and_can_shrink() {
+        // Build residuals that put the cost minimum at a partition order
+        // > 8. Period-16 runs (2048 quiet + spike pattern) make order 8's
+        // 256-sample partitions each cover 16 runs, while order 11
+        // (2-sample partitions) isolates the spikes. Deterministic.
+        let block = 4096usize;
+        let mut residuals = vec![0i32; block];
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for (i, r) in residuals.iter_mut().enumerate() {
+            // Every 16th sample is a wide value; the other 15 are tiny.
+            // A fine partition can give the wide samples their own high-`k`
+            // partition and the tiny runs a `k`≈0 partition; a coarse
+            // partition pays the high `k` across the whole 256-sample span.
+            *r = if i % 16 == 0 {
+                (next() % 60_000) as i32 - 30_000
+            } else {
+                (next() % 3) as i32 - 1
+            };
+        }
+
+        let emit = |max_po: u32| -> u32 {
+            let mut scratch = SubframeScratch {
+                max_partition_order: max_po,
+                ..SubframeScratch::default()
+            };
+            let mut w = BitWriter::new();
+            // predictor_order 0 so the whole span is one residual run.
+            encode_rice_residual_s(&mut w, &residuals, block, 0, &mut scratch)
+        };
+
+        let subset_bits = emit(SUBSET_MAX_PARTITION_ORDER);
+        let non_subset_bits = emit(MAX_PARTITION_ORDER);
+
+        assert!(
+            non_subset_bits <= subset_bits,
+            "non-subset search ({non_subset_bits} bits) must never beat itself \
+             worse than the subset search ({subset_bits} bits) — orders 0..=8 \
+             are a subset of 0..=15"
+        );
+        assert!(
+            non_subset_bits < subset_bits,
+            "this residual shape was tuned so the optimal partition order is \
+             above the subset ceiling 8, so the non-subset search should win: \
+             non-subset {non_subset_bits} vs subset {subset_bits}"
+        );
+    }
+
+    /// A full encode → decode cycle through the public
+    /// `make_encoder_with_options` path with the non-subset partition
+    /// ceiling enabled must recover the input PCM bit-exactly (FLAC is
+    /// lossless regardless of the partition split the encoder chose) —
+    /// the partition order is a pure rate decision the decoder reads from
+    /// the 4-bit §9.2.7 field, so a higher order changes only the byte
+    /// count, never the recovered samples.
+    #[test]
+    fn non_subset_partition_order_roundtrips_bit_exact() {
+        let sr = 44_100u32;
+        let n = 4096usize;
+        // Same fine-grained quiet/loud alternation, rendered to S16 PCM.
+        let mut pcm = Vec::with_capacity(n * 2);
+        let mut rng: u64 = 0x0fed_cba9_8765_4321;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for i in 0..n {
+            let v: i16 = if i % 16 == 0 {
+                ((next() % 60_000) as i32 - 30_000) as i16
+            } else {
+                ((next() % 7) as i32 - 3) as i16
+            };
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            allow_non_subset_partition_order: true,
+            ..FlacEncoderOptions::default()
+        };
+        let mut enc = make_encoder_with_options(&p, opts).unwrap();
+        let af = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.clone()],
+        };
+        enc.send_frame(&Frame::Audio(af)).unwrap();
+        enc.flush().unwrap();
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        assert!(!frames.is_empty(), "encoder produced no packets");
+
+        let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+        dparams.extradata = enc.output_params().extradata.clone();
+        let mut dec = decoder::make_decoder(&dparams).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        for f in frames {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+            pkt.pts = Some(0);
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                out.extend_from_slice(&a.data[0]);
+            }
+        }
+        assert_eq!(
+            out, pcm,
+            "non-subset partition-order output is not lossless"
+        );
+    }
+
     /// A signal engineered to need a longer impulse response than
     /// order 8 — a sum of harmonics passed through a pseudo-random
     /// AR(11) recursion. AR processes of order p have an
@@ -3410,6 +3634,7 @@ mod tests {
         let p = build_audio_params(2, 48_000, SampleFormat::S16);
         let opts = FlacEncoderOptions {
             padding_bytes: Some(8192),
+            ..FlacEncoderOptions::default()
         };
         let enc = make_encoder_with_options(&p, opts).unwrap();
         let extradata = &enc.output_params().extradata;
@@ -3441,6 +3666,7 @@ mod tests {
         let p = build_audio_params(1, 44_100, SampleFormat::S16);
         let opts = FlacEncoderOptions {
             padding_bytes: Some(0),
+            ..FlacEncoderOptions::default()
         };
         let enc = make_encoder_with_options(&p, opts).unwrap();
         let extradata = &enc.output_params().extradata;
@@ -3459,6 +3685,7 @@ mod tests {
         let opts = FlacEncoderOptions {
             // 2^24 = MAX_LENGTH + 1; just over the wire limit.
             padding_bytes: Some(BlockHeader::MAX_LENGTH as usize + 1),
+            ..FlacEncoderOptions::default()
         };
         let result = make_encoder_with_options(&p, opts);
         let err = match result {
@@ -3517,6 +3744,7 @@ mod tests {
         let p = build_audio_params(1, sr, SampleFormat::S16);
         let opts = FlacEncoderOptions {
             padding_bytes: Some(1024),
+            ..FlacEncoderOptions::default()
         };
         let mut enc = make_encoder_with_options(&p, opts).unwrap();
         let af = AudioFrame {
@@ -3559,6 +3787,7 @@ mod tests {
         let p = build_audio_params(2, 48_000, SampleFormat::S16);
         let opts = FlacEncoderOptions {
             padding_bytes: Some(256),
+            ..FlacEncoderOptions::default()
         };
         let enc = make_encoder_with_options(&p, opts).unwrap();
         let extradata = &enc.output_params().extradata;

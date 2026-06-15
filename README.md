@@ -151,7 +151,28 @@ non-Subset):
   partition independently falls back to an escape (raw fixed-width)
   coding when that beats Rice. Splitting the residual lets locally
   varying content (quiet passages next to transients) pick a tighter
-  Rice parameter per region instead of one global compromise.
+  Rice parameter per region instead of one global compromise. The
+  default ceiling of 8 keeps every emitted stream inside the FLAC
+  streamable subset (RFC 9639 §7: "The Rice partition order ... MUST
+  be less than or equal to 8").
+- **Non-subset partition orders** *(r310)*:
+  `encoder::make_encoder_with_options(params, FlacEncoderOptions {
+  allow_non_subset_partition_order: true, .. })` lifts the
+  residual-search ceiling from the subset bound of 8 to the full 4-bit
+  §9.2.7 field range (0..=15). Content whose residual statistics vary
+  on a scale finer than the order-8 partition size (a quiet passage
+  abutting a transient inside one block) can then isolate each region
+  in its own partition with a tighter Rice parameter. The search keeps
+  the smallest layout, so a finer split can only ever shrink or tie the
+  residual payload — never inflate it. The default factory
+  (`make_encoder`) and `FlacEncoderOptions::default()` keep the
+  subset-compliant ceiling of 8, so existing callers are unaffected
+  byte-for-byte. The produced stream stays a valid FLAC stream — the
+  partition order is a pure rate decision the decoder reads from the
+  4-bit §9.2.7 field, so any spec-complete decoder (including this
+  crate's own, which already accepted all 16 orders) recovers the
+  original PCM bit-exactly; the only consequence is that the output is
+  no longer streamable-subset.
 - **Block size**: 4096 samples per frame (fixed-blocking strategy).
 - **Metadata**: emits a STREAMINFO metadata header in `extradata`. An
   MD5 signature of the PCM input is computed during encode and written

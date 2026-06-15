@@ -47,6 +47,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: round-310 opt-in non-subset partition orders. New
+  `FlacEncoderOptions::allow_non_subset_partition_order` field; when
+  `true`, `make_encoder_with_options` lifts the partitioned-Rice
+  residual search ceiling from the FLAC streamable-subset bound of 8
+  (RFC 9639 §7) to the full 4-bit §9.2.7 `partition order` field range
+  of 15. Content whose residual statistics flip on a scale finer than
+  the order-8 partition size (a quiet run abutting a transient inside
+  one block) can then isolate each region in its own partition with a
+  tighter Rice parameter; the search keeps the smallest layout, so a
+  finer split only ever shrinks or ties the residual payload. The
+  default (`false`) and `make_encoder` keep the subset ceiling of 8 —
+  the produced bytes are byte-for-byte identical to the pre-r310 output
+  for every existing caller. The decoder already read the full 4-bit
+  field, so non-subset output round-trips bit-exactly; the only
+  consequence of the higher ceiling is that the stream is no longer
+  streamable-subset (RFC 9639 §7). Implemented by lifting the
+  hard-coded `MAX_PARTITION_ORDER` constant into a per-encoder
+  `SubframeScratch::max_partition_order` (defaulting to the new
+  `SUBSET_MAX_PARTITION_ORDER = 8`, with `MAX_PARTITION_ORDER` now the
+  non-subset ceiling 15) so the existing eight-deep subframe call chain
+  carries the cap without a parallel parameter. Two regressions pin it:
+  `non_subset_partition_order_never_inflates_and_can_shrink` (a residual
+  span tuned so the cost minimum sits above order 8 — the non-subset
+  search emits strictly fewer bits, and never more on any shape) and
+  `non_subset_partition_order_roundtrips_bit_exact` (a full
+  `make_encoder_with_options` → `make_decoder` cycle recovers the input
+  PCM byte-for-byte). All five existing `FlacEncoderOptions` struct
+  literals in `encoder::tests` updated to `..FlacEncoderOptions::default()`.
 - bench: round-307 `decode_mono_wasted_s16_44k1_1s` decode scenario —
   every sample carries 4 trailing zero bits, so the encoder tags a
   nonzero wasted-bits count on every subframe and the decoder runs its
