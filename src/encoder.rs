@@ -131,6 +131,48 @@ pub struct FlacEncoderOptions {
     /// streamable-subset FLAC stream regardless of the window set; this
     /// knob never affects subset membership.
     pub apodization: Option<Vec<Apodization>>,
+
+    /// Number of interchannel samples per frame the encoder accumulates
+    /// before emitting a FLAC frame (RFC 9639 §9.1). `None` (the default)
+    /// keeps the historical fixed block size of 4096 and is byte-for-byte
+    /// unchanged.
+    ///
+    /// `Some(n)` sets the per-frame block size to `n`. This encoder uses
+    /// the fixed-blocking strategy (STREAMINFO `min_block_size ==
+    /// max_block_size`), so every frame but the last carries exactly `n`
+    /// interchannel samples; the final frame carries the remainder (the
+    /// last frame is exempt from the minimum-block-size floor per RFC 9639
+    /// §8.2). The block size is a free encoder choice that trades coding
+    /// efficiency (larger blocks amortise the per-frame header + warm-up +
+    /// LPC-coefficient overhead and let the predictor + Rice-partition
+    /// search adapt over a longer window) against latency and seek
+    /// granularity (a decoder must buffer a whole block, and seek points
+    /// land on block boundaries).
+    ///
+    /// `n` MUST be in the STREAMINFO range `16..=65535` (RFC 9639 §8.2:
+    /// "The minimum block size and the maximum block size MUST be in the
+    /// 16-65535 range"); a value outside it makes
+    /// `make_encoder_with_options` return `Error::invalid`.
+    ///
+    /// **Subset membership.** The FLAC streamable subset (RFC 9639 §7)
+    /// caps the block size at 16384 always, and at 4608 for audio whose
+    /// sample rate is ≤ 48000 Hz. By default a request that would exceed
+    /// the applicable subset ceiling is rejected with `Error::invalid`, so
+    /// the produced stream stays streamable-subset. Setting
+    /// [`allow_non_subset_block_size`](Self::allow_non_subset_block_size)
+    /// to `true` lifts the check to the full STREAMINFO ceiling (65535),
+    /// producing a valid — but no longer streamable-subset — FLAC stream
+    /// that any spec-complete decoder (including this crate's) still
+    /// recovers bit-exactly.
+    pub block_size: Option<u32>,
+
+    /// Permit [`block_size`](Self::block_size) values above the streamable
+    /// subset ceiling (RFC 9639 §7), up to the STREAMINFO maximum of
+    /// 65535. The default (`false`) rejects any block size that would push
+    /// the stream out of the subset (> 16384 always, or > 4608 for audio
+    /// at ≤ 48000 Hz). It has no effect when `block_size` is `None` or
+    /// already within the subset ceiling.
+    pub allow_non_subset_block_size: bool,
 }
 
 /// A caller-selectable apodization (analysis) window for the encoder's
@@ -189,6 +231,28 @@ impl Apodization {
 }
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
+/// Lowest block size RFC 9639 §8.2 allows in STREAMINFO: "The minimum
+/// block size and the maximum block size MUST be in the 16-65535 range."
+/// The last frame is exempt from the *minimum* floor (it carries the
+/// stream remainder), but the encoder's configured block size — which is
+/// also the STREAMINFO min/max value under the fixed-blocking strategy —
+/// must be at least 16.
+const MIN_BLOCK_SIZE: u32 = 16;
+/// Highest block size RFC 9639 §8.2 allows in STREAMINFO (the field is
+/// 16 bits, and 0 is reserved, so the legal maximum is 65535).
+const MAX_BLOCK_SIZE: u32 = 65_535;
+/// Streamable-subset block-size ceiling for audio at any sample rate
+/// (RFC 9639 §7: "The stream MUST NOT contain blocks with more than
+/// 16384 interchannel samples").
+const SUBSET_MAX_BLOCK_SIZE: u32 = 16_384;
+/// Streamable-subset block-size ceiling for audio with a sample rate
+/// ≤ 48000 Hz (RFC 9639 §7: "Audio with a sample rate less than or equal
+/// to 48000 Hz MUST NOT be contained in blocks with more than 4608
+/// interchannel samples").
+const SUBSET_MAX_BLOCK_SIZE_LOW_RATE: u32 = 4_608;
+/// Sample-rate boundary (inclusive) below which the 4608-sample subset
+/// block-size ceiling applies (RFC 9639 §7).
+const SUBSET_BLOCK_SIZE_RATE_BOUNDARY: u32 = 48_000;
 /// Default highest LPC order the encoder will try. The decoder (and
 /// RFC 9639 §9.2.6) supports up to 32, but the gain curve flattens
 /// fast: most content tops out somewhere between order 6 and order 12.
@@ -468,9 +532,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 /// Same as [`make_encoder`] but accepts a [`FlacEncoderOptions`] for
-/// caller-tunable knobs (padding reservation, future LPC / block-size
-/// overrides). `make_encoder` is a thin wrapper that passes
-/// `FlacEncoderOptions::default()` through.
+/// caller-tunable knobs (padding reservation, LPC-order / partition-order
+/// ceilings, apodization window set, per-frame block size). `make_encoder`
+/// is a thin wrapper that passes `FlacEncoderOptions::default()` through.
 pub fn make_encoder_with_options(
     params: &CodecParameters,
     options: FlacEncoderOptions,
@@ -527,8 +591,40 @@ pub fn make_encoder_with_options(
         }
     }
 
+    // Resolve + validate the per-frame block size (RFC 9639 §9.1).
+    // `None` keeps the historical fixed 4096. Any explicit value must sit
+    // in the STREAMINFO range 16..=65535 (§8.2); subset membership (§7)
+    // additionally bounds it unless the caller opts out.
+    let block_size = match options.block_size {
+        None => DEFAULT_BLOCK_SIZE,
+        Some(n) => {
+            if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&n) {
+                return Err(Error::invalid(format!(
+                    "FLAC encoder: block_size {} outside STREAMINFO range {}..={} (RFC 9639 §8.2)",
+                    n, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE
+                )));
+            }
+            if !options.allow_non_subset_block_size {
+                let subset_ceiling = if sample_rate <= SUBSET_BLOCK_SIZE_RATE_BOUNDARY {
+                    SUBSET_MAX_BLOCK_SIZE_LOW_RATE
+                } else {
+                    SUBSET_MAX_BLOCK_SIZE
+                };
+                if n > subset_ceiling {
+                    return Err(Error::invalid(format!(
+                        "FLAC encoder: block_size {} exceeds streamable-subset ceiling {} for \
+                         sample_rate {} Hz (RFC 9639 §7); set \
+                         FlacEncoderOptions::allow_non_subset_block_size to allow it",
+                        n, subset_ceiling, sample_rate
+                    )));
+                }
+            }
+            n
+        }
+    };
+
     let extradata = build_extradata(
-        DEFAULT_BLOCK_SIZE,
+        block_size,
         sample_rate,
         channels as u8,
         bps,
@@ -553,7 +649,7 @@ pub fn make_encoder_with_options(
         bps,
         channels,
         sample_rate,
-        block_size: DEFAULT_BLOCK_SIZE,
+        block_size,
         time_base: TimeBase::new(1, sample_rate as i64),
         interleaved: Vec::new(),
         pending: std::collections::VecDeque::new(),
@@ -4724,5 +4820,266 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Configurable block size (FlacEncoderOptions::block_size) --------
+
+    /// Drive an `S16` mono signal through `make_encoder_with_options` with
+    /// the given options, fully decode the resulting frames, and return
+    /// `(recovered_interleaved_pcm_bytes, frame_count, observed_block_sizes)`.
+    /// Used by the block-size tests to assert losslessness + framing.
+    fn encode_decode_mono_s16_with_opts(
+        pcm: &[u8],
+        sr: u32,
+        opts: FlacEncoderOptions,
+    ) -> (Vec<u8>, usize, Vec<u32>) {
+        let n = pcm.len() / 2;
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let mut enc = make_encoder_with_options(&p, opts).unwrap();
+        let af = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.to_vec()],
+        };
+        enc.send_frame(&Frame::Audio(af)).unwrap();
+        enc.flush().unwrap();
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        assert!(!frames.is_empty(), "encoder produced no packets");
+
+        let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+        dparams.extradata = enc.output_params().extradata.clone();
+        let mut dec = decoder::make_decoder(&dparams).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut block_sizes: Vec<u32> = Vec::new();
+        let frame_count = frames.len();
+        for f in frames {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+            pkt.pts = Some(0);
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                block_sizes.push(a.samples);
+                out.extend_from_slice(&a.data[0]);
+            }
+        }
+        (out, frame_count, block_sizes)
+    }
+
+    /// Deterministic xorshift S16 mono PCM of `n` interchannel samples.
+    fn synth_mono_s16(n: usize, seed: u64) -> Vec<u8> {
+        let mut rng = seed;
+        let mut pcm = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            // Mix a tonal component with low-amplitude noise so LPC has
+            // something to fit and the Rice search has structure to find.
+            let tone = ((i as f64 * 0.05).sin() * 8_000.0) as i32;
+            let noise = (rng % 401) as i32 - 200;
+            let v = (tone + noise).clamp(-32_768, 32_767) as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        pcm
+    }
+
+    /// `block_size: None` must be byte-for-byte identical to an explicit
+    /// `Some(4096)` and to the historical `make_encoder` default — the
+    /// configured size is the only thing that changes, and 4096 is the
+    /// historical constant.
+    #[test]
+    fn block_size_none_equals_default_4096() {
+        let sr = 44_100u32;
+        let pcm = synth_mono_s16(10_000, 0xa1b2_c3d4_e5f6_0789);
+
+        let (out_default, frames_default, _) =
+            encode_decode_mono_s16_with_opts(&pcm, sr, FlacEncoderOptions::default());
+        let (out_explicit, frames_explicit, blocks_explicit) = encode_decode_mono_s16_with_opts(
+            &pcm,
+            sr,
+            FlacEncoderOptions {
+                block_size: Some(4096),
+                ..FlacEncoderOptions::default()
+            },
+        );
+
+        assert_eq!(out_default, pcm, "default path is not lossless");
+        assert_eq!(
+            out_explicit, out_default,
+            "explicit Some(4096) diverged from None"
+        );
+        assert_eq!(
+            frames_explicit, frames_default,
+            "explicit Some(4096) changed the frame count"
+        );
+        // 10_000 / 4096 -> 3 frames: 4096, 4096, 1808.
+        assert_eq!(frames_default, 3);
+        assert_eq!(blocks_explicit, vec![4096, 4096, 1808]);
+    }
+
+    /// A non-default subset-legal block size (1024) must round-trip
+    /// bit-exactly and produce the expected fixed-block framing: every
+    /// frame but the last carries exactly the configured size, and the
+    /// last carries the remainder (exempt from the minimum floor, RFC 9639
+    /// §8.2). STREAMINFO must record `min == max == 1024`.
+    #[test]
+    fn small_block_size_roundtrips_and_frames_as_configured() {
+        let sr = 44_100u32;
+        let total = 3_500usize; // 3 * 1024 + 428
+        let pcm = synth_mono_s16(total, 0x0246_8ace_1357_9bdf);
+
+        let (out, frame_count, blocks) = encode_decode_mono_s16_with_opts(
+            &pcm,
+            sr,
+            FlacEncoderOptions {
+                block_size: Some(1024),
+                ..FlacEncoderOptions::default()
+            },
+        );
+
+        assert_eq!(out, pcm, "configured-block-size output is not lossless");
+        assert_eq!(frame_count, 4);
+        assert_eq!(blocks, vec![1024, 1024, 1024, 428]);
+
+        // STREAMINFO min/max block size both equal the configured size
+        // (fixed-blocking strategy).
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let enc = make_encoder_with_options(
+            &p,
+            FlacEncoderOptions {
+                block_size: Some(1024),
+                ..FlacEncoderOptions::default()
+            },
+        )
+        .unwrap();
+        // extradata is the STREAMINFO metadata block: 4-byte block header
+        // followed by the 34-byte payload (no `fLaC` magic — that lives in
+        // the container, not extradata).
+        let info = StreamInfo::parse(&enc.output_params().extradata[4..4 + 34]).unwrap();
+        assert_eq!(info.min_block_size, 1024);
+        assert_eq!(info.max_block_size, 1024);
+    }
+
+    /// Block size must sit inside the STREAMINFO 16..=65535 range
+    /// (RFC 9639 §8.2). Values outside it are rejected at construction.
+    #[test]
+    fn block_size_out_of_streaminfo_range_is_rejected() {
+        let p = build_audio_params(1, 44_100, SampleFormat::S16);
+        for bad in [0u32, 1, 15, 65_536, 100_000] {
+            let r = make_encoder_with_options(
+                &p,
+                FlacEncoderOptions {
+                    block_size: Some(bad),
+                    // Allow non-subset so the *subset* ceiling never masks
+                    // the range check for the large values.
+                    allow_non_subset_block_size: true,
+                    ..FlacEncoderOptions::default()
+                },
+            );
+            assert!(r.is_err(), "block_size {bad} should be rejected");
+        }
+        // The boundary values 16 and 65535 are accepted (65535 needs the
+        // non-subset opt-in to clear the subset ceiling).
+        for ok in [16u32, 65_535] {
+            let r = make_encoder_with_options(
+                &p,
+                FlacEncoderOptions {
+                    block_size: Some(ok),
+                    allow_non_subset_block_size: true,
+                    ..FlacEncoderOptions::default()
+                },
+            );
+            assert!(r.is_ok(), "block_size {ok} should be accepted");
+        }
+    }
+
+    /// The streamable-subset ceiling depends on sample rate (RFC 9639 §7):
+    /// 4608 for ≤ 48 kHz, 16384 above. A request above the applicable
+    /// ceiling is rejected by default and accepted with the non-subset
+    /// opt-in.
+    #[test]
+    fn subset_block_size_ceiling_is_rate_dependent() {
+        // ≤ 48 kHz: 4608 is the ceiling.
+        let low = build_audio_params(1, 44_100, SampleFormat::S16);
+        assert!(make_encoder_with_options(
+            &low,
+            FlacEncoderOptions {
+                block_size: Some(4_608),
+                ..FlacEncoderOptions::default()
+            },
+        )
+        .is_ok());
+        assert!(
+            make_encoder_with_options(
+                &low,
+                FlacEncoderOptions {
+                    block_size: Some(4_609),
+                    ..FlacEncoderOptions::default()
+                },
+            )
+            .is_err(),
+            "4609 should exceed the ≤48 kHz subset ceiling"
+        );
+        // Same 4609 clears with the opt-in.
+        assert!(make_encoder_with_options(
+            &low,
+            FlacEncoderOptions {
+                block_size: Some(4_609),
+                allow_non_subset_block_size: true,
+                ..FlacEncoderOptions::default()
+            },
+        )
+        .is_ok());
+
+        // > 48 kHz: 16384 is the ceiling, so 8192 is subset-legal.
+        let high = build_audio_params(1, 96_000, SampleFormat::S16);
+        assert!(make_encoder_with_options(
+            &high,
+            FlacEncoderOptions {
+                block_size: Some(8_192),
+                ..FlacEncoderOptions::default()
+            },
+        )
+        .is_ok());
+        assert!(
+            make_encoder_with_options(
+                &high,
+                FlacEncoderOptions {
+                    block_size: Some(16_385),
+                    ..FlacEncoderOptions::default()
+                },
+            )
+            .is_err(),
+            "16385 should exceed the universal 16384 subset ceiling"
+        );
+    }
+
+    /// A non-subset block size above the subset ceiling but within the
+    /// STREAMINFO range must still produce a fully lossless, decodable
+    /// stream (block size is a free encoder choice the decoder reads from
+    /// the frame header, RFC 9639 §9.1.2).
+    #[test]
+    fn non_subset_block_size_roundtrips_bit_exact() {
+        let sr = 44_100u32; // ≤ 48 kHz, so 8192 is non-subset here.
+        let total = 20_000usize;
+        let pcm = synth_mono_s16(total, 0x1111_2222_3333_4444);
+
+        let (out, _frames, blocks) = encode_decode_mono_s16_with_opts(
+            &pcm,
+            sr,
+            FlacEncoderOptions {
+                block_size: Some(8_192),
+                allow_non_subset_block_size: true,
+                ..FlacEncoderOptions::default()
+            },
+        );
+        assert_eq!(out, pcm, "non-subset block-size output is not lossless");
+        // 20000 / 8192 -> 8192, 8192, 3616.
+        assert_eq!(blocks, vec![8_192, 8_192, 3_616]);
     }
 }

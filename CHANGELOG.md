@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: caller-configurable per-frame block size via
+  `FlacEncoderOptions::block_size` + a subset opt-out flag
+  `FlacEncoderOptions::allow_non_subset_block_size` (RFC 9639 §9.1).
+  `None` (the default) keeps the historical fixed 4096-sample block and is
+  byte-for-byte unchanged. `Some(n)` sets the fixed-blocking block size to
+  `n` (STREAMINFO `min_block_size == max_block_size == n`); every frame but
+  the last carries exactly `n` interchannel samples, the last carries the
+  remainder (exempt from the §8.2 minimum-block floor). `n` must sit in the
+  STREAMINFO range `16..=65535` (RFC 9639 §8.2) or construction returns
+  `Error::invalid`. By default the block size is held inside the streamable
+  subset (RFC 9639 §7: ≤ 4608 for sample rates ≤ 48 kHz, ≤ 16384 otherwise)
+  and a request above the applicable ceiling is rejected;
+  `allow_non_subset_block_size: true` lifts the bound to the full
+  STREAMINFO ceiling (65535), producing a valid — but no longer
+  streamable-subset — stream any spec-complete decoder (including this
+  crate's) recovers bit-exactly. The block size is a free encoder choice
+  the decoder reads from the §9.1.2 frame-header field, so it changes only
+  framing/rate, never the recovered samples. The existing per-subframe LPC
+  precision ceiling and Rice partition-order search already key off the
+  live per-frame block length, so they adapt to the configured size with
+  no further change. New tests:
+  `block_size_none_equals_default_4096` (default / explicit-4096 byte
+  equivalence + framing), `small_block_size_roundtrips_and_frames_as_configured`
+  (1024-sample fixed-block lossless round-trip + STREAMINFO min==max==1024),
+  `block_size_out_of_streaminfo_range_is_rejected` (16..=65535 bounds),
+  `subset_block_size_ceiling_is_rate_dependent` (4608/16384 rate-keyed
+  ceiling + opt-in), and `non_subset_block_size_roundtrips_bit_exact`
+  (8192-sample non-subset lossless round-trip at 44.1 kHz).
 - encoder: caller-configurable apodization (analysis) window set via
   `FlacEncoderOptions::apodization` + a public `encoder::Apodization`
   enum (`Welch` / `Hann` / `Tukey { alpha_num, alpha_den }`). `None`

@@ -160,7 +160,22 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   partition size. The default factory keeps the subset-compliant
   ceiling of 8 and is byte-for-byte unaffected. Output stays a valid
   (non-subset) FLAC stream.
-- **Block size**: 4096 samples per frame (fixed-blocking strategy).
+- **Block size**: 4096 samples per frame (fixed-blocking strategy) by
+  default. `make_encoder_with_options(params, FlacEncoderOptions {
+  block_size: Some(n), .. })` sets the per-frame block size to any `n` in
+  the STREAMINFO range `16..=65535` (RFC 9639 §8.2); every frame but the
+  last carries exactly `n` interchannel samples and the last carries the
+  remainder (the §8.2 minimum-block floor exempts the last frame). A
+  larger block amortises the per-frame header + LPC warm-up/coefficient
+  overhead and lets the predictor + Rice-partition search adapt over a
+  longer window; a smaller block trades that for lower latency and finer
+  seek granularity. By default the size is held inside the streamable
+  subset (RFC 9639 §7: ≤ 4608 for sample rates ≤ 48 kHz, ≤ 16384
+  otherwise) and a request beyond the applicable ceiling is rejected;
+  `allow_non_subset_block_size: true` lifts the check to the full
+  STREAMINFO ceiling, producing a valid (non-subset) stream any
+  spec-complete decoder still recovers bit-exactly. `None` keeps the
+  historical 4096 byte-for-byte.
 - **Metadata**: emits a STREAMINFO header in `extradata`. An MD5
   signature of the PCM input is computed during encode and written
   into the block at `flush()` time, along with the observed
