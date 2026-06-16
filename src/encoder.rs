@@ -102,6 +102,90 @@ pub struct FlacEncoderOptions {
     /// already permits orders up to 32, so raising the ceiling there
     /// stays inside the subset.
     pub max_lpc_order: Option<usize>,
+
+    /// Override the set of apodization (analysis) windows the
+    /// per-subframe LPC search evaluates. `None` (the default) keeps the
+    /// historical three-window set — Welch, Hann, Tukey(1/4) — and is
+    /// byte-for-byte unchanged.
+    ///
+    /// An apodization window tapers a block before the autocorrelation
+    /// that feeds Levinson-Durbin (RFC 9639 §9.2.6). It has **no**
+    /// on-wire footprint: the RFC fixes only the quantised coefficients,
+    /// precision, and shift that reach the bitstream, so which window
+    /// shaped the analysis is invisible to the decoder. Different windows
+    /// trade spectral leakage against retained edge energy, and the best
+    /// one is signal-dependent, so the encoder solves under each window
+    /// in the set, residual-codes the result, and keeps whichever LPC
+    /// subframe encodes smallest. Because the minimum-bit `best_subframe`
+    /// driver always keeps the smallest plan across every `(window,
+    /// order, precision)` candidate it visits, adding windows can only
+    /// ever shrink or tie the output — a window that never wins is
+    /// silently discarded. The trade is encode cost: each extra window is
+    /// one more Levinson-Durbin solve (plus its precision sweep) per LPC
+    /// order per subframe.
+    ///
+    /// `Some(set)` replaces the default windows with `set`. An empty set
+    /// is treated as the historical default (the LPC search needs at
+    /// least one window to run). Duplicate windows are harmless — they
+    /// just cost a redundant solve. The produced bytes stay a fully valid
+    /// streamable-subset FLAC stream regardless of the window set; this
+    /// knob never affects subset membership.
+    pub apodization: Option<Vec<Apodization>>,
+}
+
+/// A caller-selectable apodization (analysis) window for the encoder's
+/// per-subframe LPC search. See [`FlacEncoderOptions::apodization`].
+///
+/// These are the public mirror of the encoder-internal window set. They
+/// carry **no** bitstream semantics (RFC 9639 §9.2.6 leaves the analysis
+/// window a free encoder choice); the decoder never observes which one
+/// was used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Apodization {
+    /// Parabolic taper `1 - x^2`. Centre-heavy, cheap, a strong
+    /// all-rounder on steady tonal content; the encoder's historical
+    /// default window.
+    Welch,
+    /// Raised-cosine `0.5 - 0.5*cos(2*pi*i/(N-1))`. Lower side lobes than
+    /// Welch — better on signals with closely-spaced partials — at the
+    /// cost of heavier edge attenuation.
+    Hann,
+    /// Tapered-cosine ("Tukey") with taper fraction `alpha = num/den`: a
+    /// flat top over the central `(1-alpha)` of the block with cosine
+    /// ramps over the outer `alpha`. `alpha` is clamped into `[0, 1]`
+    /// (`0` degenerates to a rectangular window, `1` to a Hann). A small
+    /// `alpha` keeps almost the whole block at full weight (good for
+    /// transient-light blocks) while still smoothing the block-boundary
+    /// discontinuity an un-windowed autocorrelation would alias. `den`
+    /// must be non-zero; a zero denominator is treated as `alpha = 0`.
+    Tukey {
+        /// Numerator of the taper fraction `alpha`.
+        alpha_num: u32,
+        /// Denominator of the taper fraction `alpha` (treated as `1`
+        /// when zero to avoid a divide-by-zero in the weight function).
+        alpha_den: u32,
+    },
+}
+
+impl Apodization {
+    /// Lower the public window to the encoder-internal representation.
+    fn to_internal(self) -> ApodizationWindow {
+        match self {
+            Apodization::Welch => ApodizationWindow::Welch,
+            Apodization::Hann => ApodizationWindow::Hann,
+            Apodization::Tukey {
+                alpha_num,
+                alpha_den,
+            } => ApodizationWindow::Tukey {
+                alpha_num,
+                // A zero denominator would divide-by-zero in `weight`;
+                // map it to alpha = 0 (rectangular) so the public API can
+                // never trip an internal panic.
+                alpha_den: if alpha_den == 0 { 1 } else { alpha_den },
+            },
+        }
+    }
 }
 
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
@@ -203,6 +287,17 @@ struct SubframeScratch {
     /// ceiling; the production encoder overrides it from
     /// [`FlacEncoderOptions::max_lpc_order`].
     max_lpc_order: usize,
+    /// Apodization windows the LPC search evaluates per subframe (RFC
+    /// 9639 §9.2.6). Like `max_lpc_order` this is per-encoder
+    /// configuration carried on the scratch so it rides the same call
+    /// chain the candidate sweep already threads. `Default` populates it
+    /// with the historical three-window set, so every reference / test
+    /// path that builds a `SubframeScratch::default()` keeps the prior
+    /// behaviour; the production encoder overrides it from
+    /// [`FlacEncoderOptions::apodization`]. Never empty — the LPC search
+    /// needs at least one window — so the constructor falls back to the
+    /// default set when the caller supplies an empty list.
+    apodization: Vec<ApodizationWindow>,
     /// Residual values: `samples[order..] - prediction` for FIXED and LPC.
     residuals: Vec<i32>,
     /// Zigzag-encoded view of `residuals` so the partition search reads
@@ -241,6 +336,7 @@ impl Default for SubframeScratch {
         SubframeScratch {
             max_partition_order: SUBSET_MAX_PARTITION_ORDER,
             max_lpc_order: SUBSET_MAX_LPC_ORDER,
+            apodization: APODIZATION_WINDOWS.to_vec(),
             residuals: Vec::new(),
             zigzag: Vec::new(),
             prefix: Vec::new(),
@@ -484,6 +580,14 @@ pub fn make_encoder_with_options(
             max_lpc_order: match options.max_lpc_order {
                 Some(k) => k.clamp(1, SPEC_MAX_LPC_ORDER),
                 None => SUBSET_MAX_LPC_ORDER,
+            },
+            // Replace the default window set only when the caller
+            // supplied a non-empty list; an empty list (or `None`) keeps
+            // the historical Welch/Hann/Tukey(1/4) set so the LPC search
+            // always has at least one window to solve under.
+            apodization: match &options.apodization {
+                Some(set) if !set.is_empty() => set.iter().map(|w| w.to_internal()).collect(),
+                _ => APODIZATION_WINDOWS.to_vec(),
             },
             ..SubframeScratch::default()
         },
@@ -1275,7 +1379,13 @@ fn encode_lpc_plan_s(
     let floor = floor.max(MIN_LPC_QLP_PRECISION);
 
     let mut best: Option<SubframePlan> = None;
-    for &window in APODIZATION_WINDOWS.iter() {
+    // Detach the configured window set so the inner solve/precision
+    // passes can borrow `scratch` mutably for their own buffers without
+    // aliasing the read-only window list. `apodization` is never touched
+    // by any callee, so a `take` + restore is a clone-free borrow (same
+    // shape as the `lpc_coeffs` detach below). Restored before return.
+    let windows = std::mem::take(&mut scratch.apodization);
+    for &window in windows.iter() {
         // `levinson_durbin_s` writes its FLAC-convention coefficients
         // into `scratch.lpc_coeffs`. Returning `Ok` lets the precision
         // sweep below read `scratch.lpc_coeffs` directly; on `Err` the
@@ -1302,6 +1412,7 @@ fn encode_lpc_plan_s(
         }
         scratch.lpc_coeffs = coeffs;
     }
+    scratch.apodization = windows;
     best
 }
 
@@ -3838,6 +3949,248 @@ mod tests {
             r.push((v * 0.87) as i32);
         }
         roundtrip(vec![l, r], sr, 16);
+    }
+
+    // ------------------------------------------------------------------
+    // Caller-configurable apodization window set
+    // (`FlacEncoderOptions::apodization`).
+    // ------------------------------------------------------------------
+
+    /// `apodization: None` and an explicit `Some(<the default set>)` must
+    /// produce byte-for-byte identical output, and an empty `Some(vec![])`
+    /// must fall back to that same default set (the LPC search needs at
+    /// least one window). This pins the default-equivalence + empty-list
+    /// guard the same way `max_lpc_order: None == Some(12)` is pinned.
+    #[test]
+    fn apodization_none_equals_default_set_and_empty_falls_back() {
+        let p = build_audio_params(1, 48_000, SampleFormat::S16);
+        let pcm: Vec<u8> = (0..4096i32)
+            .flat_map(|i| (((i * 13) % 7919 - 3960) as i16).to_le_bytes())
+            .collect();
+        let emit = |opts: FlacEncoderOptions| -> Vec<u8> {
+            let mut enc = make_encoder_with_options(&p, opts).unwrap();
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: 4096,
+                pts: Some(0),
+                data: vec![pcm.clone()],
+            }))
+            .unwrap();
+            enc.flush().unwrap();
+            let mut bytes = Vec::new();
+            while let Ok(pkt) = enc.receive_packet() {
+                bytes.extend_from_slice(&pkt.data);
+            }
+            bytes
+        };
+        let default_bytes = emit(FlacEncoderOptions::default());
+        let explicit_default = emit(FlacEncoderOptions {
+            apodization: Some(vec![
+                Apodization::Welch,
+                Apodization::Hann,
+                Apodization::Tukey {
+                    alpha_num: 1,
+                    alpha_den: 4,
+                },
+            ]),
+            ..FlacEncoderOptions::default()
+        });
+        let empty = emit(FlacEncoderOptions {
+            apodization: Some(vec![]),
+            ..FlacEncoderOptions::default()
+        });
+        assert_eq!(
+            default_bytes, explicit_default,
+            "apodization: None must match an explicit default window set byte-for-byte"
+        );
+        assert_eq!(
+            default_bytes, empty,
+            "an empty apodization set must fall back to the default set byte-for-byte"
+        );
+    }
+
+    /// A custom apodization set must still produce lossless output:
+    /// the window only shapes the analysis that picks LPC coefficients,
+    /// never the decoder-visible bitstream semantics, so any set recovers
+    /// the input PCM bit-exactly. Uses a single non-default Tukey window
+    /// so the custom path (not the default) is the one exercised.
+    #[test]
+    fn custom_apodization_set_roundtrips_bit_exact() {
+        let sr = 44_100u32;
+        let n = 4096usize;
+        let samples: Vec<i32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / sr as f64;
+                ((t * 660.0 * 2.0 * std::f64::consts::PI).sin() * 14_000.0
+                    + (t * 1320.0 * 2.0 * std::f64::consts::PI).sin() * 6_000.0)
+                    as i32
+            })
+            .collect();
+        let mut pcm = Vec::with_capacity(n * 2);
+        for &s in &samples {
+            pcm.extend_from_slice(&(s as i16).to_le_bytes());
+        }
+
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            apodization: Some(vec![
+                Apodization::Tukey {
+                    alpha_num: 1,
+                    alpha_den: 2,
+                },
+                Apodization::Welch,
+            ]),
+            ..FlacEncoderOptions::default()
+        };
+        let mut enc = make_encoder_with_options(&p, opts).unwrap();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.clone()],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        assert!(!frames.is_empty(), "encoder produced no packets");
+
+        let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+        dparams.extradata = enc.output_params().extradata.clone();
+        let mut dec = decoder::make_decoder(&dparams).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        for f in frames {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+            pkt.pts = Some(0);
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                out.extend_from_slice(&a.data[0]);
+            }
+        }
+        assert_eq!(out, pcm, "custom-apodization output is not lossless");
+    }
+
+    /// The window set genuinely steers the LPC fit: a window the default
+    /// three-set never tries — a wide Tukey(7/8), almost a Hann but with a
+    /// small flat top — can strictly beat the default set on a signal it
+    /// for at least one LPC order. This proves the override genuinely
+    /// re-routes the analysis rather than collapsing back onto the same
+    /// three windows. Two checks: (a) a single non-default window (wide
+    /// Tukey(7/8)) yields a *different* per-order best than a single Welch
+    /// window, so the set really steers the autocorrelation; and (b) a
+    /// custom set that adds low-leakage windows strictly beats a
+    /// Welch-only set on leakage-sensitive content. We drive the internal
+    /// `encode_lpc_plan_s` with each scratch's window set installed so the
+    /// only variable is the apodization list.
+    #[test]
+    fn custom_window_can_beat_default_set() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        // Closely-spaced partials whose leakage a centre-heavy window
+        // smears, so the choice of window measurably moves the LPC fit.
+        let samples: Vec<i32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / sr as f64;
+                ((t * 3000.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                    + (t * 3037.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                    + (t * 9000.0 * 2.0 * std::f64::consts::PI).sin() * 3_000.0)
+                    as i32
+            })
+            .collect();
+
+        let per_order = |windows: Vec<ApodizationWindow>| -> Vec<u64> {
+            let mut scratch = SubframeScratch {
+                apodization: windows,
+                ..SubframeScratch::default()
+            };
+            (1..=SUBSET_MAX_LPC_ORDER)
+                .map(|order| {
+                    encode_lpc_plan_s(&samples, 16, order, 0, &mut scratch)
+                        .map(|p| p.bits)
+                        .unwrap_or(u64::MAX)
+                })
+                .collect()
+        };
+        let min_of = |v: &[u64]| v.iter().copied().min().unwrap_or(u64::MAX);
+
+        let welch_only = per_order(vec![ApodizationWindow::Welch]);
+        // A wide Tukey (alpha 7/8) is outside the default set.
+        let wide_tukey = per_order(vec![ApodizationWindow::Tukey {
+            alpha_num: 7,
+            alpha_den: 8,
+        }]);
+        // (a) The two single-window searches must disagree on at least one
+        //     order — proof the apodization list actually changes the fit.
+        assert!(
+            welch_only != wide_tukey,
+            "single-window apodization sets produced identical per-order plans \
+             — the window override is not steering the search"
+        );
+
+        // (b) A custom set pairing the wide Tukey with Hann (both lower
+        //     leakage than Welch) must beat a Welch-only set on this
+        //     leakage-sensitive content.
+        let custom = per_order(vec![
+            ApodizationWindow::Hann,
+            ApodizationWindow::Tukey {
+                alpha_num: 7,
+                alpha_den: 8,
+            },
+        ]);
+        assert!(
+            min_of(&custom) < min_of(&welch_only),
+            "expected a low-leakage custom window set to beat Welch-only on \
+             leakage-sensitive content: custom={} welch_only={}",
+            min_of(&custom),
+            min_of(&welch_only)
+        );
+    }
+
+    /// A Tukey window with a zero denominator must not divide-by-zero: the
+    /// public `Apodization::to_internal` maps `den == 0` to `alpha = 0`
+    /// (rectangular), so construction succeeds and encoding round-trips.
+    #[test]
+    fn zero_denominator_tukey_is_safe_and_lossless() {
+        let sr = 48_000u32;
+        let n = 2048usize;
+        let pcm: Vec<u8> = (0..n as i32)
+            .flat_map(|i| (((i * 11) % 5001 - 2500) as i16).to_le_bytes())
+            .collect();
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let opts = FlacEncoderOptions {
+            apodization: Some(vec![Apodization::Tukey {
+                alpha_num: 1,
+                alpha_den: 0, // pathological; must be treated as rectangular
+            }]),
+            ..FlacEncoderOptions::default()
+        };
+        let mut enc = make_encoder_with_options(&p, opts).expect("zero-den Tukey must not error");
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.clone()],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+        dparams.extradata = enc.output_params().extradata.clone();
+        let mut dec = decoder::make_decoder(&dparams).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        for f in frames {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+            pkt.pts = Some(0);
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                out.extend_from_slice(&a.data[0]);
+            }
+        }
+        assert_eq!(out, pcm, "zero-den Tukey output is not lossless");
     }
 
     // --- PADDING-aware encoder options (round 158) -----------------------

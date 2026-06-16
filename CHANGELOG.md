@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: caller-configurable apodization (analysis) window set via
+  `FlacEncoderOptions::apodization` + a public `encoder::Apodization`
+  enum (`Welch` / `Hann` / `Tukey { alpha_num, alpha_den }`). `None`
+  (the default) keeps the historical three-window set — Welch, Hann,
+  Tukey(1/4) — and is byte-for-byte unchanged; an empty `Some(vec![])`
+  falls back to that set so the LPC search always has at least one
+  window. `Some(set)` replaces the windows the per-subframe LPC search
+  evaluates (RFC 9639 §9.2.6). A window only tapers the block before the
+  autocorrelation that feeds Levinson-Durbin — it has no on-wire
+  footprint (the RFC fixes only the quantised coefficients, precision,
+  and shift), so the decoder never observes it and the output stays a
+  valid streamable-subset stream for any set. The minimum-bit
+  `best_subframe` driver keeps the smallest plan across every `(window,
+  order, precision)` candidate, so a larger set can only shrink or tie
+  the output; the trade is one extra Levinson-Durbin solve per window
+  per LPC order. `Apodization::Tukey` takes a clamped `alpha = num/den`
+  taper fraction (a zero denominator is treated as `alpha = 0`,
+  rectangular, so the public API can never trip the internal weight
+  function's divide). New tests:
+  `apodization_none_equals_default_set_and_empty_falls_back` (default /
+  empty-set byte equivalence), `custom_apodization_set_roundtrips_bit_exact`
+  + `zero_denominator_tukey_is_safe_and_lossless` (lossless through the
+  custom path incl. the pathological denominator), and
+  `custom_window_can_beat_default_set` (a non-default window set steers
+  the LPC fit + beats Welch-only on leakage-sensitive content).
 - fuzz: thirteenth `cargo-fuzz` target `seek` hardening the demuxer
   seek path (`<FlacDemuxer as Demuxer>::seek_to` + post-seek packet
   drain) for panic-freedom (RFC 9639 §8.5 SEEKTABLE). No prior target

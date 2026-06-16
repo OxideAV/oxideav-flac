@@ -126,6 +126,23 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   kHz audio that actually selects an order above 12, **subset
   membership** (RFC 9639 §7). The default `None` is byte-for-byte
   identical to the historical encoder and stays subset-compliant.
+- **Custom apodization windows (opt-in)**:
+  `encoder::make_encoder_with_options(params, FlacEncoderOptions {
+  apodization: Some(vec![Apodization::Hann, Apodization::Tukey {
+  alpha_num: 1, alpha_den: 8 }, ..]), .. })` replaces the default
+  three-window analysis set (Welch, Hann, Tukey(1/4)) with a
+  caller-chosen set. An apodization window only tapers a block before
+  the autocorrelation that feeds Levinson-Durbin — it has **no**
+  on-wire footprint (RFC 9639 §9.2.6 fixes only the quantised
+  coefficients, precision, and shift that reach the bitstream), so the
+  decoder never observes it and output stays a valid streamable-subset
+  stream regardless of the set. The encoder solves under every window
+  in the set and the minimum-bit driver keeps the smallest plan, so
+  more windows can only shrink or tie the output at the cost of one
+  extra Levinson-Durbin solve per window per order. `Apodization::Tukey`
+  takes an `alpha = num/den` taper fraction (clamped to `[0, 1]`; a zero
+  denominator is treated as `0`). An empty set or the default `None`
+  keeps the historical three-window search byte-for-byte.
 - **Wasted bits per sample**: detected per subframe (largest `k` such
   that every sample is divisible by `2^k`) and folded into the spec's
   wasted-bits unary header.
