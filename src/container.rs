@@ -179,6 +179,7 @@ fn open_demuxer(
         duration_micros,
         seek_points,
         first_frame_offset,
+        total_samples: info.total_samples,
         chapters,
         cuesheet,
     }))
@@ -336,6 +337,10 @@ struct FlacDemuxer {
     /// Byte offset of the first frame in the stream (immediately
     /// after the metadata-block sequence).
     first_frame_offset: u64,
+    /// Total interchannel samples from STREAMINFO (0 if the field was
+    /// left unset, i.e. "unknown"). Used as an upper bound for the
+    /// seektable-less scanning seek's RFC 9639 §11 plausibility check.
+    total_samples: u64,
     /// Chapter list derived from the CUESHEET block (when present).
     /// Each entry corresponds to one CUESHEET track except the trailing
     /// lead-out (whose offset is folded into the previous chapter's
@@ -509,6 +514,124 @@ struct EmittedFrame {
     duration: i64,
 }
 
+impl FlacDemuxer {
+    /// Locate the frame to land on for `target` (a stream-relative
+    /// sample index) by scanning frame headers forward from the start of
+    /// the frame stream. Used when the file carries no SEEKTABLE.
+    ///
+    /// Returns `(anchor_sample, byte_offset)` where `anchor_sample` is
+    /// the first sample of the chosen frame and `byte_offset` is that
+    /// frame's position relative to [`Self::first_frame_offset`] — the
+    /// same `(sample, offset)` pair shape the SEEKTABLE path produces, so
+    /// the caller's positioning logic is identical for both.
+    ///
+    /// The chosen frame is the last one whose first sample is `<=
+    /// target`, mirroring the SEEKTABLE branch's "nearest prior point"
+    /// behaviour. The decoder then discards the samples between the
+    /// frame boundary and `target` if exact-sample positioning is wanted.
+    ///
+    /// RFC 9639 §11 plausibility checks (anti-DoS): every candidate
+    /// header is CRC-8-verified by [`parse_frame_header`]; a frame's
+    /// first sample must be strictly greater than the previously
+    /// accepted frame's (frames are monotonic and non-overlapping); and
+    /// no first sample may exceed the STREAMINFO total-sample count when
+    /// that count is known. A header failing any check is skipped as a
+    /// false sync, and the scan cannot loop forever because the read
+    /// cursor advances by at least one byte on every iteration and stops
+    /// at EOF.
+    fn scan_for_target(&mut self, target: u64) -> Result<(u64, u64)> {
+        let block_size = self.scan.streaminfo_block_size;
+        let bound = self.total_samples; // 0 == unknown, no upper clamp
+
+        self.input.seek(SeekFrom::Start(self.first_frame_offset))?;
+
+        // Best frame found so far: (first_sample, byte_offset_in_stream).
+        let mut best: Option<(u64, u64)> = None;
+        // First sample of the most recently accepted frame, for the
+        // strict-monotonic plausibility check.
+        let mut last_accepted: Option<u64> = None;
+
+        // Sliding window over the frame stream. `window_start` is the
+        // byte offset (relative to first_frame_offset) of buf[0].
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut window_start: u64 = 0;
+        let mut search: usize = 0;
+        let mut eof = false;
+
+        loop {
+            // Try to validate a frame header at each candidate sync in the
+            // currently buffered window.
+            while search + 1 < buf.len() {
+                if buf[search] == 0xFF && (buf[search + 1] == 0xF8 || buf[search + 1] == 0xF9) {
+                    match parse_frame_header(&buf[search..]) {
+                        Ok(h) => {
+                            let first = h.first_sample(block_size);
+                            let monotonic = match last_accepted {
+                                Some(prev) => first > prev,
+                                None => true,
+                            };
+                            let plausible = monotonic && (bound == 0 || first < bound);
+                            if plausible {
+                                let off = window_start + search as u64;
+                                if first <= target {
+                                    best = Some((first, off));
+                                    last_accepted = Some(first);
+                                    // Continue scanning: a later frame may
+                                    // still be <= target.
+                                } else {
+                                    // First frame past the target — the
+                                    // best-so-far is our answer. Stop.
+                                    return Ok(best.unwrap_or((0, 0)));
+                                }
+                                // Advance past this header to the next
+                                // candidate (header_byte_len >= 5 > 0, so
+                                // the cursor always moves forward).
+                                search += h.header_byte_len;
+                                continue;
+                            }
+                            // Implausible coded number — treat as a false
+                            // sync and step one byte.
+                            search += 1;
+                        }
+                        Err(Error::NeedMore) => {
+                            // Header straddles the buffer tail; refill.
+                            break;
+                        }
+                        Err(_) => {
+                            // CRC mismatch or malformed — false sync.
+                            search += 1;
+                        }
+                    }
+                } else {
+                    search += 1;
+                }
+            }
+
+            if eof {
+                // Exhausted the stream without overshooting the target;
+                // land on the best frame found (or sample 0 if the file
+                // held no decodable frame at all).
+                return Ok(best.unwrap_or((0, 0)));
+            }
+
+            // Compact consumed bytes so the buffer stays bounded, then
+            // refill from the input.
+            if search > 0 {
+                buf.drain(..search);
+                window_start += search as u64;
+                search = 0;
+            }
+            let mut chunk = [0u8; 8192];
+            let n = read_up_to(&mut self.input, &mut chunk)?;
+            if n == 0 {
+                eof = true;
+            } else {
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
+}
+
 impl Demuxer for FlacDemuxer {
     fn format_name(&self) -> &str {
         "flac"
@@ -552,26 +675,33 @@ impl Demuxer for FlacDemuxer {
                 "FLAC: stream index {stream_index} out of range (only stream 0 exists)"
             )));
         }
-        if self.seek_points.is_empty() {
-            return Err(Error::unsupported(
-                "FLAC: file has no SEEKTABLE metadata block; cannot seek",
-            ));
-        }
         let target = pts.max(0) as u64;
-        // Binary-search for the last SeekPoint with sample_number <= target.
-        // partition_point returns the first index where the predicate is
-        // false, so `idx - 1` is our candidate.
-        let idx = self
-            .seek_points
-            .partition_point(|sp| sp.sample_number <= target);
-        let (anchor_sample, byte_offset) = if idx == 0 {
-            // Target is before the first seek point — land on sample 0
-            // at the start of the frame stream.
-            (0u64, 0u64)
+
+        let (anchor_sample, byte_offset) = if self.seek_points.is_empty() {
+            // No SEEKTABLE: scan frame headers forward from the start of
+            // the frame stream to locate the target frame (RFC 9639 §8.5
+            // — "It is possible to seek to any given sample in a FLAC
+            // stream without a seek table, but the delay can be
+            // unpredictable"). The scan is bounded and CRC-verified per
+            // the §11 anti-DoS guidance.
+            self.scan_for_target(target)?
         } else {
-            let sp = &self.seek_points[idx - 1];
-            (sp.sample_number, sp.offset)
+            // Binary-search for the last SeekPoint with sample_number <=
+            // target. partition_point returns the first index where the
+            // predicate is false, so `idx - 1` is our candidate.
+            let idx = self
+                .seek_points
+                .partition_point(|sp| sp.sample_number <= target);
+            if idx == 0 {
+                // Target is before the first seek point — land on sample 0
+                // at the start of the frame stream.
+                (0u64, 0u64)
+            } else {
+                let sp = &self.seek_points[idx - 1];
+                (sp.sample_number, sp.offset)
+            }
         };
+
         self.input
             .seek(SeekFrom::Start(self.first_frame_offset + byte_offset))?;
         self.scan.reset_to(anchor_sample);

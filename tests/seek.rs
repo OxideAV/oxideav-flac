@@ -1,9 +1,11 @@
 //! FLAC demuxer `seek_to` smoke test.
 //!
-//! Builds a synthetic FLAC prefix (`fLaC` + STREAMINFO + SEEKTABLE) followed
-//! by three hand-rolled fixed-blocking frames whose headers parse and
-//! CRC-8-verify. We seek into the middle of the file via the SEEKTABLE and
-//! assert that the next emitted packet carries the expected sample number.
+//! Builds a synthetic FLAC prefix (`fLaC` + STREAMINFO [+ SEEKTABLE])
+//! followed by three hand-rolled fixed-blocking frames whose headers parse
+//! and CRC-8-verify. We exercise both seek paths — SEEKTABLE-driven
+//! byte-offset seeking and the seektable-less frame-header scanning
+//! fallback (RFC 9639 §8.5) — and assert the next emitted packet carries
+//! the expected sample number.
 
 use std::io::Cursor;
 
@@ -164,28 +166,67 @@ fn flac_seek_before_first_seekpoint_lands_on_frame_zero() {
     assert_eq!(pkt.pts, Some(0));
 }
 
-#[test]
-fn flac_seek_without_seektable_is_unsupported() {
+/// Assemble a synthetic seektable-less FLAC file: `fLaC` + STREAMINFO
+/// (marked last) + the three known frames. No SEEKTABLE block, so a
+/// `seek_to` must use the frame-scanning fallback (RFC 9639 §8.5).
+fn build_seektableless_file() -> Vec<u8> {
+    let (f0, _) = build_frame(0);
+    let (f1, _) = build_frame(1);
+    let (f2, _) = build_frame(2);
     let streaminfo = build_streaminfo();
     let mut file = Vec::new();
     file.extend_from_slice(b"fLaC");
     file.extend_from_slice(&block_header(true, 0, streaminfo.len()));
     file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&f0);
+    file.extend_from_slice(&f1);
+    file.extend_from_slice(&f2);
+    file
+}
 
+fn open_seektableless() -> Box<dyn oxideav_core::Demuxer> {
     let mut reg = ContainerRegistry::new();
     oxideav_flac::register_containers(&mut reg);
-    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
-    let mut demuxer = reg
-        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
-        .expect("open flac");
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(build_seektableless_file()));
+    reg.open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac")
+}
 
-    match demuxer.seek_to(0, 0) {
-        Err(oxideav_core::Error::Unsupported(msg)) => {
-            assert!(
-                msg.contains("SEEKTABLE"),
-                "expected SEEKTABLE hint, got {msg:?}"
-            );
-        }
-        other => panic!("expected Unsupported(SEEKTABLE hint), got {other:?}"),
-    }
+#[test]
+fn flac_seek_without_seektable_scans_to_target_frame() {
+    // No SEEKTABLE present: the demuxer scans frame headers to find the
+    // last frame whose first sample is <= the target. Target 300 sits
+    // inside frame 1 ([192, 384)), so we land on sample 192.
+    let mut demuxer = open_seektableless();
+    let landed = demuxer.seek_to(0, 300).expect("scanning seek");
+    assert_eq!(landed, 192, "expected to land on frame 1's first sample");
+    assert!(landed <= 300, "landing pts must be <= target");
+
+    let pkt = demuxer.next_packet().expect("packet after seek");
+    assert_eq!(pkt.pts, Some(192));
+    assert_eq!(pkt.duration, Some(192));
+
+    let pkt = demuxer.next_packet().expect("second packet after seek");
+    assert_eq!(pkt.pts, Some(384));
+}
+
+#[test]
+fn flac_seek_without_seektable_clamps_negative_to_frame_zero() {
+    // A negative-looking target clamps to 0 and lands on the first frame.
+    let mut demuxer = open_seektableless();
+    let landed = demuxer.seek_to(0, -10).expect("scanning seek");
+    assert_eq!(landed, 0);
+    let pkt = demuxer.next_packet().expect("packet after seek");
+    assert_eq!(pkt.pts, Some(0));
+}
+
+#[test]
+fn flac_seek_without_seektable_past_end_lands_on_last_frame() {
+    // A target beyond every frame's first sample exhausts the scan and
+    // lands on the last decodable frame (sample 384) rather than failing.
+    let mut demuxer = open_seektableless();
+    let landed = demuxer.seek_to(0, 10_000).expect("scanning seek");
+    assert_eq!(landed, 384, "expected to land on the final frame");
+    let pkt = demuxer.next_packet().expect("packet after seek");
+    assert_eq!(pkt.pts, Some(384));
 }

@@ -195,8 +195,18 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Muxer**: writes `fLaC` + preserved metadata blocks + frame
   packets. Packets produced by the encoder pass straight through.
 - **Seeking**: SEEKTABLE-driven byte-offset seek (`seek_to(pts)`
-  lands on the nearest prior seek point). Files without a SEEKTABLE
-  return `Error::Unsupported` on seek.
+  lands on the nearest prior seek point). Files **without** a SEEKTABLE
+  seek via a frame-header scanning fallback (RFC 9639 §8.5 — "it is
+  possible to seek to any given sample in a FLAC stream without a seek
+  table, but the delay can be unpredictable"): the demuxer scans
+  CRC-8-verified frame headers forward from the start of the frame
+  stream and lands on the last frame whose first sample is ≤ the
+  target, exhausting to the final frame for targets past the end and
+  clamping to sample 0 for negative targets. The scan applies the
+  §11 anti-DoS plausibility checks — each accepted coded number must
+  be CRC-verified, strictly increasing, and within the STREAMINFO
+  total-sample bound — so a stream with non-monotonic or out-of-range
+  coded numbers can never loop the scanner.
 - **Metadata surfaces**: Vorbis-comment key/value pairs and attached
   pictures (FLAC PICTURE block + ID3v2 APIC fallback).
 - **Chapters**: CUESHEET tracks are surfaced through

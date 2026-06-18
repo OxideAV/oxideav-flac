@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- demuxer: seektable-less seeking. `seek_to` on a file with no SEEKTABLE
+  metadata block no longer returns `Error::Unsupported`; instead it scans
+  CRC-8-verified frame headers forward from the start of the frame stream
+  and lands on the last frame whose first sample is ≤ the target (RFC 9639
+  §8.5 — seeking without a seek table is permitted, with an
+  implementation-defined delay). Targets past the final frame exhaust the
+  scan to the last decodable frame; negative targets clamp to sample 0.
+  The scan enforces the RFC 9639 §11 anti-DoS plausibility checks — every
+  accepted coded number must be CRC-verified, strictly increasing, and
+  within the STREAMINFO total-sample bound (when known) — and the read
+  cursor advances monotonically, so a malicious stream with non-monotonic
+  or out-of-bounds coded numbers cannot trap the scanner in an infinite
+  loop. The SEEKTABLE-driven path is unchanged.
 - encoder: caller-configurable per-frame block size via
   `FlacEncoderOptions::block_size` + a subset opt-out flag
   `FlacEncoderOptions::allow_non_subset_block_size` (RFC 9639 §9.1).
