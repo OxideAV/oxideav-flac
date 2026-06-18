@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder: two additional apodization (analysis) windows in the public
+  `encoder::Apodization` enum — `Bartlett` (triangular: a linear ramp
+  0→1→0, the cheapest non-rectangular taper, with milder edge attenuation
+  than Hann) and `BlackmanHarris` (the classic four-term cosine-sum
+  window `0.35875 − 0.48829·cos + 0.14128·cos2 − 0.01168·cos3`, whose far
+  lower side lobes give the strongest spectral-leakage suppression in the
+  set). Like the existing windows these only taper a block before the
+  autocorrelation that feeds Levinson-Durbin (RFC 9639 §9.2.6) and have
+  **no** on-wire footprint — the decoder never observes which window
+  shaped the analysis, so output stays a valid streamable-subset stream
+  regardless of the set, and the minimum-bit `best_subframe` driver keeps
+  the smallest plan so adding a window can only shrink or tie the output.
+  `Apodization` is `#[non_exhaustive]`, so the new variants are additive.
+  New tests: `bartlett_and_blackman_harris_weights_and_lossless` (weight
+  curve sanity — non-negative, symmetric about the midpoint, zero-edged,
+  unit-peaked + lossless round-trip through each window as sole analysis
+  window) and `new_windows_steer_lpc_fit` (each new window changes the
+  per-order LPC plan vs Welch + a window superset never loses to its
+  subset).
 - demuxer: seektable-less seeking. `seek_to` on a file with no SEEKTABLE
   metadata block no longer returns `Error::Unsupported`; instead it scans
   CRC-8-verified frame headers forward from the start of the frame stream

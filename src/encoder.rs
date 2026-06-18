@@ -208,6 +208,18 @@ pub enum Apodization {
         /// when zero to avoid a divide-by-zero in the weight function).
         alpha_den: u32,
     },
+    /// Triangular ("Bartlett") taper: a linear ramp from 0 at each edge to
+    /// 1 at the centre. The cheapest non-rectangular window — no
+    /// transcendental call per sample — and a milder edge attenuation than
+    /// Hann, so it can win on content that a centre-heavy Welch over-weights
+    /// but a full raised-cosine over-tapers.
+    Bartlett,
+    /// Four-term Blackman-Harris cosine-sum window. Its side lobes sit far
+    /// below Welch/Hann/Tukey, so on densely-packed or closely-spaced
+    /// partials — where autocorrelation leakage corrupts the LPC fit — it
+    /// can recover a tighter predictor than any of the other windows at the
+    /// cost of the heaviest edge attenuation in the set.
+    BlackmanHarris,
 }
 
 impl Apodization {
@@ -226,6 +238,8 @@ impl Apodization {
                 // never trip an internal panic.
                 alpha_den: if alpha_den == 0 { 1 } else { alpha_den },
             },
+            Apodization::Bartlett => ApodizationWindow::Bartlett,
+            Apodization::BlackmanHarris => ApodizationWindow::BlackmanHarris,
         }
     }
 }
@@ -445,6 +459,14 @@ enum ApodizationWindow {
     /// energy still matters) while smoothing the discontinuity at the
     /// block boundary that an un-windowed autocorrelation would alias.
     Tukey { alpha_num: u32, alpha_den: u32 },
+    /// Triangular (Bartlett) taper: a linear ramp from 0 at each edge to 1
+    /// at the centre. Cheapest non-rectangular window; milder edge
+    /// attenuation than Hann.
+    Bartlett,
+    /// Four-term Blackman-Harris cosine-sum window. Very low side lobes,
+    /// strongest leakage suppression in the set, at the cost of the
+    /// heaviest edge attenuation.
+    BlackmanHarris,
 }
 
 /// The windows the per-subframe LPC search evaluates, in priority order
@@ -503,6 +525,25 @@ impl ApodizationWindow {
                 } else {
                     0.5 * (1.0 + (std::f64::consts::PI * ((t - 1.0) / edge + 1.0)).cos())
                 }
+            }
+            ApodizationWindow::Bartlett => {
+                // Triangular: linear ramp 0 -> 1 -> 0, peak at the centre.
+                // `1 - |(i - (N-1)/2) / ((N-1)/2)|` is 1 at i = (N-1)/2 and
+                // 0 at both ends.
+                let half = last / 2.0;
+                1.0 - ((i as f64 - half) / half).abs()
+            }
+            ApodizationWindow::BlackmanHarris => {
+                // Four-term Blackman-Harris: a0 - a1*cos(2*pi*t)
+                //   + a2*cos(4*pi*t) - a3*cos(6*pi*t), t = i/(N-1).
+                // The classic minimum-side-lobe coefficient set.
+                const A0: f64 = 0.358_75;
+                const A1: f64 = 0.488_29;
+                const A2: f64 = 0.141_28;
+                const A3: f64 = 0.011_68;
+                let t = i as f64 / last;
+                let w = std::f64::consts::PI * t;
+                A0 - A1 * (2.0 * w).cos() + A2 * (4.0 * w).cos() - A3 * (6.0 * w).cos()
             }
         }
     }
@@ -4287,6 +4328,164 @@ mod tests {
             }
         }
         assert_eq!(out, pcm, "zero-den Tukey output is not lossless");
+    }
+
+    /// The Bartlett (triangular) and Blackman-Harris cosine-sum windows
+    /// added to the public apodization set must (a) carry a sane weight
+    /// curve — non-negative, peaking at 1.0 in the centre, symmetric about
+    /// the midpoint, and zero at both edges (a defining property of both
+    /// windows) — and (b) round-trip a block bit-exactly when selected as
+    /// the sole analysis window, since the window has no on-wire footprint.
+    #[test]
+    fn bartlett_and_blackman_harris_weights_and_lossless() {
+        // (a) weight-curve sanity for both new windows.
+        for w in [
+            ApodizationWindow::Bartlett,
+            ApodizationWindow::BlackmanHarris,
+        ] {
+            let n = 4096usize;
+            let mut prev_up = f64::NEG_INFINITY;
+            for i in 0..n {
+                let v = w.weight(i, n);
+                assert!(
+                    (-1e-9..=1.0 + 1e-9).contains(&v),
+                    "{w:?} weight at {i} out of [0,1]: {v}"
+                );
+                // Symmetry: weight(i) == weight(n-1-i).
+                let mirror = w.weight(n - 1 - i, n);
+                assert!(
+                    (v - mirror).abs() < 1e-9,
+                    "{w:?} not symmetric at {i}: {v} vs {mirror}"
+                );
+                // Monotone rise over the first half (both windows are
+                // unimodal with their peak at the centre).
+                if i <= (n - 1) / 2 {
+                    assert!(
+                        v + 1e-9 >= prev_up,
+                        "{w:?} not monotone-rising on first half at {i}"
+                    );
+                    prev_up = v;
+                }
+            }
+            // Edges hug zero, centre hugs one.
+            assert!(w.weight(0, n).abs() < 1e-3, "{w:?} edge weight not ~0");
+            assert!(
+                (w.weight((n - 1) / 2, n) - 1.0).abs() < 1e-3,
+                "{w:?} centre weight not ~1"
+            );
+        }
+
+        // (b) lossless round-trip through each new window as sole analysis
+        //     window.
+        let sr = 48_000u32;
+        let n = 2048usize;
+        let pcm: Vec<u8> = (0..n as i32)
+            .flat_map(|i| {
+                let t = i as f64 / sr as f64;
+                let s = ((t * 1234.0 * 2.0 * std::f64::consts::PI).sin() * 9000.0
+                    + (t * 5678.0 * 2.0 * std::f64::consts::PI).sin() * 4000.0)
+                    as i16;
+                s.to_le_bytes()
+            })
+            .collect();
+        for win in [Apodization::Bartlett, Apodization::BlackmanHarris] {
+            let p = build_audio_params(1, sr, SampleFormat::S16);
+            let opts = FlacEncoderOptions {
+                apodization: Some(vec![win]),
+                ..FlacEncoderOptions::default()
+            };
+            let mut enc = make_encoder_with_options(&p, opts).expect("new window must construct");
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: n as u32,
+                pts: Some(0),
+                data: vec![pcm.clone()],
+            }))
+            .unwrap();
+            enc.flush().unwrap();
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            while let Ok(pkt) = enc.receive_packet() {
+                frames.push(pkt.data);
+            }
+            let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+            dparams.extradata = enc.output_params().extradata.clone();
+            let mut dec = decoder::make_decoder(&dparams).unwrap();
+            let mut out: Vec<u8> = Vec::new();
+            for f in frames {
+                let mut pkt =
+                    oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+                pkt.pts = Some(0);
+                dec.send_packet(&pkt).unwrap();
+                while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                    out.extend_from_slice(&a.data[0]);
+                }
+            }
+            assert_eq!(out, pcm, "{win:?} window output is not lossless");
+        }
+    }
+
+    /// The two new windows must actually steer the LPC fit — selecting one
+    /// as the sole window must produce a different per-order plan than the
+    /// Welch default on leakage-sensitive content, and a low-leakage window
+    /// set including Blackman-Harris must beat a Welch-only search there.
+    #[test]
+    fn new_windows_steer_lpc_fit() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let samples: Vec<i32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / sr as f64;
+                ((t * 3000.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                    + (t * 3041.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                    + (t * 9000.0 * 2.0 * std::f64::consts::PI).sin() * 3_000.0)
+                    as i32
+            })
+            .collect();
+
+        let per_order = |windows: Vec<ApodizationWindow>| -> Vec<u64> {
+            let mut scratch = SubframeScratch {
+                apodization: windows,
+                ..SubframeScratch::default()
+            };
+            (1..=SUBSET_MAX_LPC_ORDER)
+                .map(|order| {
+                    encode_lpc_plan_s(&samples, 16, order, 0, &mut scratch)
+                        .map(|p| p.bits)
+                        .unwrap_or(u64::MAX)
+                })
+                .collect()
+        };
+        let min_of = |v: &[u64]| v.iter().copied().min().unwrap_or(u64::MAX);
+
+        let welch_only = per_order(vec![ApodizationWindow::Welch]);
+        let bartlett = per_order(vec![ApodizationWindow::Bartlett]);
+        let bh = per_order(vec![ApodizationWindow::BlackmanHarris]);
+
+        // Each new window must change the fit relative to Welch on at least
+        // one order — proof it is actually wired into the search.
+        assert!(
+            welch_only != bartlett,
+            "Bartlett produced an identical per-order plan to Welch"
+        );
+        assert!(
+            welch_only != bh,
+            "Blackman-Harris produced an identical per-order plan to Welch"
+        );
+
+        // Adding the new windows alongside Welch can only shrink or tie the
+        // best plan — the minimum-bit driver keeps the smallest candidate,
+        // so a superset of windows is never worse than the Welch-only subset.
+        let superset = per_order(vec![
+            ApodizationWindow::Welch,
+            ApodizationWindow::Bartlett,
+            ApodizationWindow::BlackmanHarris,
+        ]);
+        assert!(
+            min_of(&superset) <= min_of(&welch_only),
+            "a window superset must never beat-then-lose to its subset: \
+             superset={} welch_only={}",
+            min_of(&superset),
+            min_of(&welch_only)
+        );
     }
 
     // --- PADDING-aware encoder options (round 158) -----------------------

@@ -139,10 +139,15 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   stream regardless of the set. The encoder solves under every window
   in the set and the minimum-bit driver keeps the smallest plan, so
   more windows can only shrink or tie the output at the cost of one
-  extra Levinson-Durbin solve per window per order. `Apodization::Tukey`
-  takes an `alpha = num/den` taper fraction (clamped to `[0, 1]`; a zero
-  denominator is treated as `0`). An empty set or the default `None`
-  keeps the historical three-window search byte-for-byte.
+  extra Levinson-Durbin solve per window per order. The public
+  `Apodization` enum offers five window shapes — `Welch`, `Hann`,
+  `Tukey { alpha_num, alpha_den }`, `Bartlett` (triangular, the cheapest
+  non-rectangular taper), and `BlackmanHarris` (4-term cosine-sum with
+  the lowest side lobes / strongest leakage suppression in the set).
+  `Apodization::Tukey` takes an `alpha = num/den` taper fraction (clamped
+  to `[0, 1]`; a zero denominator is treated as `0`). An empty set or the
+  default `None` keeps the historical three-window (Welch / Hann /
+  Tukey(1/4)) search byte-for-byte.
 - **Wasted bits per sample**: detected per subframe (largest `k` such
   that every sample is divisible by `2^k`) and folded into the spec's
   wasted-bits unary header.
