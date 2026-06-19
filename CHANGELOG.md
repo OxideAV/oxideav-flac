@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- tests: `compression_quality` suite pinning two load-bearing invariants
+  of the encoder's minimum-bit rate-distortion search. (1) A real-fixture
+  guard re-encodes every PCM fixture under `docs/audio/flac/fixtures/`
+  (mono/stereo/7.1, 8/16/24-bit) and decodes it back through this crate's
+  own decoder, asserting byte-exact recovery plus a locked
+  compressed/PCM-ratio ceiling per fixture so a quietly de-tuned RDO
+  search trips a size regression instead of passing silently. (2) A
+  monotonicity property battery proves that widening the search space —
+  adding apodization windows, raising the LPC-order ceiling to 32, raising
+  the partition-order ceiling to 15 — can only ever shrink or tie the
+  encoded size (never inflate it), across tonal, transient,
+  near-white-noise, and autoregressive signal classes, with each variant
+  also re-checked lossless. Five tests; no production code changed.
 - encoder: two additional apodization (analysis) windows in the public
   `encoder::Apodization` enum — `Bartlett` (triangular: a linear ramp
   0→1→0, the cheapest non-rectangular taper, with milder edge attenuation

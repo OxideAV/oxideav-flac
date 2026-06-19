@@ -191,6 +191,28 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   tools can rewrite metadata in place. Requesting more than
   `BlockHeader::MAX_LENGTH` (2²⁴ − 1) returns `Error::invalid`.
 
+### Compression-quality guarantees
+
+The encoder's residual/predictor/window search is a minimum-bit
+rate-distortion search, and two invariants of that search are pinned by
+the `compression_quality` test suite:
+
+- **Lossless on real fixtures.** Every PCM fixture under
+  `docs/audio/flac/fixtures/` (mono/stereo/7.1, 8/16/24-bit) is
+  re-encoded and decoded back through this crate's own decoder, asserting
+  byte-exact recovery — no external tool in the loop.
+- **Monotone search.** Widening the search space — adding apodization
+  windows, raising the LPC-order ceiling to 32, raising the
+  partition-order ceiling to 15 — can only ever *shrink or tie* the
+  encoded size, never inflate it, because the extra candidates are
+  compared on actual bit cost and discarded when they don't win. The
+  property battery checks this across tonal, transient, near-white-noise,
+  and autoregressive signal classes.
+- **Compression-ratio ceilings.** Each fixture carries a locked
+  compressed/PCM ratio ceiling, so a change that quietly de-tuned the RDO
+  search (e.g. dropping a default window or narrowing a search range)
+  trips a size regression rather than passing silently.
+
 ## Native container
 
 - **Demuxer**: parses `fLaC` magic + metadata block chain
