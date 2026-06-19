@@ -104,9 +104,9 @@ pub struct FlacEncoderOptions {
     pub max_lpc_order: Option<usize>,
 
     /// Override the set of apodization (analysis) windows the
-    /// per-subframe LPC search evaluates. `None` (the default) keeps the
-    /// historical three-window set — Welch, Hann, Tukey(1/4) — and is
-    /// byte-for-byte unchanged.
+    /// per-subframe LPC search evaluates. `None` (the default) uses the
+    /// five-window set — Welch, Hann, Tukey(1/4), Bartlett, and
+    /// Blackman-Harris.
     ///
     /// An apodization window tapers a block before the autocorrelation
     /// that feeds Levinson-Durbin (RFC 9639 §9.2.6). It has **no**
@@ -124,12 +124,14 @@ pub struct FlacEncoderOptions {
     /// one more Levinson-Durbin solve (plus its precision sweep) per LPC
     /// order per subframe.
     ///
-    /// `Some(set)` replaces the default windows with `set`. An empty set
-    /// is treated as the historical default (the LPC search needs at
-    /// least one window to run). Duplicate windows are harmless — they
-    /// just cost a redundant solve. The produced bytes stay a fully valid
-    /// streamable-subset FLAC stream regardless of the window set; this
-    /// knob never affects subset membership.
+    /// `Some(set)` replaces the default windows with `set` — useful both
+    /// to add a window the default set omits and to trim to a leaner set
+    /// (e.g. Welch-only) when encode speed matters more than the last
+    /// few percent. An empty set is treated as the default (the LPC
+    /// search needs at least one window to run). Duplicate windows are
+    /// harmless — they just cost a redundant solve. The produced bytes
+    /// stay a fully valid streamable-subset FLAC stream regardless of the
+    /// window set; this knob never affects subset membership.
     pub apodization: Option<Vec<Apodization>>,
 
     /// Number of interchannel samples per frame the encoder accumulates
@@ -369,12 +371,13 @@ struct SubframeScratch {
     /// 9639 §9.2.6). Like `max_lpc_order` this is per-encoder
     /// configuration carried on the scratch so it rides the same call
     /// chain the candidate sweep already threads. `Default` populates it
-    /// with the historical three-window set, so every reference / test
-    /// path that builds a `SubframeScratch::default()` keeps the prior
-    /// behaviour; the production encoder overrides it from
-    /// [`FlacEncoderOptions::apodization`]. Never empty — the LPC search
-    /// needs at least one window — so the constructor falls back to the
-    /// default set when the caller supplies an empty list.
+    /// with the [`APODIZATION_WINDOWS`] default set, so every reference /
+    /// test path that builds a `SubframeScratch::default()` uses the same
+    /// windows the production encoder does; the production encoder
+    /// overrides it from [`FlacEncoderOptions::apodization`]. Never
+    /// empty — the LPC search needs at least one window — so the
+    /// constructor falls back to the default set when the caller supplies
+    /// an empty list.
     apodization: Vec<ApodizationWindow>,
     /// Residual values: `samples[order..] - prediction` for FIXED and LPC.
     residuals: Vec<i32>,
@@ -469,20 +472,43 @@ enum ApodizationWindow {
     BlackmanHarris,
 }
 
-/// The windows the per-subframe LPC search evaluates, in priority order
-/// (ties are broken toward the earlier entry, which keeps the historical
-/// Welch result when nothing beats it). Three windows with materially
-/// different leakage / edge-energy trade-offs cover the common cases
-/// without ballooning the per-frame solve count: Welch (centre-heavy,
-/// the prior default), Hann (low leakage), and a shallow Tukey(1/4)
-/// (mostly flat, light edge smoothing).
-const APODIZATION_WINDOWS: [ApodizationWindow; 3] = [
+/// The windows the per-subframe LPC search evaluates by default, in
+/// priority order (ties are broken toward the earlier entry, which keeps
+/// the long-standing Welch result when nothing beats it). Five windows
+/// with materially different leakage / edge-energy trade-offs:
+///
+/// * `Welch` — centre-heavy parabolic taper, a strong all-rounder on
+///   steady tonal content.
+/// * `Hann` — raised cosine, low side lobes, good on closely-spaced
+///   partials.
+/// * `Tukey(1/4)` — mostly flat with light edge smoothing, good for
+///   transient-light blocks.
+/// * `Bartlett` — triangular, milder edge attenuation than Hann; wins on
+///   content Welch over-weights but Hann over-tapers.
+/// * `BlackmanHarris` — four-term cosine sum with the lowest side lobes
+///   in the set; recovers a tighter predictor when autocorrelation
+///   leakage from densely-packed partials corrupts the LPC fit.
+///
+/// The window has no on-wire footprint (RFC 9639 §9.2.6 fixes only the
+/// quantised coefficients, precision, and shift that reach the
+/// bitstream), so trying more windows is subset-neutral and the
+/// minimum-bit `best_subframe` driver keeps whichever LPC subframe
+/// encodes smallest — a window that never wins is silently discarded, so
+/// adding windows can only shrink or tie the output. On real
+/// multichannel / wideband content the Bartlett + Blackman-Harris pair
+/// recovers a few percent the three-window set left on the table; the
+/// cost is two extra Levinson-Durbin solves per LPC order per subframe.
+/// Callers that want the leaner three-window search (or any other set)
+/// override it via [`FlacEncoderOptions::apodization`].
+const APODIZATION_WINDOWS: [ApodizationWindow; 5] = [
     ApodizationWindow::Welch,
     ApodizationWindow::Hann,
     ApodizationWindow::Tukey {
         alpha_num: 1,
         alpha_den: 4,
     },
+    ApodizationWindow::Bartlett,
+    ApodizationWindow::BlackmanHarris,
 ];
 
 impl ApodizationWindow {
@@ -719,8 +745,8 @@ pub fn make_encoder_with_options(
                 None => SUBSET_MAX_LPC_ORDER,
             },
             // Replace the default window set only when the caller
-            // supplied a non-empty list; an empty list (or `None`) keeps
-            // the historical Welch/Hann/Tukey(1/4) set so the LPC search
+            // supplied a non-empty list; an empty list (or `None`) uses
+            // the `APODIZATION_WINDOWS` default set so the LPC search
             // always has at least one window to solve under.
             apodization: match &options.apodization {
                 Some(set) if !set.is_empty() => set.iter().map(|w| w.to_internal()).collect(),
@@ -4128,6 +4154,8 @@ mod tests {
                     alpha_num: 1,
                     alpha_den: 4,
                 },
+                Apodization::Bartlett,
+                Apodization::BlackmanHarris,
             ]),
             ..FlacEncoderOptions::default()
         });

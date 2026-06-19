@@ -107,9 +107,12 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   streamable-subset boundary for sample rates ≤ 48 kHz (RFC 9639 §7)
   and the point past which the gain curve flattens while per-frame
   cost grows quadratically. For each LPC order the encoder searches
-  three analysis windows (Welch, Hann, shallow Tukey) before
-  Levinson-Durbin and keeps the smallest; the window choice has no
-  on-wire footprint. LPC coefficient precision is also searched per
+  five analysis windows (Welch, Hann, shallow Tukey, Bartlett,
+  Blackman-Harris) before Levinson-Durbin and keeps the smallest; the
+  window choice has no on-wire footprint, so the wider default set is
+  subset-neutral and recovers a few percent on real multichannel /
+  wideband content that the leaner three-window set left on the table.
+  LPC coefficient precision is also searched per
   subframe within the legal `[5, 15]` range. Output is always fully
   valid and lossless — any compliant decoder recovers the original
   PCM bit-exactly.
@@ -130,24 +133,25 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   `encoder::make_encoder_with_options(params, FlacEncoderOptions {
   apodization: Some(vec![Apodization::Hann, Apodization::Tukey {
   alpha_num: 1, alpha_den: 8 }, ..]), .. })` replaces the default
-  three-window analysis set (Welch, Hann, Tukey(1/4)) with a
-  caller-chosen set. An apodization window only tapers a block before
-  the autocorrelation that feeds Levinson-Durbin — it has **no**
-  on-wire footprint (RFC 9639 §9.2.6 fixes only the quantised
-  coefficients, precision, and shift that reach the bitstream), so the
-  decoder never observes it and output stays a valid streamable-subset
-  stream regardless of the set. The encoder solves under every window
-  in the set and the minimum-bit driver keeps the smallest plan, so
-  more windows can only shrink or tie the output at the cost of one
-  extra Levinson-Durbin solve per window per order. The public
-  `Apodization` enum offers five window shapes — `Welch`, `Hann`,
+  five-window analysis set (Welch, Hann, Tukey(1/4), Bartlett,
+  Blackman-Harris) with a caller-chosen set — useful both to add a window
+  the default omits and to trim to a leaner set (e.g. Welch-only) when
+  encode speed matters more than the last few percent. An apodization
+  window only tapers a block before the autocorrelation that feeds
+  Levinson-Durbin — it has **no** on-wire footprint (RFC 9639 §9.2.6
+  fixes only the quantised coefficients, precision, and shift that reach
+  the bitstream), so the decoder never observes it and output stays a
+  valid streamable-subset stream regardless of the set. The encoder
+  solves under every window in the set and the minimum-bit driver keeps
+  the smallest plan, so more windows can only shrink or tie the output at
+  the cost of one extra Levinson-Durbin solve per window per order. The
+  public `Apodization` enum offers five window shapes — `Welch`, `Hann`,
   `Tukey { alpha_num, alpha_den }`, `Bartlett` (triangular, the cheapest
   non-rectangular taper), and `BlackmanHarris` (4-term cosine-sum with
   the lowest side lobes / strongest leakage suppression in the set).
   `Apodization::Tukey` takes an `alpha = num/den` taper fraction (clamped
   to `[0, 1]`; a zero denominator is treated as `0`). An empty set or the
-  default `None` keeps the historical three-window (Welch / Hann /
-  Tukey(1/4)) search byte-for-byte.
+  default `None` uses the five-window default set.
 - **Wasted bits per sample**: detected per subframe (largest `k` such
   that every sample is divisible by `2^k`) and folded into the spec's
   wasted-bits unary header.

@@ -499,9 +499,9 @@ fn assert_monotone_and_lossless(
     assert_monotone_and_lossless_on(label, ALL_KINDS, lean, rich);
 }
 
-/// The full five-window apodization set (the three default windows plus
-/// the two minimum-side-lobe additions).
-fn five_windows() -> Vec<Apodization> {
+/// The leaner three-window set (the historical default before the
+/// Bartlett + Blackman-Harris pair joined the default).
+fn three_windows() -> Vec<Apodization> {
     vec![
         Apodization::Welch,
         Apodization::Hann,
@@ -509,22 +509,40 @@ fn five_windows() -> Vec<Apodization> {
             alpha_num: 1,
             alpha_den: 4,
         },
-        Apodization::Bartlett,
-        Apodization::BlackmanHarris,
     ]
+}
+
+/// The full five-window apodization set — what the default factory now
+/// uses (the three windows above plus the two minimum-side-lobe
+/// additions).
+fn five_windows() -> Vec<Apodization> {
+    let mut w = three_windows();
+    w.push(Apodization::Bartlett);
+    w.push(Apodization::BlackmanHarris);
+    w
 }
 
 #[test]
 fn extra_apodization_windows_never_inflate() {
-    // The default three-window set vs the full five-window set. Adding the
+    // The leaner three-window set vs the five-window default. Adding the
     // Bartlett + Blackman-Harris windows can only ever shrink-or-tie: a
     // window that never wins the per-subframe min-bit comparison is
-    // discarded, so the five-window output is never larger.
-    assert_monotone_and_lossless("windows", FlacEncoderOptions::default, || {
-        let mut o = FlacEncoderOptions::default();
-        o.apodization = Some(five_windows());
-        o
-    });
+    // discarded, so the five-window output is never larger. (This is also
+    // why making the five-window set the default can only improve, or
+    // leave unchanged, the bytes any caller emits.)
+    assert_monotone_and_lossless(
+        "windows",
+        || {
+            let mut o = FlacEncoderOptions::default();
+            o.apodization = Some(three_windows());
+            o
+        },
+        || {
+            let mut o = FlacEncoderOptions::default();
+            o.apodization = Some(five_windows());
+            o
+        },
+    );
 }
 
 #[test]

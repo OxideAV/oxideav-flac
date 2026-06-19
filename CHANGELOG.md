@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- encoder: the default apodization (analysis) window set the per-subframe
+  LPC search evaluates grows from three windows (Welch, Hann, Tukey(1/4))
+  to five — adding `Bartlett` and `BlackmanHarris`. The window has no
+  on-wire footprint (RFC 9639 §9.2.6 fixes only the quantised
+  coefficients, precision, and shift), so the wider set is subset-neutral
+  and the minimum-bit `best_subframe` driver keeps whichever LPC subframe
+  encodes smallest — a window that never wins is discarded. On real
+  multichannel / wideband fixtures the extra pair recovers a few percent
+  the three-window set left on the table (e.g. ~5% on a 7.1/24-bit
+  fixture, ~2.6% on 24-bit stereo) while every emitted stream stays a
+  valid streamable-subset FLAC stream that decodes bit-exactly. Default
+  output bytes change (strictly smaller-or-equal); callers who want the
+  leaner three-window search (or any other set) select it via
+  `FlacEncoderOptions::apodization`. The cost is two extra
+  Levinson-Durbin solves per LPC order per subframe at encode time.
+
 ### Added
 
 - tests: `compression_quality` suite pinning two load-bearing invariants
@@ -85,10 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - encoder: caller-configurable apodization (analysis) window set via
   `FlacEncoderOptions::apodization` + a public `encoder::Apodization`
   enum (`Welch` / `Hann` / `Tukey { alpha_num, alpha_den }`). `None`
-  (the default) keeps the historical three-window set — Welch, Hann,
-  Tukey(1/4) — and is byte-for-byte unchanged; an empty `Some(vec![])`
-  falls back to that set so the LPC search always has at least one
-  window. `Some(set)` replaces the windows the per-subframe LPC search
+  (the default) uses the default window set (see the **Changed** entry
+  above for its current membership); an empty `Some(vec![])` falls back
+  to that set so the LPC search always has at least one window.
+  `Some(set)` replaces the windows the per-subframe LPC search
   evaluates (RFC 9639 §9.2.6). A window only tapers the block before the
   autocorrelation that feeds Levinson-Durbin — it has no on-wire
   footprint (the RFC fixes only the quantised coefficients, precision,
