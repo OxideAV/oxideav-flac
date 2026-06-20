@@ -319,3 +319,141 @@ fn registry_default_muxer_generates_seektable() {
         "registry default muxer should generate a SEEKTABLE, got {pts:?}"
     );
 }
+
+/// Re-serialise `params.extradata` with `block` inserted right after
+/// STREAMINFO, returning new params. Used to simulate extradata that
+/// already carries a SEEKTABLE (e.g. from a demuxed file being re-muxed).
+fn extradata_with_block(
+    params: &CodecParameters,
+    block: oxideav_flac::metadata::MetadataBlock,
+) -> CodecParameters {
+    use oxideav_flac::metadata::MetadataChain;
+    let (mut chain, _) = MetadataChain::parse(&params.extradata).expect("parse extradata");
+    let at = 1.min(chain.blocks.len());
+    chain.blocks.insert(at, block);
+    let mut p = params.clone();
+    p.extradata = chain.write().expect("re-write chain");
+    p
+}
+
+#[test]
+fn existing_seektable_in_extradata_is_preserved_not_duplicated() {
+    use oxideav_flac::metadata::{MetadataBlock, MetadataChain, SeekPoint};
+    let sr = 44_100u32;
+    let n = 512 * 8;
+    let pcm = stereo_sine(n, sr);
+    let (packets, params) = encode_small_blocks(2, sr, 512, pcm);
+
+    // A hand-built SEEKTABLE with one distinctive point the generator
+    // would never produce (sample 999, offset 12345).
+    let marker = SeekPoint {
+        sample_number: 999,
+        offset: 12_345,
+        frame_samples: 512,
+    };
+    let params = extradata_with_block(
+        &params,
+        MetadataBlock::SeekTable {
+            points: vec![marker],
+            placeholder_count: 0,
+        },
+    );
+
+    // Default options (generation ON) — but since a SEEKTABLE already
+    // exists, the muxer MUST preserve it untouched and add no second one
+    // (§8.5: at most one SEEKTABLE per stream).
+    let bytes = mux_into_vec(&params, &packets, FlacMuxerOptions::default());
+    let (chain, _) = MetadataChain::parse(&bytes[4..]).expect("parse muxed chain");
+    let tables: Vec<&Vec<SeekPoint>> = chain
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            MetadataBlock::SeekTable { points, .. } => Some(points),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tables.len(), 1, "exactly one SEEKTABLE allowed");
+    assert_eq!(tables[0].len(), 1, "original table preserved verbatim");
+    assert_eq!(tables[0][0], marker, "original seek point must survive");
+}
+
+#[test]
+fn seektable_coexists_with_reserved_padding() {
+    use oxideav_flac::metadata::{MetadataBlock, MetadataChain};
+    let sr = 44_100u32;
+    let n = 512 * 12;
+    let pcm = stereo_sine(n, sr);
+
+    // Encode with reserved PADDING so the chain is STREAMINFO + PADDING.
+    let mut params = CodecParameters::audio(CodecId::new("flac"));
+    params.channels = Some(2);
+    params.sample_rate = Some(sr);
+    params.sample_format = Some(SampleFormat::S16);
+    let mut eopts = FlacEncoderOptions::default();
+    eopts.block_size = Some(512);
+    eopts.padding_bytes = Some(256);
+    let mut enc = make_encoder_with_options(&params, eopts).expect("make_encoder");
+    enc.send_frame(&Frame::Audio(s16_frame(2, &pcm))).unwrap();
+    enc.flush().unwrap();
+    let mut packets = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let out_params = enc.output_params().clone();
+
+    let opts = FlacMuxerOptions {
+        generate_seektable: true,
+        seek_point_interval: 1024,
+        max_seek_points: 0,
+    };
+    let bytes = mux_into_vec(&out_params, &packets, opts);
+    let (chain, _) = MetadataChain::parse(&bytes[4..]).expect("parse chain");
+
+    // STREAMINFO first, then the inserted SEEKTABLE, then PADDING — all
+    // present, structurally valid (parse re-validates the chain MUSTs).
+    assert!(matches!(chain.blocks[0], MetadataBlock::StreamInfo(_)));
+    assert!(
+        chain
+            .blocks
+            .iter()
+            .any(|b| matches!(b, MetadataBlock::SeekTable { .. })),
+        "SEEKTABLE generated alongside PADDING"
+    );
+    assert!(
+        chain
+            .blocks
+            .iter()
+            .any(|b| matches!(b, MetadataBlock::Padding(_))),
+        "reserved PADDING preserved"
+    );
+    // The whole file still round-trips through the demuxer + a seek.
+    let mut dmx = open_demuxer(bytes);
+    let landed = dmx.seek_to(0, 3000).expect("seek");
+    assert!(landed <= 3000 && landed % 512 == 0);
+}
+
+#[test]
+fn empty_stream_muxes_without_seektable_and_without_panic() {
+    use oxideav_flac::metadata::{MetadataBlock, MetadataChain};
+    let sr = 44_100u32;
+    // Encode a single tiny frame just to get valid extradata, then mux
+    // ZERO packets — the trailer must emit a valid header with no
+    // SEEKTABLE (no frames => no anchors => no points).
+    let pcm = stereo_sine(16, sr);
+    let (_packets, params) = encode_small_blocks(2, sr, 512, pcm);
+
+    let bytes = mux_into_vec(&params, &[], FlacMuxerOptions::default());
+    assert_eq!(&bytes[0..4], b"fLaC");
+    let (chain, _) = MetadataChain::parse(&bytes[4..]).expect("parse chain");
+    assert!(
+        !chain
+            .blocks
+            .iter()
+            .any(|b| matches!(b, MetadataBlock::SeekTable { .. })),
+        "empty stream must not generate a SEEKTABLE"
+    );
+}

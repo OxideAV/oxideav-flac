@@ -238,8 +238,30 @@ the `compression_quality` test suite:
   (STREAMINFO, VORBIS_COMMENT, SEEKTABLE, PICTURE, CUESHEET, plus
   ID3v2 tags prepended by some taggers), emits one packet per frame
   via a CRC-verified sync-code scanner.
-- **Muxer**: writes `fLaC` + preserved metadata blocks + frame
-  packets. Packets produced by the encoder pass straight through.
+- **Muxer**: writes `fLaC` + metadata blocks + frame packets. Packets
+  produced by the encoder pass straight through.
+- **SEEKTABLE generation** (RFC 9639 §8.5): by default the muxer builds
+  a SEEKTABLE from the frames it writes. As each frame is muxed it
+  records that frame's `(first_sample, offset_from_first_frame,
+  frame_samples)` seek anchor — read from the frame header itself, not
+  the packet timestamp — and at `write_trailer` time inserts a single
+  SEEKTABLE block (right after STREAMINFO) at a configurable point
+  density. The seek-point offset is "from the first byte of the first
+  frame header to the first byte of the target frame's header" (§8.5.1),
+  exactly what the demuxer's `seek_to` consumes, so a muxer→demuxer
+  round-trip seeks land on the right frame without the slow
+  header-scanning fallback. The default density places roughly one point
+  per second of audio, capped at 2048 points (so even a multi-hour
+  stream's table stays under ~36 KiB). An existing SEEKTABLE in the
+  source extradata is preserved untouched and never duplicated (§8.5
+  forbids more than one SEEKTABLE per stream). `container::open_muxer_with_options(output,
+  streams, FlacMuxerOptions { generate_seektable, seek_point_interval,
+  max_seek_points })` exposes the density control plus
+  `FlacMuxerOptions::no_seektable()`, which restores the historical
+  zero-buffering pass-through that streams frames straight to the output
+  and writes the metadata chain byte-for-byte. (Generating a table buffers
+  the frame packets until the trailer, since the SEEKTABLE must precede
+  the frames it indexes.)
 - **Seeking**: SEEKTABLE-driven byte-offset seek (`seek_to(pts)`
   lands on the nearest prior seek point). Files **without** a SEEKTABLE
   seek via a frame-header scanning fallback (RFC 9639 §8.5 — "it is
