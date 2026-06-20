@@ -1,4 +1,4 @@
-//! Verify-decoder MD5 path (RFC 9639 §9.2.1 + Appendix D.2.9).
+//! Verify-decoder MD5 path (RFC 9639 §8.2 + Appendix D.2.9).
 //!
 //! The STREAMINFO metadata block carries an MD5 checksum of the *unencoded*
 //! audio: every interchannel sample of every channel, interleaved, each
@@ -20,7 +20,7 @@
 //!   of a `.flac` file (or a bare frame stream + an explicit STREAMINFO),
 //!   decode every frame and report whether the recomputed MD5 matches.
 //!
-//! Per RFC 9639 §9.2.1, an all-zero signature means "MD5 not computed"; the
+//! Per RFC 9639 §8.2, an all-zero signature means "MD5 not computed"; the
 //! verifier treats that as *unverifiable* (neither pass nor fail) rather
 //! than a mismatch, matching the reference behaviour where an absent
 //! signature simply skips the check.
@@ -32,7 +32,7 @@ use crate::md5::Md5;
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 
 /// Bytes used to store one sample at `bits_per_sample` in the MD5 message,
-/// per RFC 9639 §9.2.1: the sample is sign-extended to the next whole
+/// per RFC 9639 §8.2: the sample is sign-extended to the next whole
 /// number of bytes (1 byte for ≤ 8 bps, 2 for ≤ 16, 3 for ≤ 24, 4 for
 /// ≤ 32).
 fn md5_bytes_per_sample(bits_per_sample: u32) -> usize {
@@ -59,7 +59,7 @@ fn push_sample_le(buf: &mut Vec<u8>, value: i32, bytes_per_sample: usize) {
     }
 }
 
-/// Incremental MD5 accumulator over decoded FLAC PCM (RFC 9639 §9.2.1).
+/// Incremental MD5 accumulator over decoded FLAC PCM (RFC 9639 §8.2).
 ///
 /// Construct with the stream's bit depth, feed each frame's decoded
 /// per-channel planes in stream order via [`Md5Verifier::update`], then call
@@ -117,7 +117,7 @@ impl Md5Verifier {
     /// Returns:
     /// * `Ok(true)` — the recomputed digest equals `expected`.
     /// * `Ok(false)` — `expected` is all-zero ("MD5 not computed",
-    ///   RFC 9639 §9.2.1): unverifiable, treated as not-a-mismatch but
+    ///   RFC 9639 §8.2): unverifiable, treated as not-a-mismatch but
     ///   reported `false` so callers can distinguish a real match.
     /// * `Err(Error::InvalidData)` — the digests differ: the decode was not
     ///   lossless (or the stream is corrupt). The message includes both

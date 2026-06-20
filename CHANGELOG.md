@@ -27,13 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- decoder/verify: **verify-decoder MD5 path** (RFC 9639 §9.2.1). New
+- decoder/verify: **verify-decoder MD5 path** (RFC 9639 §8.2). New
   `verify` module recomputes the STREAMINFO MD5 from decoded PCM to
   confirm a whole-stream decode is lossless — the canonical FLAC
   integrity check, complementary to the per-frame CRC-16.
   `verify::verify_stream(&flac_bytes)` walks the metadata chain, decodes
   every frame, and returns `VerifyOutcome::Match` / `NoSignature` (an
-  all-zero signature is "MD5 not computed" per §9.2.1) or an
+  all-zero signature is "MD5 not computed" per §8.2) or an
   `Error::InvalidData` with both digests on mismatch. `Md5Verifier`
   exposes the same accumulation incrementally for streaming callers. The
   PCM is serialised in FLAC's canonical order (interchannel samples

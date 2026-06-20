@@ -91,7 +91,7 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Wasted bits per sample** (unary-coded count per subframe).
 - **Frame CRC**: header CRC-8 and frame CRC-16 are both verified; bad
   frames are rejected.
-- **Verify-decoder MD5** (RFC 9639 §9.2.1): the `verify` module
+- **Verify-decoder MD5** (RFC 9639 §8.2): the `verify` module
   recomputes the STREAMINFO MD5 from the decoded PCM and checks it,
   confirming the whole-stream decode is lossless — the canonical FLAC
   integrity check, stronger than the per-frame CRC-16 (which only
