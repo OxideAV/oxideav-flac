@@ -196,8 +196,8 @@ pub fn verify_frame_stream(frames: &[u8], streaminfo: &StreamInfo) -> Result<Ver
 /// metadata-block chain to find STREAMINFO, then decodes every frame and
 /// recomputes the MD5. Returns [`VerifyOutcome::Match`] on a lossless
 /// decode, [`VerifyOutcome::NoSignature`] when the file stores no MD5, and
-/// `Err(Error::Crc)` when the recomputed digest disagrees with the stored
-/// one.
+/// `Err(Error::InvalidData)` when the recomputed digest disagrees with the
+/// stored one.
 pub fn verify_stream(file: &[u8]) -> Result<VerifyOutcome> {
     if file.len() < 4 || &file[0..4] != b"fLaC" {
         return Err(Error::invalid("FLAC verify: missing fLaC stream marker"));
