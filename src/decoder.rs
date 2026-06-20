@@ -105,12 +105,30 @@ fn find_streaminfo(extradata: &[u8]) -> Result<StreamInfo> {
     Err(Error::invalid("FLAC decoder: no STREAMINFO in extradata"))
 }
 
-fn decode_one_frame(
-    data: &[u8],
-    streaminfo: &StreamInfo,
-    output_format: SampleFormat,
-    pts: Option<i64>,
-) -> Result<Frame> {
+/// Fully decoded FLAC frame: post-decorrelation per-channel samples plus
+/// the effective bit depth and the byte length consumed (header + body +
+/// trailing CRC-16). Returned by [`decode_frame_channels`] so callers that
+/// need the raw `i32` sample planes — PCM packing, MD5 verification
+/// (RFC 9639 §9.2.1) — share one decode + CRC path.
+pub struct DecodedFrame {
+    /// One `Vec<i32>` per output channel, after stereo decorrelation.
+    pub channels: Vec<Vec<i32>>,
+    /// Effective bits-per-sample for these samples (from the frame header,
+    /// or STREAMINFO when the header's bps field is the "get from
+    /// STREAMINFO" escape).
+    pub bits_per_sample: u32,
+    /// Total bytes the frame occupies in `data` (header + body + CRC-16).
+    pub frame_byte_len: usize,
+}
+
+/// Decode one FLAC frame from `data` to per-channel `i32` planes.
+///
+/// Parses the frame header, decodes every subframe, undoes stereo
+/// decorrelation, and verifies the trailing frame CRC-16 (RFC 9639 §9.3).
+/// This is the shared decode core behind both the streaming `Frame::Audio`
+/// path and the MD5 verifier in [`crate::verify`]; keeping it as one
+/// function means the verifier checks exactly the bytes the decoder emits.
+pub fn decode_frame_channels(data: &[u8], streaminfo: &StreamInfo) -> Result<DecodedFrame> {
     let header = parse_frame_header(data)?;
     let body_offset = header.header_byte_len;
 
@@ -166,7 +184,22 @@ fn decode_one_frame(
         )));
     }
 
-    let total_samples = header.block_size as usize;
+    Ok(DecodedFrame {
+        channels,
+        bits_per_sample: bps,
+        frame_byte_len: frame_byte_len + 2,
+    })
+}
+
+fn decode_one_frame(
+    data: &[u8],
+    streaminfo: &StreamInfo,
+    output_format: SampleFormat,
+    pts: Option<i64>,
+) -> Result<Frame> {
+    let DecodedFrame { channels, .. } = decode_frame_channels(data, streaminfo)?;
+
+    let total_samples = channels[0].len();
     let n_out = channels.len();
     let bytes_per_sample = output_format.bytes_per_sample();
     let mut out = Vec::with_capacity(total_samples * n_out * bytes_per_sample);

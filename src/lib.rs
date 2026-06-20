@@ -29,6 +29,7 @@ pub mod frame;
 pub mod md5;
 pub mod metadata;
 pub mod subframe;
+pub mod verify;
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::ContainerRegistry;
