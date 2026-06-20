@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- muxer: **SEEKTABLE generation** (RFC 9639 §8.5). The native FLAC muxer
+  now builds a SEEKTABLE metadata block from the frames it writes,
+  recording each frame's `(first_sample, offset_from_first_frame,
+  frame_samples)` seek anchor from the frame header and inserting a single
+  SEEKTABLE block — at a configurable point density — into the metadata
+  chain at `write_trailer` time. The seek-point byte offset is relative to
+  the first frame header (§8.5.1), exactly what the demuxer's `seek_to`
+  consumes, so a muxer→demuxer round-trip lands seeks on the right frame
+  without the slow header-scanning fallback. Generation is on by default
+  (one point per ~second of audio, capped at 2048 points); an existing
+  SEEKTABLE in the extradata is preserved untouched (§8.5 forbids more
+  than one). The new public `container::open_muxer_with_options` +
+  `FlacMuxerOptions` (`generate_seektable`, `seek_point_interval`,
+  `max_seek_points`, plus `for_sample_rate` / `no_seektable` constructors)
+  expose density control and an opt-out that restores the historical
+  zero-buffering pass-through behaviour byte-for-byte.
 - decoder/verify: **verify-decoder MD5 path** (RFC 9639 §8.2). New
   `verify` module recomputes the STREAMINFO MD5 from decoded PCM to
   confirm a whole-stream decode is lossless — the canonical FLAC
