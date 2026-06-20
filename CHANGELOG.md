@@ -27,6 +27,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- decoder/verify: **verify-decoder MD5 path** (RFC 9639 §9.2.1). New
+  `verify` module recomputes the STREAMINFO MD5 from decoded PCM to
+  confirm a whole-stream decode is lossless — the canonical FLAC
+  integrity check, complementary to the per-frame CRC-16.
+  `verify::verify_stream(&flac_bytes)` walks the metadata chain, decodes
+  every frame, and returns `VerifyOutcome::Match` / `NoSignature` (an
+  all-zero signature is "MD5 not computed" per §9.2.1) or an
+  `Error::InvalidData` with both digests on mismatch. `Md5Verifier`
+  exposes the same accumulation incrementally for streaming callers. The
+  PCM is serialised in FLAC's canonical order (interchannel samples
+  interleaved, each signed two's-complement little-endian, sign-extended
+  to a whole byte), validated against the RFC 9639 Appendix D.1 worked
+  example. `decoder::decode_frame_channels` is factored out as the shared
+  decode + CRC-16 core returning post-decorrelation `i32` planes, so the
+  streaming `Frame::Audio` path and the verifier check exactly the same
+  samples.
+- tests: `verify_md5` integration suite. Runs `verify_stream` over every
+  reference `input.flac` in `docs/audio/flac/fixtures/` — all 18 verify
+  `Match` against the *external* reference-encoder MD5 (constant / fixed
+  / LPC / verbatim subframes; L-R / L-S / R-S / M-S layouts; 8/16/24/32-bit;
+  mono..7.1). A corruption test flips a body byte and asserts
+  verification no longer matches; an encode→verify roundtrip closes the
+  loop through the encoder-stamped MD5 across mono / stereo / 24-bit / 7.1.
 - tests: `compression_quality` suite pinning two load-bearing invariants
   of the encoder's minimum-bit rate-distortion search. (1) A real-fixture
   guard re-encodes every PCM fixture under `docs/audio/flac/fixtures/`

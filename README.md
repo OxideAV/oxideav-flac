@@ -91,6 +91,21 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Wasted bits per sample** (unary-coded count per subframe).
 - **Frame CRC**: header CRC-8 and frame CRC-16 are both verified; bad
   frames are rejected.
+- **Verify-decoder MD5** (RFC 9639 §9.2.1): the `verify` module
+  recomputes the STREAMINFO MD5 from the decoded PCM and checks it,
+  confirming the whole-stream decode is lossless — the canonical FLAC
+  integrity check, stronger than the per-frame CRC-16 (which only
+  proves a single frame's bytes are intact, not that the stream decoded
+  to the original audio). `verify::verify_stream(&flac_bytes)` walks the
+  metadata chain, decodes every frame, and returns `Match` /
+  `NoSignature` (all-zero signature = "MD5 not computed") or an error on
+  mismatch. `Md5Verifier` exposes the same check incrementally for
+  streaming callers (feed each frame's decoded planes, then `verify`).
+  The PCM is serialised in FLAC's canonical order — interchannel samples
+  interleaved, each signed two's-complement little-endian, sign-extended
+  to a whole byte — validated against the RFC 9639 Appendix D.1 worked
+  example and every reference `input.flac` fixture (all 18 verify
+  `Match`).
 
 ## Encode support
 
