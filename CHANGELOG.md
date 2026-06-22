@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- encoder: **per-subframe LPC analysis no longer re-windows and
+  re-autocorrelates the block once per LPC order** (GitHub #12 "encode is
+  very slow"). The maximal-effort search visits every apodization window ×
+  LPC order 1..=`max_lpc` × precision; previously each `(window, order)`
+  pair re-tapered the block (O(n)) and recomputed the autocorrelation
+  (O(n·order)) from scratch inside `levinson_durbin_s`, so a block was
+  windowed/autocorrelated ~`max_lpc`× per window when each is needed only
+  *once* per window. The loop nest is now inverted: for each window the
+  encoder windows + autocorrelates (at the maximum order) + runs
+  Levinson-Durbin a single time, snapshotting every order's coefficients
+  (`levinson_durbin_all_orders_s`), then sweeps order × precision off the
+  snapshots. **Output is byte-identical** — the autocorrelation at the
+  maximum order subsumes every lower order's lags with the same f64
+  summation order, and Levinson-Durbin's order-`m` solution is bit-stable
+  whether reached standalone or as a prefix of the full recursion — so the
+  full reference / roundtrip / MD5 suite passes unchanged. The redundant
+  windowing/autocorrelation was not the dominant cost (the Rice
+  partition-order search is), so the default encoder's measured win is
+  modest (~2-3%); callers who want a large speedup use the new
+  `FlacEncoderOptions::fast` preset below.
+
+### Added
+
+- encoder: **`FlacEncoderOptions::fast()` speed preset** — a
+  speed-biased configuration (single Welch apodization window +
+  `max_lpc_order = 8`) analogous to a low `flac -N` level, for callers who
+  want a markedly faster encode over the last few percent of ratio. On a
+  1 s stereo S16/44.1 kHz buffer it encodes ~6.8× faster than the default
+  maximal-effort search (~232 ms vs ~1586 ms). The output bytes differ
+  from the default encoder's (fewer candidates searched) but remain a
+  valid streamable-subset FLAC stream that decodes bit-exactly; the
+  default `FlacEncoderOptions::default()` behaviour is unchanged and still
+  byte-stable. A doc-test on `FlacEncoderOptions::fast` shows both the
+  default and fast-preset encode through the public API.
+
 - encoder: the default apodization (analysis) window set the per-subframe
   LPC search evaluates grows from three windows (Welch, Hann, Tukey(1/4))
   to five — adding `Bartlett` and `BlackmanHarris`. The window has no

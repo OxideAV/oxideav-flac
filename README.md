@@ -167,6 +167,20 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   `Apodization::Tukey` takes an `alpha = num/den` taper fraction (clamped
   to `[0, 1]`; a zero denominator is treated as `0`). An empty set or the
   default `None` uses the five-window default set.
+- **Fast preset (opt-in)**: `encoder::make_encoder_with_options(params,
+  FlacEncoderOptions::fast())` selects a speed-biased configuration —
+  a single Welch analysis window and `max_lpc_order = 8` — analogous to a
+  low `flac -N` level for callers who want a markedly faster encode over
+  the last few percent of ratio. On a 1 s stereo S16/44.1 kHz buffer it
+  encodes roughly **6.8× faster** than the default maximal-effort search
+  (five windows × LPC 1..=12). The output bytes differ from the default
+  encoder's (fewer search candidates) but stay a valid streamable-subset
+  FLAC stream that decodes bit-exactly; `FlacEncoderOptions::default()` is
+  unchanged and still byte-stable. Note that the default search itself was
+  also made faster (#12): the per-subframe LPC analysis now windows +
+  autocorrelates + runs Levinson-Durbin once **per analysis window**
+  (snapshotting every order's coefficients) instead of once per
+  `(window, order)` pair — a byte-identical restructure.
 - **Wasted bits per sample**: detected per subframe (largest `k` such
   that every sample is divisible by `2^k`) and folded into the spec's
   wasted-bits unary header.

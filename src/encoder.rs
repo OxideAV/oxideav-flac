@@ -177,6 +177,54 @@ pub struct FlacEncoderOptions {
     pub allow_non_subset_block_size: bool,
 }
 
+impl FlacEncoderOptions {
+    /// A speed-biased preset: trades a little compression ratio for a
+    /// markedly faster encode, analogous to a low `flac -N` level.
+    ///
+    /// The default encoder runs a *maximal-effort* per-subframe search —
+    /// five apodization windows × LPC orders 1..=12 × a small precision
+    /// window — which is what makes it thorough but slow (#12). This preset
+    /// trims the two most expensive search axes:
+    ///
+    /// * **One apodization window** (Welch) instead of five — cutting the
+    ///   per-subframe LPC solve + quantise + residual + Rice-partition
+    ///   passes to a fifth.
+    /// * **`max_lpc_order = 8`** instead of 12 — fewer (and cheaper, since
+    ///   residual cost is linear in order) candidate orders per subframe.
+    ///
+    /// Every other field keeps its default, so the output is still a valid
+    /// streamable-subset FLAC stream that any spec-complete decoder
+    /// (including this crate's) recovers bit-exactly. The bytes differ from
+    /// the default encoder's (fewer candidates searched ⇒ a slightly larger
+    /// residual on some subframes), but only in size — never in
+    /// correctness. Use [`FlacEncoderOptions::default`] when ratio matters
+    /// more than speed.
+    ///
+    /// ```
+    /// use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+    /// use oxideav_flac::encoder::{make_encoder, make_encoder_with_options, FlacEncoderOptions};
+    ///
+    /// let mut params = CodecParameters::audio(CodecId::new("flac"));
+    /// params.channels = Some(2);
+    /// params.sample_rate = Some(48_000);
+    /// params.sample_format = Some(SampleFormat::S16);
+    ///
+    /// // Default: maximal-effort search (best ratio).
+    /// let _best = make_encoder(&params).expect("default encoder");
+    ///
+    /// // Fast preset: single window + lower LPC order ceiling (faster).
+    /// let _fast = make_encoder_with_options(&params, FlacEncoderOptions::fast())
+    ///     .expect("fast encoder");
+    /// ```
+    pub fn fast() -> Self {
+        FlacEncoderOptions {
+            apodization: Some(vec![Apodization::Welch]),
+            max_lpc_order: Some(8),
+            ..FlacEncoderOptions::default()
+        }
+    }
+}
+
 /// A caller-selectable apodization (analysis) window for the encoder's
 /// per-subframe LPC search. See [`FlacEncoderOptions::apodization`].
 ///
@@ -397,9 +445,24 @@ struct SubframeScratch {
     autoc: Vec<f64>,
     /// In-place Levinson-Durbin coefficient state (length `order`).
     lpc_state: Vec<f64>,
-    /// Final FLAC-convention LPC coefficients (`-a[j+1]`), borrowed by
-    /// `encode_lpc_plan_at_s` for the candidate-precision sweep.
+    /// Final FLAC-convention LPC coefficients (`-a[j+1]`) for the
+    /// single-order [`levinson_durbin_s`] reference solve. The production
+    /// encoder uses `lpc_coeffs_all` instead (all orders at once, #12), so
+    /// this field is exercised only by the `#[cfg(test)]` reference path.
+    #[cfg_attr(not(test), allow(dead_code))]
     lpc_coeffs: Vec<f64>,
+    /// Triangular snapshot store for the all-orders Levinson-Durbin solve
+    /// ([`levinson_durbin_all_orders_s`]). Order `m`'s `m` FLAC-convention
+    /// coefficients live at `lpc_coeffs_all[m*(m-1)/2 .. m*(m+1)/2]`. A
+    /// single window's recursion fills every order 1..=`max` here so the
+    /// per-subframe search no longer re-windows + re-autocorrelates per
+    /// order. Reused across windows and frames.
+    lpc_coeffs_all: Vec<f64>,
+    /// Per-order validity flag (index `m-1` ↔ order `m`) for
+    /// `lpc_coeffs_all`: `false` where the recursion bailed out before
+    /// reaching that order (degenerate energy), so the candidate sweep
+    /// skips those orders exactly as the per-order solve would have.
+    lpc_order_valid: Vec<bool>,
     /// Quantised LPC coefficients (length `order`).
     qcoeffs: Vec<i32>,
     /// Wasted-bits-shifted sample buffer used by `best_subframe_s`.
@@ -426,6 +489,8 @@ impl Default for SubframeScratch {
             autoc: Vec::new(),
             lpc_state: Vec::new(),
             lpc_coeffs: Vec::new(),
+            lpc_coeffs_all: Vec::new(),
+            lpc_order_valid: Vec::new(),
             qcoeffs: Vec::new(),
             shifted: Vec::new(),
         }
@@ -1371,8 +1436,69 @@ fn best_subframe_with_wasted_s(
     }
 
     let max_lpc = scratch.max_lpc_order.min(n.saturating_sub(1));
-    for order in 1..=max_lpc {
-        if let Some(plan) = encode_lpc_plan_s(samples, bps, order, wasted, scratch) {
+    if max_lpc >= 1 {
+        // LPC search. The previous structure called `encode_lpc_plan_s`
+        // once per order, and each of those re-windowed + re-autocorrelated
+        // + re-ran Levinson-Durbin for every apodization window — so a
+        // block was windowed/autocorrelated ~`max_lpc`× per window when
+        // each is needed only ONCE per window (#12 "encode is very slow").
+        //
+        // Here we invert the loop nest: for each window, window +
+        // autocorrelate + run Levinson-Durbin a SINGLE time, snapshotting
+        // every order's coefficients (`levinson_durbin_all_orders_s`), then
+        // sweep order × precision off the snapshots. This is byte-identical
+        // to the old nest: for any fixed order the sequence of
+        // (window, precision) plan comparisons is the same window-outer /
+        // precision-inner accumulation with the same strict `<` tie-break,
+        // and the snapshot coefficients are bit-identical to the per-order
+        // solve (see `levinson_durbin_all_orders_s`). We accumulate the
+        // per-order best in `lpc_order_best`, then fold those into the
+        // global `best` in ascending order — identical to the old order
+        // loop's ascending strict-`<` selection.
+        let ceiling = lpc_precision_for(n);
+        let floor = ceiling
+            .saturating_sub(LPC_PRECISION_SEARCH_SPAN)
+            .max(MIN_LPC_QLP_PRECISION);
+
+        let mut lpc_order_best: Vec<Option<SubframePlan>> = (0..max_lpc).map(|_| None).collect();
+        let windows = std::mem::take(&mut scratch.apodization);
+        for &window in windows.iter() {
+            let reached = levinson_durbin_all_orders_s(samples, max_lpc, window, scratch);
+            if reached == 0 {
+                continue;
+            }
+            // Detach the snapshot store so `encode_lpc_plan_at_s` can borrow
+            // `scratch` mutably for its quantise / residual / partition
+            // tables without aliasing the read-only coefficient slice.
+            let all = std::mem::take(&mut scratch.lpc_coeffs_all);
+            let valid = std::mem::take(&mut scratch.lpc_order_valid);
+            for order in 1..=max_lpc {
+                if order > valid.len() || !valid[order - 1] {
+                    continue;
+                }
+                let base = order * (order - 1) / 2;
+                let coeffs = &all[base..base + order];
+                for precision in floor..=ceiling {
+                    if let Some(plan) = encode_lpc_plan_at_s(
+                        samples, bps, order, wasted, coeffs, precision, scratch,
+                    ) {
+                        let slot = &mut lpc_order_best[order - 1];
+                        let better = match slot {
+                            Some(b) => plan.bits < b.bits,
+                            None => true,
+                        };
+                        if better {
+                            *slot = Some(plan);
+                        }
+                    }
+                }
+            }
+            scratch.lpc_coeffs_all = all;
+            scratch.lpc_order_valid = valid;
+        }
+        scratch.apodization = windows;
+
+        for plan in lpc_order_best.into_iter().flatten() {
             if plan.bits < best.bits {
                 best = plan;
             }
@@ -1526,6 +1652,14 @@ fn encode_lpc_plan(samples: &[i32], bps: u32, order: usize, wasted: u32) -> Opti
 /// quantisation buffer all live in `scratch`. The final coefficient
 /// vector `lpc_coeffs` is borrowed by the precision sweep — no `Vec`
 /// clone per `(window, precision)` pair.
+///
+/// As of #12's per-window-solve restructure, the production encoder's
+/// per-subframe search no longer calls this per-order path (it uses
+/// [`levinson_durbin_all_orders_s`], which windows + autocorrelates once
+/// per window instead of once per order). This single-order driver is
+/// retained as the reference path the byte-exactness tests pin the
+/// all-orders solve against, so it is `#[cfg(test)]`.
+#[cfg(test)]
 fn encode_lpc_plan_s(
     samples: &[i32],
     bps: u32,
@@ -2472,6 +2606,12 @@ fn levinson_durbin(samples: &[i32], order: usize, window: ApodizationWindow) -> 
 /// `windowed`, `autoc`, and `lpc_state` work buffers are reused
 /// across windows and across frames; only the contents matter to the
 /// next call.
+///
+/// Single-order reference solve. The production encoder uses the
+/// all-orders [`levinson_durbin_all_orders_s`] (one window + autocorrelate
+/// per window rather than per order, #12); this per-order form is retained
+/// as the oracle the byte-exactness tests pin against, hence `#[cfg(test)]`.
+#[cfg(test)]
 fn levinson_durbin_s(
     samples: &[i32],
     order: usize,
@@ -2574,6 +2714,134 @@ fn levinson_durbin_s(
         scratch.lpc_coeffs.push(-v);
     }
     true
+}
+
+/// All-orders Levinson-Durbin: window + autocorrelate **once at
+/// `max_order`**, then run the recursion **once**, snapshotting the
+/// FLAC-convention coefficient vector at every order 1..=`max_order` into
+/// the triangular `scratch.lpc_coeffs_all` store (validity in
+/// `scratch.lpc_order_valid`, index `m-1`). Returns the highest order the
+/// recursion reached before either finishing or bailing on degenerate
+/// energy; orders above that are marked invalid.
+///
+/// This is the hot-path replacement for calling [`levinson_durbin_s`]
+/// once per order inside the per-subframe search. It is **byte-exact**
+/// with that per-order loop:
+///
+/// * The windowed signal is `samples[i] as f64 * window.weight(i, n)` —
+///   identical f64 values regardless of order.
+/// * `autoc[lag]` is `sum_{i=lag}^{n-1} windowed[i]*windowed[i-lag]` in
+///   the same ascending-`i` summation order; computing it up to
+///   `max_order` makes every lower order's lags a prefix of this vector,
+///   so each lag's f64 value is bit-identical to the per-order compute.
+/// * Levinson-Durbin is a forward recursion: after the outer iteration
+///   `i` completes, `lpc_state[0..=i]` holds exactly the order-`(i+1)`
+///   solution — bit-identical to running the recursion independently up
+///   to order `i+1`, because every operation up to that point is the same
+///   in the same order. Snapshotting there yields the same `lpc_coeffs`
+///   the per-order [`levinson_durbin_s`] would have produced.
+fn levinson_durbin_all_orders_s(
+    samples: &[i32],
+    max_order: usize,
+    window: ApodizationWindow,
+    scratch: &mut SubframeScratch,
+) -> usize {
+    let n = samples.len();
+    scratch.lpc_order_valid.clear();
+    scratch.lpc_order_valid.resize(max_order, false);
+    if n <= max_order || max_order == 0 {
+        // Mirror `levinson_durbin_s`'s `n <= order` guard per order:
+        // every order m with n <= m is invalid; lower orders still solve.
+        // Fall through with a reduced effective ceiling.
+        if max_order == 0 {
+            return 0;
+        }
+    }
+    // Highest order for which `n > order` holds (matches the per-order
+    // `if n <= order { return false }` guard exactly).
+    let eff_max = max_order.min(n.saturating_sub(1));
+    if eff_max == 0 {
+        return 0;
+    }
+
+    // Window once. Bit-identical to `levinson_durbin_s`'s taper.
+    scratch.windowed.clear();
+    scratch.windowed.reserve(n);
+    for (i, &s) in samples.iter().enumerate() {
+        scratch.windowed.push(s as f64 * window.weight(i, n));
+    }
+
+    // Autocorrelate once at the maximum order. `autoc[lag]` is identical
+    // for every order that needs that lag (same windowed signal, same
+    // ascending-`i` f64 summation), so lower orders read an exact prefix.
+    scratch.autoc.clear();
+    scratch.autoc.resize(eff_max + 1, 0.0f64);
+    for lag in 0..=eff_max {
+        let mut s = 0.0f64;
+        for i in lag..n {
+            s += scratch.windowed[i] * scratch.windowed[i - lag];
+        }
+        scratch.autoc[lag] = s;
+    }
+    if scratch.autoc[0] <= 0.0 || !scratch.autoc[0].is_finite() {
+        return 0;
+    }
+
+    // Pre-size the triangular snapshot store: orders 1..=eff_max need
+    // 1+2+...+eff_max = eff_max*(eff_max+1)/2 slots.
+    let total = eff_max * (eff_max + 1) / 2;
+    scratch.lpc_coeffs_all.clear();
+    scratch.lpc_coeffs_all.resize(total, 0.0f64);
+
+    scratch.lpc_state.clear();
+    scratch.lpc_state.resize(eff_max, 0.0f64);
+    let mut error = scratch.autoc[0];
+    let mut reached = 0usize;
+    for i in 0..eff_max {
+        let mut r = -scratch.autoc[i + 1];
+        for j in 0..i {
+            r -= scratch.lpc_state[j] * scratch.autoc[i - j];
+        }
+        if error.abs() < 1e-12 {
+            // Per-order `levinson_durbin_s` returns false here for every
+            // order > reached; orders <= reached already snapshotted.
+            break;
+        }
+        let k = r / error;
+        // Identical in-place symmetric update to `levinson_durbin_s`; see
+        // that function for the pairing derivation. Floating-point
+        // operands and order match, so snapshots stay byte-stable.
+        let mid = i / 2;
+        for j in 0..mid {
+            let opp = i - 1 - j;
+            let a = scratch.lpc_state[j] + k * scratch.lpc_state[opp];
+            let b = scratch.lpc_state[opp] + k * scratch.lpc_state[j];
+            scratch.lpc_state[j] = a;
+            scratch.lpc_state[opp] = b;
+        }
+        if i % 2 == 1 {
+            scratch.lpc_state[mid] = scratch.lpc_state[mid] + k * scratch.lpc_state[mid];
+        }
+        scratch.lpc_state[i] = k;
+        error *= 1.0 - k * k;
+        if !error.is_finite() || error <= 0.0 {
+            // `levinson_durbin_s` returns false for this order. Its
+            // `lpc_state` is fully written for order `i+1` though — but
+            // the per-order helper bails BEFORE building `lpc_coeffs`, so
+            // order `i+1` is invalid. Stop without snapshotting it.
+            break;
+        }
+        // Iteration `i` completed order `m = i+1`. `lpc_state[0..m]` is the
+        // order-`m` solution; snapshot its FLAC-convention coefficients.
+        let m = i + 1;
+        let base = m * (m - 1) / 2; // == i*(i+1)/2
+        for (j, &v) in scratch.lpc_state[..m].iter().enumerate() {
+            scratch.lpc_coeffs_all[base + j] = -v;
+        }
+        scratch.lpc_order_valid[m - 1] = true;
+        reached = m;
+    }
+    reached
 }
 
 /// Quantise floating-point LPC coefficients into `precision`-bit signed
@@ -3594,6 +3862,81 @@ mod tests {
             out, pcm,
             "non-subset partition-order output is not lossless"
         );
+    }
+
+    /// The speed-biased [`FlacEncoderOptions::fast`] preset (single Welch
+    /// window + `max_lpc_order = 8`) must still produce a fully lossless
+    /// stream: FLAC is lossless for *any* analysis-window / LPC-order
+    /// choice, so trimming the search affects only the byte count, never
+    /// the recovered samples. This pins that invariant so a future preset
+    /// tweak can't silently turn the fast path lossy.
+    #[test]
+    fn fast_preset_roundtrips_bit_exact() {
+        let sr = 48_000u32;
+        let n = 4096usize;
+        let mut pcm = Vec::with_capacity(n * 2);
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for i in 0..n {
+            // Tone-plus-noise so the LPC + Rice search has real work to do.
+            let phase = (i % 256) as i32 - 128;
+            let env = phase * 64;
+            let noise = (next() % 33) as i32 - 16;
+            let v = (env + noise) as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let mut enc = make_encoder_with_options(&p, FlacEncoderOptions::fast()).unwrap();
+        let af = AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.clone()],
+        };
+        enc.send_frame(&Frame::Audio(af)).unwrap();
+        enc.flush().unwrap();
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        assert!(!frames.is_empty(), "fast preset produced no packets");
+
+        let mut dparams = build_audio_params(1, sr, SampleFormat::S16);
+        dparams.extradata = enc.output_params().extradata.clone();
+        let mut dec = decoder::make_decoder(&dparams).unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        for f in frames {
+            let mut pkt =
+                oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, sr as i64), f);
+            pkt.pts = Some(0);
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(oxideav_core::Frame::Audio(a)) = dec.receive_frame() {
+                out.extend_from_slice(&a.data[0]);
+            }
+        }
+        assert_eq!(out, pcm, "fast-preset output is not lossless");
+    }
+
+    /// The [`FlacEncoderOptions::fast`] preset must set exactly the two
+    /// speed knobs (single Welch window + LPC ceiling 8) and leave every
+    /// other field at its default, so it stays a streamable-subset config.
+    #[test]
+    fn fast_preset_sets_expected_knobs() {
+        let fast = FlacEncoderOptions::fast();
+        assert_eq!(fast.apodization.as_deref(), Some(&[Apodization::Welch][..]));
+        assert_eq!(fast.max_lpc_order, Some(8));
+        // Untouched defaults — fast must not silently leave the subset.
+        assert!(!fast.allow_non_subset_partition_order);
+        assert!(!fast.allow_non_subset_block_size);
+        assert_eq!(fast.block_size, None);
+        assert_eq!(fast.padding_bytes, None);
     }
 
     /// A signal engineered to need a longer impulse response than
