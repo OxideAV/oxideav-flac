@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- encoder: **partitioned-Rice residual search now merges partition costs
+  bottom-up instead of re-walking the residual slice per partition order**
+  (GitHub #12 follow-up, after the LPC hoist). Each partition's Rice cost
+  depends only on additive per-partition stats — `sum(zigzag[i] >> k)` for
+  every `k`, the residual count, and `max(raw_bits[i])`. The search now
+  builds those stats for the *finest* legal partition order **once** (a
+  single `O(n·(k_max+1))` pass) and derives every coarser order by summing
+  adjacent partition pairs (`O(num_partitions·stride)` adds), rather than
+  re-scoring every `(method, partition order)` pair against the slice. A
+  single shared finest-level ladder (built at the wider method-1
+  `k_max = 30`) serves both Rice methods; method 0 clamps its search
+  window to `k_max = 14` over the same rows. **Output is byte-identical** —
+  `sum(u >> k)` and the residual count are additive over a partition split
+  and `max` composes, so each merged order's per-partition cost equals the
+  per-slice path's, and the winning `(method, partition order, Rice k,
+  escape)` selection (including its strict-`<` tie-break) is reproduced
+  exactly. The full reference / roundtrip / MD5 / compression-quality suite
+  passes unchanged; a new `merge_ladder_matches_per_slice_oracle` crosswalk
+  pins the ladder against the retained per-slice oracle. Measured
+  encode speedup ~1.6–1.8× on the mono/stereo S16/S24 benches.
+
 - encoder: **per-subframe LPC analysis no longer re-windows and
   re-autocorrelates the block once per LPC order** (GitHub #12 "encode is
   very slow"). The maximal-effort search visits every apodization window ×

@@ -467,6 +467,43 @@ struct SubframeScratch {
     qcoeffs: Vec<i32>,
     /// Wasted-bits-shifted sample buffer used by `best_subframe_s`.
     shifted: Vec<i32>,
+    /// Bottom-up partition-merge scratch (`rice_search_merged`). Holds,
+    /// for the partition order currently being scored, one `u64` row of
+    /// `k_max + 1` shift-sums per partition plus a parallel count / raw-
+    /// width row. `level_a` and `level_b` ping-pong: the finest order is
+    /// built into one, then each coarser order is merged pairwise into
+    /// the other so no slice of `zigzag` is re-walked per order. See
+    /// [`MergeLevel`].
+    merge_a: MergeLevel,
+    merge_b: MergeLevel,
+}
+
+/// One partition order's worth of bottom-up Rice-merge state, reused
+/// across orders by [`rice_search_merged`]. Each partition `p` owns:
+/// * `shift_sums[p*stride .. p*stride + stride]` — `sum(zigzag[i] >> k)`
+///   for `k in 0..=k_max` (so `stride == k_max + 1`). Element `[..0]` is
+///   `sum_u` (since `u >> 0 == u`), feeding the closed-form `k_est`.
+/// * `counts[p]` — residual count in the partition (the first partition
+///   is short by `predictor_order` warmup samples).
+/// * `max_raw[p]` — `max(raw_bits[i])` over the partition, for the
+///   escape-cost test.
+///
+/// Coarser orders are derived by summing adjacent pairs of the next-
+/// finer level's rows (shift-sums + counts add; `max_raw` maxes), which
+/// is exact because `sum(u >> k)` and the residual count are additive
+/// over a partition split and `max` composes. The chosen Rice `k`,
+/// escape decision, and emitted bits are therefore bit-identical to the
+/// per-slice [`partition_layout_cost_zp`] path.
+#[derive(Default)]
+struct MergeLevel {
+    /// Flattened `num_partitions × stride` shift-sum rows.
+    shift_sums: Vec<u64>,
+    /// Per-partition residual counts.
+    counts: Vec<u32>,
+    /// Per-partition max raw width (escape-cost input).
+    max_raw: Vec<u8>,
+    /// Row width: `k_max + 1`.
+    stride: usize,
 }
 
 impl Default for SubframeScratch {
@@ -493,6 +530,8 @@ impl Default for SubframeScratch {
             lpc_order_valid: Vec::new(),
             qcoeffs: Vec::new(),
             shifted: Vec::new(),
+            merge_a: MergeLevel::default(),
+            merge_b: MergeLevel::default(),
         }
     }
 }
@@ -1835,6 +1874,10 @@ struct PartChoice {
     coding: PartCoding,
     /// Payload bits for this partition *including* its `param_bits`
     /// Rice-parameter field (and, for escape, the extra 5-bit width).
+    /// The production emit loop only reads `coding` (the order-cost
+    /// search now runs off the [`MergeLevel`] ladder); `cost` is read by
+    /// the per-slice reference oracles and their byte-exactness tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     cost: u64,
 }
 
@@ -2121,14 +2164,15 @@ fn partition_layout_cost_z(
     Some(total)
 }
 
-/// Production partition-order cost helper. Same per-partition cost
-/// the `_z` reference path would compute — every layout decision
-/// (which Rice `k` per partition, which partitions take the escape
-/// path) is byte-identical — but the per-partition `sum_u` and
-/// `raw_bits` scans read from subframe-scoped tables instead of
-/// re-deriving from the slice on every visit. Each
-/// `(method, partition_order)` pair pays only the `rice_cost_for_k`
-/// walks the search inherently needs.
+/// Per-partition-order cost helper that walks each partition's slice via
+/// [`best_partition_zp`]. Same per-partition cost the `_z` reference path
+/// would compute — every layout decision (which Rice `k` per partition,
+/// which partitions take the escape path) is byte-identical.
+///
+/// Retained as the per-order reference oracle: the production search now
+/// derives every order's total from the bottom-up [`MergeLevel`] ladder
+/// ([`level_total_cost`]), and the unit tests pin that ladder against
+/// this per-slice walk for byte-exactness — hence `#[cfg(test)]`.
 ///
 /// Eight arguments because each table comes from a different stage of
 /// the per-subframe pipeline (zigzag conversion, prefix sum, per-sample
@@ -2136,6 +2180,7 @@ fn partition_layout_cost_z(
 /// folding them into a struct would push the allocation onto every call
 /// site without buying any clarity over the call shape `_z` already
 /// uses with seven arguments.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn partition_layout_cost_zp(
     zigzag: &[u32],
@@ -2178,6 +2223,235 @@ fn partition_layout_cost_zp(
         idx += count;
     }
     Some(total)
+}
+
+/// Largest legal partition order `p` in `0..=max_po` for a block of
+/// `block_size` samples with `predictor_order` warmup samples: the
+/// order must divide the block evenly (`block_size % 2^p == 0`) and
+/// leave the first partition non-empty after warmup
+/// (`block_size / 2^p > predictor_order`). Returns 0 when no higher
+/// order is legal (order 0 is always legal for a valid subframe).
+///
+/// Mirrors the legality gate inside [`partition_layout_cost_zp`]: that
+/// function returns `None` for an illegal order and the production
+/// search `break`s on the first `None`, so the legal orders are exactly
+/// the contiguous prefix `0..=finest`.
+fn finest_legal_partition_order(block_size: usize, predictor_order: usize, max_po: u32) -> u32 {
+    let mut finest = 0u32;
+    for p in 1..=max_po {
+        let n_partitions = 1usize << p;
+        if block_size % n_partitions != 0 {
+            break;
+        }
+        if block_size / n_partitions <= predictor_order {
+            break;
+        }
+        finest = p;
+    }
+    finest
+}
+
+/// Score one partition's Rice cost from pre-merged shift-sums instead of
+/// re-walking the residual slice. `shift_row[k] == sum(zigzag[i] >> k)`
+/// for the partition (so `shift_row[0] == sum_u`), `n` is the residual
+/// count. Returns `(best_bits, best_k)` where `best_bits` is the Rice
+/// payload **excluding** the `param_bits` parameter field.
+///
+/// Reproduces [`best_rice_params_zp`] exactly — same closed-form
+/// `k_est`, same `[k_est-2 ..= k_est+3]` window, same unimodal
+/// directional extension — but each candidate `k`'s cost is the O(1)
+/// table read `n*(1+k) + shift_row[k]` rather than an O(partition) walk.
+/// The full table cost equals `rice_cost_for_k`'s full sum (its early
+/// exit only ever returns a value that loses the `cost < best_bits`
+/// test, never the chosen one), so `best_bits` and `best_k` match.
+fn rice_search_from_row(shift_row: &[u64], n: u64, k_max: u32) -> (u64, u32) {
+    if n == 0 {
+        return (0, 0);
+    }
+    let sum_u = shift_row[0];
+    let k_est: u32 = if sum_u == 0 {
+        0
+    } else {
+        let mean_u = sum_u / n;
+        if mean_u == 0 {
+            0
+        } else {
+            63u32.saturating_sub(mean_u.leading_zeros())
+        }
+    };
+
+    let lo = k_est.saturating_sub(2).min(k_max);
+    let hi = (k_est + 3).min(k_max);
+
+    let cost_at = |k: u32| -> u64 { n * (1 + k as u64) + shift_row[k as usize] };
+
+    let mut best_k = lo;
+    let mut best_bits = u64::MAX;
+    for k in lo..=hi {
+        let cost = cost_at(k);
+        if cost < best_bits {
+            best_bits = cost;
+            best_k = k;
+        }
+    }
+    if best_k == lo && lo > 0 {
+        for k in (0..lo).rev() {
+            let cost = cost_at(k);
+            if cost < best_bits {
+                best_bits = cost;
+                best_k = k;
+            } else {
+                break;
+            }
+        }
+    }
+    if best_k == hi && hi < k_max {
+        for k in (hi + 1)..=k_max {
+            let cost = cost_at(k);
+            if cost < best_bits {
+                best_bits = cost;
+                best_k = k;
+            } else {
+                break;
+            }
+        }
+    }
+    (best_bits, best_k)
+}
+
+/// Total payload bits for one partition given its pre-merged stats —
+/// byte-identical to [`best_partition_zp`]'s `cost`, but reading the
+/// shift-sum row / count / max-raw from the merge level instead of the
+/// slice. `param_bits`/`k_max` select the method.
+#[inline]
+fn partition_cost_from_row(
+    shift_row: &[u64],
+    n: u64,
+    max_raw: u8,
+    param_bits: u32,
+    k_max: u32,
+) -> u64 {
+    let (rice_bits, _k) = rice_search_from_row(shift_row, n, k_max);
+    let rice_cost = param_bits as u64 + rice_bits;
+
+    let needed_bits = max_raw.max(1) as u32;
+    if needed_bits <= 31 {
+        let escape_cost = param_bits as u64 + 5 + n * needed_bits as u64;
+        if escape_cost < rice_cost {
+            return escape_cost;
+        }
+    }
+    rice_cost
+}
+
+/// Build the finest-order [`MergeLevel`] (`shift_sums`, `counts`,
+/// `max_raw`) for `finest` from the subframe-scoped `zigzag` / `raw_bits`
+/// tables. Each finest partition `p` covers sample range
+/// `[p*fps, (p+1)*fps)`; residual index `i` maps to sample `i +
+/// predictor_order`, so the leftmost partition is short by
+/// `predictor_order` warmup samples. `shift_sums[p*stride + k]` collects
+/// `sum(zigzag[i] >> k)` for `k in 0..=k_max` in a single pass over the
+/// partition's residuals (one read of `zigzag[i]` shifted across all k),
+/// keeping the build at `O(n * (k_max + 1))` total.
+fn build_finest_level(
+    zigzag: &[u32],
+    raw_bits: &[u8],
+    block_size: usize,
+    predictor_order: usize,
+    finest: u32,
+    k_max: u32,
+    level: &mut MergeLevel,
+) {
+    let n_partitions = 1usize << finest;
+    let fps = block_size / n_partitions; // samples per finest partition
+    let stride = (k_max + 1) as usize;
+    level.stride = stride;
+    level.shift_sums.clear();
+    level.shift_sums.resize(n_partitions * stride, 0u64);
+    level.counts.clear();
+    level.counts.resize(n_partitions, 0u32);
+    level.max_raw.clear();
+    level.max_raw.resize(n_partitions, 1u8);
+
+    // Residual index walks the contiguous residual array; sample index =
+    // residual index + predictor_order. Partition p ends at sample
+    // (p+1)*fps, i.e. residual index (p+1)*fps - predictor_order.
+    let mut idx = 0usize;
+    for p in 0..n_partitions {
+        let part_end_sample = (p + 1) * fps;
+        let end = part_end_sample - predictor_order; // residual index (exclusive)
+        let row = &mut level.shift_sums[p * stride..p * stride + stride];
+        let mut m: u8 = 1;
+        for i in idx..end {
+            let u = zigzag[i] as u64;
+            // Accumulate u >> k for every k. The shift chain is cheap and
+            // branch-free; the inner k loop is the only place the full
+            // k_max range is touched, amortised once per residual.
+            let mut v = u;
+            for slot in row.iter_mut() {
+                *slot += v;
+                v >>= 1;
+            }
+            let rb = raw_bits[i];
+            if rb > m {
+                m = rb;
+            }
+        }
+        level.counts[p] = (end - idx) as u32;
+        level.max_raw[p] = m;
+        idx = end;
+    }
+}
+
+/// Merge adjacent partition pairs of `src` (order `p+1`) into `dst`
+/// (order `p`): `dst` partition `j` is the element-wise sum of `src`
+/// partitions `2j` and `2j+1`'s shift rows and counts, and the max of
+/// their `max_raw`. Exact because `sum(u >> k)` and the residual count
+/// are additive over a split and `max` composes — so `dst`'s per-
+/// partition stats equal what [`build_finest_level`] would produce for
+/// order `p` directly, at a fraction of the work (`O(num_partitions ×
+/// stride)` adds instead of another `O(n × stride)` pass).
+fn merge_level_down(src: &MergeLevel, dst: &mut MergeLevel) {
+    let stride = src.stride;
+    let dst_n = src.counts.len() / 2;
+    dst.stride = stride;
+    dst.shift_sums.clear();
+    dst.shift_sums.resize(dst_n * stride, 0u64);
+    dst.counts.clear();
+    dst.counts.resize(dst_n, 0u32);
+    dst.max_raw.clear();
+    dst.max_raw.resize(dst_n, 1u8);
+
+    for j in 0..dst_n {
+        let a = 2 * j;
+        let b = 2 * j + 1;
+        let (sa, sb) = src.shift_sums[a * stride..(b + 1) * stride].split_at(stride);
+        let d = &mut dst.shift_sums[j * stride..j * stride + stride];
+        for k in 0..stride {
+            d[k] = sa[k] + sb[k];
+        }
+        dst.counts[j] = src.counts[a] + src.counts[b];
+        dst.max_raw[j] = src.max_raw[a].max(src.max_raw[b]);
+    }
+}
+
+/// Total residual payload (sum of per-partition costs) for one partition
+/// order, read from a pre-merged [`MergeLevel`]. Byte-identical to
+/// summing [`best_partition_zp`] over the order's partitions.
+fn level_total_cost(level: &MergeLevel, param_bits: u32, k_max: u32) -> u64 {
+    let stride = level.stride;
+    let mut total = 0u64;
+    for p in 0..level.counts.len() {
+        let row = &level.shift_sums[p * stride..p * stride + stride];
+        total += partition_cost_from_row(
+            row,
+            level.counts[p] as u64,
+            level.max_raw[p],
+            param_bits,
+            k_max,
+        );
+    }
+    total
 }
 
 /// Emit the partitioned-Rice residual for one subframe and return the
@@ -2244,31 +2518,69 @@ fn encode_rice_residual_s(
 
     // Find the (method, partition_order) pair with the smallest payload.
     // The search ceiling is the caller-configured `max_partition_order`
-    // (subset default 8, opt-in non-subset up to 15); higher orders that
-    // turn out illegal for this block size break out below. Detach the
-    // value before the borrow loop so the immutable `&zigzag` etc. and
-    // the `scratch` field read don't conflict.
+    // (subset default 8, opt-in non-subset up to 15); the legal orders
+    // are the contiguous prefix `0..=finest` (illegal orders only get
+    // more constrained, so the original loop's `break`-on-first-illegal
+    // means everything above `finest` is unreachable).
+    //
+    // Bottom-up partition merge: the per-partition Rice cost depends only
+    // on additive stats — `sum(zigzag[i] >> k)` for each `k`, the
+    // residual count, and `max(raw_bits[i])`. So we build those stats for
+    // the *finest* legal order **once** (one `O(n × (k_max+1))` pass) and
+    // derive every coarser order by summing adjacent partition pairs
+    // (`O(num_partitions × stride)` adds), instead of re-walking the
+    // residual slice for every `(method, partition_order)` pair. The
+    // finest level is built with the wider method-1 `k_max = 30` (stride
+    // 31); method 0 (`k_max = 14`) reads the same rows but clamps its
+    // search window to 14, so a single shared ladder serves both methods.
     let max_po = scratch.max_partition_order;
+    let finest = finest_legal_partition_order(block_size, predictor_order, max_po);
+
+    // `totals[m][p]` = residual payload (excluding the 2+4 header) for
+    // method `m`, partition order `p`. Filled top-down as the ladder
+    // descends so the selection below can replay the original loop's
+    // exact `(method, p)` visit order and strict-`<` tie-break.
+    let mut totals = [[0u64; 16]; 2];
+
+    let mut level_a = std::mem::take(&mut scratch.merge_a);
+    let mut level_b = std::mem::take(&mut scratch.merge_b);
+    build_finest_level(
+        &zigzag,
+        &raw_bits,
+        block_size,
+        predictor_order,
+        finest,
+        30,
+        &mut level_a,
+    );
+    // Walk orders from `finest` down to 0, scoring both methods off the
+    // current level, then merging pairwise into the spare buffer for the
+    // next (coarser) order. `cur`/`spare` ping-pong between a and b.
+    let mut cur = &mut level_a;
+    let mut spare = &mut level_b;
+    let mut p = finest as i32;
+    while p >= 0 {
+        let pu = p as usize;
+        totals[0][pu] = level_total_cost(cur, 4, 14);
+        totals[1][pu] = level_total_cost(cur, 5, 30);
+        if p > 0 {
+            merge_level_down(cur, spare);
+            std::mem::swap(&mut cur, &mut spare);
+        }
+        p -= 1;
+    }
+    // Return the ping-ponged buffers to scratch (capacity carries over).
+    scratch.merge_a = level_a;
+    scratch.merge_b = level_b;
+
+    // Replay the original method-major / order-minor selection so the
+    // winning `(method, partition_order)` — and therefore every emitted
+    // bit — is identical to the per-slice search, including its
+    // strict-`<` tie-break (earliest visited candidate wins ties).
     let mut best: Option<(u32, u32, u32, u32, u64)> = None; // method, param_bits, k_max, p, cost
     for (method, param_bits, k_max) in [(0u32, 4u32, 14u32), (1u32, 5u32, 30u32)] {
-        for p in 0..=max_po {
-            let Some(cost) = partition_layout_cost_zp(
-                &zigzag,
-                &prefix,
-                &raw_bits,
-                block_size,
-                predictor_order,
-                p,
-                param_bits,
-                k_max,
-            ) else {
-                // Higher orders only get more constrained — once a split
-                // is illegal for this block size, larger ones are too.
-                break;
-            };
-            // Add the constant 2-bit method + 4-bit partition-order
-            // header so cross-method comparison is fair.
-            let total = 2 + 4 + cost;
+        for p in 0..=finest {
+            let total = 2 + 4 + totals[method as usize][p as usize];
             if best.is_none() || total < best.unwrap().4 {
                 best = Some((method, param_bits, k_max, p, total));
             }
@@ -5220,6 +5532,166 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Byte-exactness crosswalk for the bottom-up partition-merge ladder.
+    /// For each diverse residual buffer + predictor order, build the
+    /// finest legal level, walk it down to order 0, and assert each
+    /// order's [`level_total_cost`] (for **both** Rice methods) equals the
+    /// per-slice [`partition_layout_cost_zp`] oracle. Also pins
+    /// [`finest_legal_partition_order`] against the legality boundary the
+    /// per-slice path enforces (the first order for which
+    /// `partition_layout_cost_zp` returns `None`). A mismatch here means
+    /// the merge would change a chosen partition order / Rice `k` / escape
+    /// decision — i.e. non-byte-identical output — and fails before any
+    /// fixture round-trip can.
+    #[test]
+    fn merge_ladder_matches_per_slice_oracle() {
+        fn xorshift32(state: &mut u32) -> u32 {
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            *state
+        }
+
+        let block = 4096usize;
+        let mut cases: Vec<(String, Vec<i32>)> = Vec::new();
+
+        // Mixed-amplitude pseudo-random residuals.
+        let mut st = 0x1234_5678u32;
+        let mut rnd = Vec::with_capacity(block);
+        for _ in 0..block {
+            rnd.push((xorshift32(&mut st) as i32) >> 18);
+        }
+        cases.push(("xorshift".into(), rnd));
+
+        // All zero (degenerate post-predictor partition).
+        cases.push(("all-zero".into(), vec![0i32; block]));
+
+        // Laplace-ish small means.
+        for mean in [1i32, 7, 64, 900] {
+            let mut st = 0xBEEF_0000u32 ^ (mean as u32);
+            let mut buf = Vec::with_capacity(block);
+            for _ in 0..block {
+                let u = xorshift32(&mut st);
+                let mag = ((u % (mean as u32 * 4 + 1)) as i32) - mean * 2;
+                buf.push(mag);
+            }
+            cases.push((format!("laplace(mean={mean})"), buf));
+        }
+
+        // Split statistics: quiet first half, loud second half.
+        let mut split = Vec::with_capacity(block);
+        for i in 0..block {
+            if i < block / 2 {
+                split.push((i % 3) as i32 - 1);
+            } else {
+                split.push(((i * 2654435761usize) % 20000) as i32 - 10000);
+            }
+        }
+        cases.push(("split-stats".into(), split));
+
+        // i32 edge values to stress the escape / raw-bits path.
+        let mut edge = vec![0i32; block];
+        edge[0] = i32::MIN;
+        edge[block / 4] = i32::MAX;
+        edge[block / 2] = -1;
+        edge[3 * block / 4] = 1;
+        cases.push(("edge-i32-bounds".into(), edge));
+
+        for (name, residuals) in &cases {
+            let zigzag: Vec<u32> = residuals.iter().map(|&r| zigzag_encode(r)).collect();
+            let (prefix, raw_bits) = build_partition_tables(residuals, &zigzag);
+            for predictor_order in [0usize, 1, 4, 8, 12] {
+                // The residual array the production emit path sees excludes
+                // the warmup samples; here `residuals` is the full block so
+                // we slice it the way `encode_rice_residual_s` does — its
+                // length is block - predictor_order. Build a residual /
+                // table view consistent with the production call shape.
+                let res = &residuals[..block - predictor_order];
+                let zz = &zigzag[..block - predictor_order];
+                let (pfx, rb) = build_partition_tables(res, zz);
+
+                // Determine the legality boundary the per-slice path sees.
+                for max_po in [SUBSET_MAX_PARTITION_ORDER, MAX_PARTITION_ORDER] {
+                    let finest = finest_legal_partition_order(block, predictor_order, max_po);
+
+                    // finest must be legal and finest+1 (if <= max_po) illegal.
+                    assert!(
+                        partition_layout_cost_zp(
+                            zz,
+                            &pfx,
+                            &rb,
+                            block,
+                            predictor_order,
+                            finest,
+                            4,
+                            14
+                        )
+                        .is_some(),
+                        "{name}: finest order {finest} reported illegal (po={predictor_order})",
+                    );
+                    if finest < max_po {
+                        assert!(
+                            partition_layout_cost_zp(
+                                zz,
+                                &pfx,
+                                &rb,
+                                block,
+                                predictor_order,
+                                finest + 1,
+                                4,
+                                14
+                            )
+                            .is_none(),
+                            "{name}: order {} should be illegal (po={predictor_order})",
+                            finest + 1,
+                        );
+                    }
+
+                    // Walk the merge ladder finest -> 0, asserting each
+                    // order's total matches the per-slice oracle for both
+                    // methods.
+                    let mut a = MergeLevel::default();
+                    let mut b = MergeLevel::default();
+                    build_finest_level(zz, &rb, block, predictor_order, finest, 30, &mut a);
+                    let mut cur = &mut a;
+                    let mut spare = &mut b;
+                    let mut p = finest as i32;
+                    while p >= 0 {
+                        let pu = p as u32;
+                        for (param_bits, k_max) in [(4u32, 14u32), (5u32, 30u32)] {
+                            let merged = level_total_cost(cur, param_bits, k_max);
+                            let oracle = partition_layout_cost_zp(
+                                zz,
+                                &pfx,
+                                &rb,
+                                block,
+                                predictor_order,
+                                pu,
+                                param_bits,
+                                k_max,
+                            )
+                            .expect("legal order");
+                            assert_eq!(
+                                merged, oracle,
+                                "{name}: merge mismatch po={predictor_order} \
+                                 max_po={max_po} order={pu} param_bits={param_bits}: \
+                                 merged={merged} oracle={oracle}",
+                            );
+                        }
+                        if p > 0 {
+                            merge_level_down(cur, spare);
+                            std::mem::swap(&mut cur, &mut spare);
+                        }
+                        p -= 1;
+                    }
+                }
+                // Silence unused warnings for the block-scoped table views
+                // when predictor_order == 0 makes them alias the originals.
+                let _ = (&prefix, &raw_bits, res);
             }
         }
     }
