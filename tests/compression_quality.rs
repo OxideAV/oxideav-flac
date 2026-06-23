@@ -388,6 +388,65 @@ fn real_fixtures_roundtrip_bit_exact_and_meet_ratio_floor() {
     );
 }
 
+/// Encode-time verify (`FlacEncoderOptions::verifying()`) on every real
+/// fixture must (a) succeed — the verify pass never fires on a correct
+/// encoder — and (b) produce output byte-identical to the default encoder:
+/// the same total payload size and the same decoded PCM. Verify is a pure
+/// self-check with zero on-wire effect, so any divergence here is a bug.
+#[test]
+fn verify_matches_default_on_real_fixtures() {
+    let root = fixtures_root();
+    if !std::path::Path::new(&format!(
+        "{root}{}/expected.wav",
+        FIXTURE_EXPECTATIONS[0].dir
+    ))
+    .exists()
+    {
+        eprintln!("skip verify_matches_default: docs/audio/flac/fixtures/ not present (submodule)");
+        return;
+    }
+    for exp in FIXTURE_EXPECTATIONS {
+        let wp = format!("{root}{}/expected.wav", exp.dir);
+        let bytes =
+            std::fs::read(&wp).unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", exp.dir));
+        let (ch, sr, bits, data_full) = parse_wav(&bytes)
+            .unwrap_or_else(|| panic!("fixture {} is not parseable PCM WAVE", exp.dir));
+        let fmt = match bits {
+            8 => SampleFormat::U8,
+            16 => SampleFormat::S16,
+            24 => SampleFormat::S24,
+            other => panic!("fixture {} has unexpected bit depth {other}", exp.dir),
+        };
+        let bytes_per_iframe = fmt.bytes_per_sample() * ch as usize;
+        let cap_bytes = (MAX_FIXTURE_SAMPLES * bytes_per_iframe).min(data_full.len());
+        let data = &data_full[..cap_bytes];
+
+        // The verifying() encode must complete without firing its own
+        // self-check (roundtrip() would panic on the encoder error path).
+        let (payload_default, rec_default) =
+            roundtrip(data, ch, sr, fmt, FlacEncoderOptions::default());
+        let (payload_verify, rec_verify) =
+            roundtrip(data, ch, sr, fmt, FlacEncoderOptions::verifying());
+
+        assert_eq!(
+            payload_verify, payload_default,
+            "fixture {}: verify changed the payload size ({} vs {})",
+            exp.dir, payload_verify, payload_default
+        );
+        assert!(
+            rec_verify == rec_default,
+            "fixture {}: verify changed the decoded PCM",
+            exp.dir
+        );
+        // And of course it's still lossless.
+        assert!(
+            rec_verify == pcm_to_i32(data, fmt, ch),
+            "fixture {}: verify path is not lossless",
+            exp.dir
+        );
+    }
+}
+
 // --- RDO monotonicity property battery ---------------------------------
 
 /// A deterministic xorshift PRNG so the property signals are reproducible

@@ -88,6 +88,12 @@ fuzz_target!(|data: &[u8]| {
     let ch_raw = data[1];
     let sr_sel = data[2] & 0x07;
     let pad_sel = data[3] & 0x07;
+    // Spare bit of the pad selector byte toggles encode-time verify. Verify
+    // decodes every emitted frame back and asserts a bit-exact round-trip;
+    // on a correct encoder it must never fire, so the harness exercises the
+    // verify branch and treats a verify error as a hard contract violation
+    // (a real encoder regression) rather than a cooperative early-out.
+    let verify = (data[3] & 0x08) != 0;
     let pad_seed = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
     let rest = &data[8..];
 
@@ -141,6 +147,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut opts = FlacEncoderOptions::default();
     opts.padding_bytes = padding_bytes;
+    opts.verify = verify;
 
     let mut enc = match make_encoder_with_options(&params, opts.clone()) {
         Ok(e) => e,
@@ -202,12 +209,20 @@ fuzz_target!(|data: &[u8]| {
         pts: Some(0),
         data: vec![pcm],
     };
-    if enc.send_frame(&Frame::Audio(frame)).is_err() {
+    if let Err(e) = enc.send_frame(&Frame::Audio(frame)) {
         // `send_frame` rejections on degenerate (samples=0) or
-        // mis-sized payloads are acceptable.
+        // mis-sized payloads are acceptable — but a *verify* failure is
+        // never acceptable: the encoder produced bytes that don't decode
+        // back to the input it was just handed, i.e. a real encoder bug.
+        if verify && format!("{e}").contains("verify") {
+            panic!("encode-time verify failed on a clamped, in-range PCM frame: {e}");
+        }
         return;
     }
-    if enc.flush().is_err() {
+    if let Err(e) = enc.flush() {
+        if verify && format!("{e}").contains("verify") {
+            panic!("encode-time verify failed during flush: {e}");
+        }
         return;
     }
     loop {

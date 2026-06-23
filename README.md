@@ -223,6 +223,27 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   `n`-byte all-zero PADDING block after STREAMINFO so downstream
   tools can rewrite metadata in place. Requesting more than
   `BlockHeader::MAX_LENGTH` (2²⁴ − 1) returns `Error::invalid`.
+- **Encode-time verify (opt-in)**:
+  `make_encoder_with_options(params, FlacEncoderOptions { verify: true,
+  .. })` — or the `FlacEncoderOptions::verifying()` preset — turns on
+  FLAC's `--verify` self-check. As each frame is produced the encoder
+  runs its own decoder over the freshly-emitted bytes (through the very
+  same `decoder::decode_frame_channels` core the streaming decoder uses,
+  so it sees exactly what a real decoder would — frame-header parse and
+  trailing CRC-16 included) and asserts the reconstructed per-channel
+  `i32` planes equal the input block sample-for-sample. On the first
+  diverging sample — or if the round-tripped frame fails to decode at
+  all — `send_frame` / `flush` returns `Error::InvalidData` naming the
+  offending `(frame, channel, sample)`, and the bad frame is **not**
+  queued for `receive_packet`, so a caller that propagates the error
+  never writes a silently-corrupt `.flac`. This is strictly stronger
+  than the post-hoc whole-stream MD5 check: it catches a mis-encode at
+  the exact frame that produced it, before the file is even finalised,
+  and needs no STREAMINFO signature to compare against. Verify has
+  **zero on-wire effect** — the emitted bytes are byte-for-byte
+  identical to the default encoder's; it only decides whether they are
+  checked. The trade is one extra (cheap) decode per frame. The default
+  `verify: false` skips the pass and is byte-stable.
 
 ### Compression-quality guarantees
 

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder: **encode-time verify (`--verify`)** — opt-in
+  `FlacEncoderOptions { verify: true, .. }` (and the
+  `FlacEncoderOptions::verifying()` preset) decode each frame back to PCM
+  as it is produced and assert it reconstructs the input block
+  bit-exactly, through the same `decoder::decode_frame_channels` core the
+  streaming decoder uses (so the check sees the real frame-header parse +
+  trailing CRC-16). On the first diverging sample — or a frame that fails
+  to decode — `send_frame` / `flush` returns `Error::InvalidData` naming
+  the offending `(frame, channel, sample)`, and the bad frame is not
+  queued for `receive_packet`, so a caller that propagates the error never
+  emits a silently-corrupt `.flac`. This is FLAC's canonical encoder
+  safety net: strictly stronger than the post-hoc whole-stream MD5 check
+  (it pinpoints the mis-encode at the producing frame, before the file is
+  finalised, and needs no STREAMINFO signature). Verify has **zero on-wire
+  effect** — emitted bytes are byte-for-byte identical to the default
+  encoder; it only decides whether they are checked, at the cost of one
+  extra decode per frame. Default `verify: false` is byte-stable. Tests
+  pin: byte-identical output vs. default (both decoded PCM and raw frame
+  bytes), a pass across every supported depth/layout (8/16/24/32-bit,
+  1/2/6-channel), and the failure path (mismatching input → error naming
+  the channel/sample; positive control accepts the true input).
+
 ### Changed
 
 - encoder: **partitioned-Rice residual search now merges partition costs

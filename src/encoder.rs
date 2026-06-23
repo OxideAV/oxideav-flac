@@ -26,6 +26,7 @@ use oxideav_core::{
 
 use crate::bits_ext::BitWriterExt;
 use crate::crc;
+use crate::decoder::decode_frame_channels;
 use crate::md5::Md5;
 use crate::metadata::{write_padding, BlockHeader, BlockType, StreamInfo};
 use oxideav_core::bits::BitWriter;
@@ -175,6 +176,44 @@ pub struct FlacEncoderOptions {
     /// at ≤ 48000 Hz). It has no effect when `block_size` is `None` or
     /// already within the subset ceiling.
     pub allow_non_subset_block_size: bool,
+
+    /// Decode every encoded frame back to PCM as it is produced and assert
+    /// it reconstructs the input samples bit-exactly — FLAC's canonical
+    /// encode-time verify safety net (the `flac --verify` flag).
+    ///
+    /// FLAC is a lossless codec, so a *correct* encoder always produces a
+    /// stream that decodes back to the exact input. The verify pass is a
+    /// belt-and-braces self-check against an encoder bug: with `true`, the
+    /// encoder runs its own decoder over each freshly-emitted frame and
+    /// compares the reconstructed per-channel `i32` planes against the
+    /// original block sample-for-sample. On any mismatch — or if the
+    /// round-tripped frame fails to decode at all (e.g. a corrupt
+    /// frame-header / CRC the encoder somehow emitted) —
+    /// [`Encoder::send_frame`](oxideav_core::Encoder::send_frame) /
+    /// [`Encoder::flush`](oxideav_core::Encoder::flush) returns
+    /// `Error::InvalidData` naming the first offending `(channel, sample)`,
+    /// and the offending frame is *not* queued for `receive_packet`, so a
+    /// caller that propagates the error never writes a silently-corrupt
+    /// `.flac`.
+    ///
+    /// This is strictly stronger than the post-hoc whole-stream MD5 check
+    /// in [`crate::verify`]: it catches a mis-encode at the exact frame
+    /// that produced it (before the file is even finalised), pinpoints the
+    /// diverging sample, and needs no STREAMINFO MD5 to compare against.
+    /// The check runs through the very same [`decode_frame_channels`] core
+    /// the streaming decoder uses, so it verifies exactly the bytes a real
+    /// decoder would see — including the frame-header parse and the
+    /// trailing CRC-16.
+    ///
+    /// The trade is encode cost: a full extra decode per frame (roughly the
+    /// decode-side cost, which is far cheaper than the encoder's
+    /// per-subframe search, so verify typically adds well under the encode
+    /// time rather than doubling it). The default (`false`) skips the pass
+    /// and is byte-for-byte identical to the historical encoder — verify
+    /// never changes the produced bytes, only whether they are checked.
+    ///
+    /// [`decode_frame_channels`]: crate::decoder::decode_frame_channels
+    pub verify: bool,
 }
 
 impl FlacEncoderOptions {
@@ -220,6 +259,23 @@ impl FlacEncoderOptions {
         FlacEncoderOptions {
             apodization: Some(vec![Apodization::Welch]),
             max_lpc_order: Some(8),
+            ..FlacEncoderOptions::default()
+        }
+    }
+
+    /// The default maximal-effort search with the encode-time
+    /// [`verify`](Self::verify) self-check enabled — equivalent to
+    /// `flac --verify` at the default compression level.
+    ///
+    /// Every emitted frame is decoded back and asserted bit-exact against
+    /// the input before its packet is queued, so an encoder regression
+    /// surfaces as an `Error::InvalidData` at the offending frame instead
+    /// of a silently-corrupt output file. The produced bytes are identical
+    /// to [`FlacEncoderOptions::default`]'s — verify only adds the check,
+    /// never changes the encoding. Costs one extra decode per frame.
+    pub fn verifying() -> Self {
+        FlacEncoderOptions {
+            verify: true,
             ..FlacEncoderOptions::default()
         }
     }
@@ -831,34 +887,43 @@ pub fn make_encoder_with_options(
         max_frame_size: 0,
         eof: false,
         padding_bytes: options.padding_bytes,
-        scratch: SubframeScratch {
-            // Lift the residual-search partition-order ceiling above the
-            // streamable-subset bound (8) only when the caller opted in.
-            // Everything else stays at the `Default` (empty buffers).
-            max_partition_order: if options.allow_non_subset_partition_order {
-                MAX_PARTITION_ORDER
-            } else {
-                SUBSET_MAX_PARTITION_ORDER
-            },
-            // Lift the LPC-order search ceiling above the streamable-subset
-            // bound (12, for ≤48 kHz) only when the caller opted in. The
-            // requested ceiling is clamped to the spec maximum of 32 and
-            // floored at 1; `None` keeps the historical default of 12.
-            max_lpc_order: match options.max_lpc_order {
-                Some(k) => k.clamp(1, SPEC_MAX_LPC_ORDER),
-                None => SUBSET_MAX_LPC_ORDER,
-            },
-            // Replace the default window set only when the caller
-            // supplied a non-empty list; an empty list (or `None`) uses
-            // the `APODIZATION_WINDOWS` default set so the LPC search
-            // always has at least one window to solve under.
-            apodization: match &options.apodization {
-                Some(set) if !set.is_empty() => set.iter().map(|w| w.to_internal()).collect(),
-                _ => APODIZATION_WINDOWS.to_vec(),
-            },
-            ..SubframeScratch::default()
-        },
+        verify: options.verify,
+        scratch: build_scratch(&options),
     }))
+}
+
+/// Build the per-subframe search scratch from the caller's options. Split
+/// out of [`make_encoder_with_options`] so a test can construct a concrete
+/// [`FlacEncoder`] (e.g. to drive `verify_frame` directly) without
+/// re-implementing the option-to-ceiling mapping.
+fn build_scratch(options: &FlacEncoderOptions) -> SubframeScratch {
+    SubframeScratch {
+        // Lift the residual-search partition-order ceiling above the
+        // streamable-subset bound (8) only when the caller opted in.
+        // Everything else stays at the `Default` (empty buffers).
+        max_partition_order: if options.allow_non_subset_partition_order {
+            MAX_PARTITION_ORDER
+        } else {
+            SUBSET_MAX_PARTITION_ORDER
+        },
+        // Lift the LPC-order search ceiling above the streamable-subset
+        // bound (12, for ≤48 kHz) only when the caller opted in. The
+        // requested ceiling is clamped to the spec maximum of 32 and
+        // floored at 1; `None` keeps the historical default of 12.
+        max_lpc_order: match options.max_lpc_order {
+            Some(k) => k.clamp(1, SPEC_MAX_LPC_ORDER),
+            None => SUBSET_MAX_LPC_ORDER,
+        },
+        // Replace the default window set only when the caller
+        // supplied a non-empty list; an empty list (or `None`) uses
+        // the `APODIZATION_WINDOWS` default set so the LPC search
+        // always has at least one window to solve under.
+        apodization: match &options.apodization {
+            Some(set) if !set.is_empty() => set.iter().map(|w| w.to_internal()).collect(),
+            _ => APODIZATION_WINDOWS.to_vec(),
+        },
+        ..SubframeScratch::default()
+    }
 }
 
 /// Build a full METADATA_BLOCK (header + STREAMINFO payload).
@@ -990,6 +1055,10 @@ struct FlacEncoder {
     /// final `extradata` chain. `None` means no PADDING block — the
     /// pre-round-158 behaviour. See [`FlacEncoderOptions::padding_bytes`].
     padding_bytes: Option<usize>,
+    /// When `true`, decode each emitted frame back and assert it
+    /// reconstructs the input block bit-exactly before queuing the packet.
+    /// See [`FlacEncoderOptions::verify`].
+    verify: bool,
     /// Reusable scratch buffers for the per-subframe candidate sweep.
     /// First frame grows them to the maximum the encoder will need;
     /// subsequent frames reuse the capacity in place. See
@@ -1077,6 +1146,15 @@ impl FlacEncoder {
                 &per_channel,
                 &mut self.scratch,
             )?;
+
+            // FLAC `--verify`: decode the frame we just emitted and assert
+            // it reconstructs the input block bit-exactly. Runs before the
+            // packet is queued, so a mis-encode aborts the stream rather
+            // than producing a silently-corrupt `.flac`.
+            if self.verify {
+                self.verify_frame(&data, &per_channel)?;
+            }
+
             let fsize = data.len() as u32;
             if fsize < self.min_frame_size {
                 self.min_frame_size = fsize;
@@ -1126,6 +1204,67 @@ impl FlacEncoder {
             }
         }
         self.md5.update(&buf);
+    }
+
+    /// Decode `frame` (the freshly-encoded frame bytes) back to PCM and
+    /// assert it equals the original `per_channel` input sample-for-sample
+    /// — FLAC's encode-time `--verify` self-check (RFC 9639 §9.2.1: the
+    /// codec is lossless, so a correct encode round-trips exactly).
+    ///
+    /// Returns `Error::InvalidData` on the first diverging sample (or if the
+    /// frame fails to decode / CRC-16 at all), naming the channel and sample
+    /// index so an encoder regression is pinpointed rather than reported as a
+    /// vague whole-file mismatch.
+    fn verify_frame(&self, frame: &[u8], per_channel: &[Vec<i32>]) -> Result<()> {
+        // A minimal STREAMINFO is all `decode_frame_channels` needs: the
+        // frame header is self-describing except for the "get from
+        // STREAMINFO" escapes (block size / sample rate / bit depth), which
+        // this encoder never emits, but we populate the relevant fields
+        // anyway so the escape path resolves correctly if it ever does.
+        let info = StreamInfo {
+            min_block_size: self.block_size as u16,
+            max_block_size: self.block_size as u16,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: self.sample_rate,
+            channels: self.channels as u8,
+            bits_per_sample: self.bps,
+            total_samples: 0,
+            md5: [0u8; 16],
+        };
+        let decoded = decode_frame_channels(frame, &info).map_err(|e| {
+            Error::invalid(format!(
+                "FLAC verify (frame {}): encoded frame failed to decode: {}",
+                self.frame_number, e
+            ))
+        })?;
+
+        if decoded.channels.len() != per_channel.len() {
+            return Err(Error::invalid(format!(
+                "FLAC verify (frame {}): channel count {} != input {}",
+                self.frame_number,
+                decoded.channels.len(),
+                per_channel.len()
+            )));
+        }
+        for (c, (got, want)) in decoded.channels.iter().zip(per_channel.iter()).enumerate() {
+            if got.len() != want.len() {
+                return Err(Error::invalid(format!(
+                    "FLAC verify (frame {}): channel {} length {} != input {}",
+                    self.frame_number,
+                    c,
+                    got.len(),
+                    want.len()
+                )));
+            }
+            if let Some(i) = got.iter().zip(want.iter()).position(|(g, w)| g != w) {
+                return Err(Error::invalid(format!(
+                    "FLAC verify (frame {}): channel {} sample {} decoded {} != input {}",
+                    self.frame_number, c, i, got[i], want[i]
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild STREAMINFO in `output_params.extradata` using live stats.
@@ -5199,6 +5338,37 @@ mod tests {
         p
     }
 
+    /// Construct a concrete [`FlacEncoder`] (not boxed) so tests can drive
+    /// the private `verify_frame` directly. Mirrors the verify preset.
+    fn test_flac_encoder(channels: u16, sample_rate: u32, bps: u8) -> FlacEncoder {
+        let fmt = match bps {
+            8 => SampleFormat::U8,
+            16 => SampleFormat::S16,
+            24 => SampleFormat::S24,
+            _ => SampleFormat::S32,
+        };
+        FlacEncoder {
+            output_params: build_audio_params(channels, sample_rate, fmt),
+            sample_format: fmt,
+            bps,
+            channels,
+            sample_rate,
+            block_size: DEFAULT_BLOCK_SIZE,
+            time_base: TimeBase::new(1, sample_rate as i64),
+            interleaved: Vec::new(),
+            pending: std::collections::VecDeque::new(),
+            frame_number: 0,
+            md5: Md5::new(),
+            total_samples: 0,
+            min_frame_size: u32::MAX,
+            max_frame_size: 0,
+            eof: false,
+            padding_bytes: None,
+            verify: true,
+            scratch: build_scratch(&FlacEncoderOptions::verifying()),
+        }
+    }
+
     #[test]
     fn make_encoder_default_emits_streaminfo_only_extradata() {
         let p = build_audio_params(2, 48_000, SampleFormat::S16);
@@ -5928,6 +6098,201 @@ mod tests {
             pcm.extend_from_slice(&v.to_le_bytes());
         }
         pcm
+    }
+
+    /// Multichannel deterministic S16 PCM, `n` interchannel samples per
+    /// channel, interleaved little-endian — exercises the verify path on a
+    /// stereo/surround layout the per-frame decorrelation search touches.
+    fn synth_interleaved_s16(n: usize, channels: usize, seed: u64) -> Vec<u8> {
+        let mut rng = seed;
+        let mut pcm = Vec::with_capacity(n * channels * 2);
+        for i in 0..n {
+            for c in 0..channels {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let tone = ((i as f64 * (0.04 + 0.01 * c as f64)).sin() * 9_000.0) as i32;
+                let noise = (rng % 301) as i32 - 150;
+                let v = (tone + noise).clamp(-32_768, 32_767) as i16;
+                pcm.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        pcm
+    }
+
+    /// `verify: true` must produce byte-for-byte identical output to the
+    /// default encoder — the self-check never changes the encoding, it only
+    /// asserts the bytes round-trip. The encode must succeed (no false
+    /// mismatch on a correct encoder).
+    #[test]
+    fn verify_output_is_byte_identical_to_default() {
+        let sr = 44_100u32;
+        let pcm = synth_mono_s16(12_000, 0x5151_2323_8989_abcd);
+
+        let (out_default, frames_default, blocks_default) =
+            encode_decode_mono_s16_with_opts(&pcm, sr, FlacEncoderOptions::default());
+        let (out_verify, frames_verify, blocks_verify) =
+            encode_decode_mono_s16_with_opts(&pcm, sr, FlacEncoderOptions::verifying());
+
+        assert_eq!(out_verify, pcm, "verify path is not lossless");
+        assert_eq!(
+            out_verify, out_default,
+            "verify changed the decoded PCM (must be identical)"
+        );
+        assert_eq!(
+            frames_verify, frames_default,
+            "verify changed the frame count"
+        );
+        assert_eq!(blocks_verify, blocks_default, "verify changed the framing");
+
+        // And the raw produced frame bytes are identical, not just the
+        // decoded PCM — verify must be a pure check with zero on-wire effect.
+        let raw_default = encode_mono_frames(&pcm, sr, FlacEncoderOptions::default());
+        let raw_verify = encode_mono_frames(&pcm, sr, FlacEncoderOptions::verifying());
+        assert_eq!(
+            raw_default, raw_verify,
+            "verify altered the emitted frame bytes"
+        );
+    }
+
+    /// Collect the raw per-frame packet bytes the encoder emits for mono S16.
+    fn encode_mono_frames(pcm: &[u8], sr: u32, opts: FlacEncoderOptions) -> Vec<Vec<u8>> {
+        let n = pcm.len() / 2;
+        let p = build_audio_params(1, sr, SampleFormat::S16);
+        let mut enc = make_encoder_with_options(&p, opts).unwrap();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm.to_vec()],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut frames = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            frames.push(pkt.data);
+        }
+        frames
+    }
+
+    /// Verify must succeed across every supported bit depth, channel layout,
+    /// and a span of block sizes — the round-trip self-check exercises the
+    /// full encode→decode core on each.
+    #[test]
+    fn verify_passes_on_all_formats_and_layouts() {
+        let sr = 48_000u32;
+        // (channels, sample_format, bytes_per_sample)
+        for &(channels, fmt) in &[
+            (1usize, SampleFormat::S16),
+            (2, SampleFormat::S16),
+            (2, SampleFormat::S24),
+            (2, SampleFormat::S32),
+            (1, SampleFormat::U8),
+            (6, SampleFormat::S16),
+        ] {
+            let n = 5_000usize;
+            // Build interleaved PCM for the requested format from an i16 base.
+            let base = synth_interleaved_s16(n, channels, 0x1357_9bdf_2468_ace0);
+            let pcm: Vec<u8> = match fmt {
+                SampleFormat::S16 => base,
+                SampleFormat::S24 => base
+                    .chunks_exact(2)
+                    .flat_map(|c| {
+                        let v = i16::from_le_bytes([c[0], c[1]]) as i32 * 64;
+                        [
+                            (v & 0xFF) as u8,
+                            ((v >> 8) & 0xFF) as u8,
+                            ((v >> 16) & 0xFF) as u8,
+                        ]
+                    })
+                    .collect(),
+                SampleFormat::S32 => base
+                    .chunks_exact(2)
+                    .flat_map(|c| {
+                        let v = i16::from_le_bytes([c[0], c[1]]) as i32 * 1024;
+                        v.to_le_bytes()
+                    })
+                    .collect(),
+                SampleFormat::U8 => base
+                    .chunks_exact(2)
+                    .map(|c| {
+                        let v = i16::from_le_bytes([c[0], c[1]]);
+                        ((v >> 8) as i32 + 128).clamp(0, 255) as u8
+                    })
+                    .collect(),
+                _ => unreachable!(),
+            };
+
+            let p = build_audio_params(channels as u16, sr, fmt);
+            let mut enc = make_encoder_with_options(&p, FlacEncoderOptions::verifying()).unwrap();
+            let samples = (pcm.len() / channels / fmt_bytes(fmt)) as u32;
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples,
+                pts: Some(0),
+                data: vec![pcm],
+            }))
+            .expect("verify must accept a correctly-encoded frame");
+            enc.flush()
+                .unwrap_or_else(|e| panic!("verify flush failed for {channels}ch {fmt:?}: {e}"));
+            let mut got = 0;
+            while enc.receive_packet().is_ok() {
+                got += 1;
+            }
+            assert!(got > 0, "no packets for {channels}ch {fmt:?}");
+        }
+    }
+
+    fn fmt_bytes(fmt: SampleFormat) -> usize {
+        match fmt {
+            SampleFormat::U8 => 1,
+            SampleFormat::S16 => 2,
+            SampleFormat::S24 => 3,
+            SampleFormat::S32 => 4,
+            _ => unreachable!(),
+        }
+    }
+
+    /// `verify_frame` must reject a frame whose decoded samples diverge from
+    /// the claimed input, naming the offending channel + sample. This is the
+    /// failure path that would fire on a genuine encoder regression.
+    #[test]
+    fn verify_frame_rejects_a_mismatching_input() {
+        let sr = 44_100u32;
+        let pcm = synth_mono_s16(4096, 0x9999_7777_5555_3333);
+        // Encode a legitimate frame.
+        let frames = encode_mono_frames(&pcm, sr, FlacEncoderOptions::default());
+        let frame = &frames[0];
+
+        // Build an encoder so we can call verify_frame with deliberately
+        // wrong "input" planes (claim the all-zero signal instead of the
+        // real one). The decoded frame won't match → must error.
+        let enc = test_flac_encoder(1, sr, 16);
+        let wrong = vec![vec![0i32; 4096]];
+        let err = enc
+            .verify_frame(frame, &wrong)
+            .expect_err("verify must reject a non-matching input");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("verify") && msg.contains("channel 0"),
+            "error should pinpoint the diverging channel/sample: {msg}"
+        );
+    }
+
+    /// `verify_frame` accepts the frame when the input planes are the ones
+    /// that were actually encoded — the positive control for the test above.
+    #[test]
+    fn verify_frame_accepts_the_true_input() {
+        let sr = 44_100u32;
+        let n = 4096usize;
+        let pcm = synth_mono_s16(n, 0x2468_ace0_1357_9bdf);
+        let frames = encode_mono_frames(&pcm, sr, FlacEncoderOptions::default());
+
+        let enc = test_flac_encoder(1, sr, 16);
+        let truth: Vec<i32> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+            .collect();
+        enc.verify_frame(&frames[0], &[truth])
+            .expect("verify must accept the genuine input");
     }
 
     /// `block_size: None` must be byte-for-byte identical to an explicit
