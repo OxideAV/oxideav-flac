@@ -2523,9 +2523,19 @@ fn build_finest_level(
         let mut m: u8 = 1;
         for i in idx..end {
             let u = zigzag[i] as u64;
-            // Accumulate u >> k for every k. The shift chain is cheap and
-            // branch-free; the inner k loop is the only place the full
-            // k_max range is touched, amortised once per residual.
+            // Accumulate u >> k for every k. `u >> k` is 0 for every
+            // k >= 64 - leading_zeros(u), so only the low `nbits` rows ever
+            // receive a non-zero add; the rest would only add 0 (a no-op).
+            // We compute `nbits` once and run a branch-free loop over
+            // exactly that many slots, so the long high-`k` tail of zero
+            // adds (which dominates for the small residuals a good LPC fit
+            // produces) is skipped without a per-iteration `if v == 0`
+            // test in the inner loop. This is byte-identical to walking the
+            // full `stride` rows — the skipped slots keep their prior sum
+            // unchanged. This inner k loop is the hottest line in the whole
+            // encoder (built once per LPC candidate).
+            let nbits = (64 - u.leading_zeros() as usize).min(stride);
+            let row = &mut row[..nbits];
             let mut v = u;
             for slot in row.iter_mut() {
                 *slot += v;
@@ -6488,5 +6498,104 @@ mod tests {
         assert_eq!(out, pcm, "non-subset block-size output is not lossless");
         // 20000 / 8192 -> 8192, 8192, 3616.
         assert_eq!(blocks, vec![8_192, 8_192, 3_616]);
+    }
+
+    /// `build_finest_level`'s inner shift-sum loop walks only the low
+    /// `64 - leading_zeros(u)` rows of each residual (the high-`k` rows
+    /// would only add `u >> k == 0`). This proves that skipping the
+    /// zero-add tail is bit-identical to the naive full-`stride`
+    /// accumulation that touches every row, across magnitudes spanning a
+    /// single bit up to the full 32-bit zigzag width (including zeros and
+    /// the `nbits >= stride` clamp boundary). A divergence here would
+    /// change the partition-order cost search and so the encoded bytes.
+    #[test]
+    fn build_finest_level_matches_naive_full_stride() {
+        // Reference: accumulate `u >> k` for EVERY k in 0..stride, with no
+        // leading-zeros short-circuit — the definition the optimized loop
+        // must equal.
+        fn naive(
+            zigzag: &[u32],
+            raw_bits: &[u8],
+            block_size: usize,
+            predictor_order: usize,
+            finest: u32,
+            k_max: u32,
+        ) -> MergeLevel {
+            let n_partitions = 1usize << finest;
+            let fps = block_size / n_partitions;
+            let stride = (k_max + 1) as usize;
+            let mut lvl = MergeLevel {
+                shift_sums: vec![0u64; n_partitions * stride],
+                counts: vec![0u32; n_partitions],
+                max_raw: vec![1u8; n_partitions],
+                stride,
+            };
+            let mut idx = 0usize;
+            for p in 0..n_partitions {
+                let end = (p + 1) * fps - predictor_order;
+                let row = &mut lvl.shift_sums[p * stride..p * stride + stride];
+                let mut m: u8 = 1;
+                for i in idx..end {
+                    let u = zigzag[i] as u64;
+                    for (k, slot) in row.iter_mut().enumerate() {
+                        *slot += u >> k;
+                    }
+                    if raw_bits[i] > m {
+                        m = raw_bits[i];
+                    }
+                }
+                lvl.counts[p] = (end - idx) as u32;
+                lvl.max_raw[p] = m;
+                idx = end;
+            }
+            lvl
+        }
+
+        // Deterministic battery: magnitudes chosen so successive residuals
+        // need 0, 1, … up to 32 significant bits, exercising the whole
+        // `nbits` range and the `.min(stride)` clamp when k_max < 31.
+        let block_size = 256usize;
+        let predictor_order = 4usize;
+        let n_res = block_size - predictor_order;
+        let zigzag: Vec<u32> = (0..n_res)
+            .map(|i| match i % 5 {
+                0 => 0,                                      // nbits = 0
+                1 => 1,                                      // nbits = 1
+                2 => (1u32 << (i % 31)).wrapping_sub(1),     // ramp of widths
+                3 => u32::MAX,                               // nbits = 32 (> any k_max)
+                _ => (i as u32).wrapping_mul(2_654_435_761), // varied
+            })
+            .collect();
+        let raw_bits: Vec<u8> = (0..n_res).map(|i| ((i % 17) + 1) as u8).collect();
+
+        for &finest in &[0u32, 1, 2, 3] {
+            for &k_max in &[0u32, 1, 7, 15, 30] {
+                let mut opt = MergeLevel::default();
+                build_finest_level(
+                    &zigzag,
+                    &raw_bits,
+                    block_size,
+                    predictor_order,
+                    finest,
+                    k_max,
+                    &mut opt,
+                );
+                let want = naive(
+                    &zigzag,
+                    &raw_bits,
+                    block_size,
+                    predictor_order,
+                    finest,
+                    k_max,
+                );
+                assert_eq!(
+                    opt.shift_sums, want.shift_sums,
+                    "shift_sums diverge at finest={finest} k_max={k_max}"
+                );
+                assert_eq!(opt.counts, want.counts, "counts diverge");
+                assert_eq!(opt.max_raw, want.max_raw, "max_raw diverge");
+                assert_eq!(opt.stride, want.stride, "stride diverge");
+            }
+        }
     }
 }

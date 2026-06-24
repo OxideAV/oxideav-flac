@@ -33,6 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- encoder: **finest-level shift-sum accumulation skips the all-zero
+  high-`k` tail per residual.** Building the partitioned-Rice ladder's
+  finest level sums `zigzag[i] >> k` into `stride = k_max + 1` rows for
+  every residual. But `zigzag[i] >> k` is `0` for every
+  `k >= 64 - leading_zeros(zigzag[i])`, so the high rows only ever receive
+  `+ 0`. The inner loop now walks exactly the low
+  `min(64 - leading_zeros(u), stride)` rows and stops, leaving the
+  zero-add tail untouched — which dominates for the small residuals a good
+  LPC fit produces. **Output is byte-identical**: skipped rows would have
+  added `0`, so every shift-sum (and the derived partition-order cost
+  search and winning Rice selection) is unchanged. A new
+  `build_finest_level_matches_naive_full_stride` unit test pins the
+  optimized loop against a naive full-`stride` reference across partition
+  orders, `k_max` values, and residual magnitudes spanning 0 to 32
+  significant bits (including the `nbits >= stride` clamp). Measured
+  encode speedup ~4–7% on the stereo/6-channel S16 benches.
+
 - encoder: **partitioned-Rice residual search now merges partition costs
   bottom-up instead of re-walking the residual slice per partition order**
   (GitHub #12 follow-up, after the LPC hoist). Each partition's Rice cost
