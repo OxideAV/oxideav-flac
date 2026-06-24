@@ -532,6 +532,28 @@ struct SubframeScratch {
     /// [`MergeLevel`].
     merge_a: MergeLevel,
     merge_b: MergeLevel,
+    /// Memoised apodization weight rows, keyed by `(window, n)`. Every
+    /// subframe of a fixed-block stream has the same length `n`, and the
+    /// LPC search applies the same window set to each, so `window.weight(i,
+    /// n)` over `i in 0..n` is recomputed identically for every subframe of
+    /// every frame. The weight is a pure function of `(window, i, n)`, so a
+    /// cached row is bit-identical to a fresh `weight` call — multiplying a
+    /// sample by it yields the exact same `f64` product, keeping the
+    /// windowed signal (hence the autocorrelation, the LPC fit, and the
+    /// emitted bytes) unchanged. The cache holds at most a handful of rows
+    /// (one per `(window, n)` pair; `n` only changes for the short final
+    /// block), so a linear scan to find the row is cheaper than the per-
+    /// sample transcendental rebuild it replaces.
+    window_cache: Vec<WindowWeights>,
+}
+
+/// One memoised apodization weight row: the `n` per-sample weights for a
+/// given `(window, n)`, reused across every subframe of that length. See
+/// [`SubframeScratch::window_cache`].
+struct WindowWeights {
+    window: ApodizationWindow,
+    n: usize,
+    weights: Vec<f64>,
 }
 
 /// One partition order's worth of bottom-up Rice-merge state, reused
@@ -588,6 +610,7 @@ impl Default for SubframeScratch {
             shifted: Vec::new(),
             merge_a: MergeLevel::default(),
             merge_b: MergeLevel::default(),
+            window_cache: Vec::new(),
         }
     }
 }
@@ -3177,6 +3200,50 @@ fn levinson_durbin_s(
     true
 }
 
+/// Look up (or build) the memoised `(window, n)` weight row in `cache` and
+/// return it as a slice. The row holds `window.weight(i, n)` for every
+/// `i in 0..n`. Because `weight` is a pure function of `(window, i, n)`, a
+/// cached row is **bit-identical** to a fresh per-sample `weight` call, so
+/// reusing it across subframes does not perturb the windowed signal.
+fn window_weights(cache: &mut Vec<WindowWeights>, window: ApodizationWindow, n: usize) -> &[f64] {
+    // Linear scan: the cache holds at most a handful of rows (one per
+    // distinct `(window, n)` — `n` only changes for the short final block),
+    // so this is far cheaper than the per-sample transcendental rebuild it
+    // replaces.
+    let idx = cache.iter().position(|w| w.window == window && w.n == n);
+    let idx = match idx {
+        Some(i) => i,
+        None => {
+            let mut weights = Vec::with_capacity(n);
+            for i in 0..n {
+                weights.push(window.weight(i, n));
+            }
+            cache.push(WindowWeights { window, n, weights });
+            cache.len() - 1
+        }
+    };
+    &cache[idx].weights
+}
+
+/// Fill `windowed` with `samples[i] as f64 * weight(i, n)`, drawing the
+/// weights from the memoised `(window, n)` row. Byte-exact with an inline
+/// `samples[i] as f64 * window.weight(i, n)` loop: the cached weight is the
+/// same `f64` `weight` would return, and the multiplication is identical.
+fn apply_window(
+    cache: &mut Vec<WindowWeights>,
+    windowed: &mut Vec<f64>,
+    samples: &[i32],
+    window: ApodizationWindow,
+) {
+    let n = samples.len();
+    windowed.clear();
+    windowed.reserve(n);
+    let weights = window_weights(cache, window, n);
+    for (&s, &w) in samples.iter().zip(weights.iter()) {
+        windowed.push(s as f64 * w);
+    }
+}
+
 /// All-orders Levinson-Durbin: window + autocorrelate **once at
 /// `max_order`**, then run the recursion **once**, snapshotting the
 /// FLAC-convention coefficient vector at every order 1..=`max_order` into
@@ -3225,12 +3292,12 @@ fn levinson_durbin_all_orders_s(
         return 0;
     }
 
-    // Window once. Bit-identical to `levinson_durbin_s`'s taper.
-    scratch.windowed.clear();
-    scratch.windowed.reserve(n);
-    for (i, &s) in samples.iter().enumerate() {
-        scratch.windowed.push(s as f64 * window.weight(i, n));
-    }
+    // Window once. Bit-identical to `levinson_durbin_s`'s taper: the
+    // per-sample weight is drawn from the memoised `(window, n)` row, which
+    // holds exactly what `window.weight(i, n)` would return.
+    let mut windowed = std::mem::take(&mut scratch.windowed);
+    apply_window(&mut scratch.window_cache, &mut windowed, samples, window);
+    scratch.windowed = windowed;
 
     // Autocorrelate once at the maximum order. `autoc[lag]` is identical
     // for every order that needs that lag (same windowed signal, same
@@ -6595,6 +6662,62 @@ mod tests {
                 assert_eq!(opt.counts, want.counts, "counts diverge");
                 assert_eq!(opt.max_raw, want.max_raw, "max_raw diverge");
                 assert_eq!(opt.stride, want.stride, "stride diverge");
+            }
+        }
+    }
+
+    /// The memoised `(window, n)` weight cache (`window_weights` /
+    /// `apply_window`) must return values bit-identical to a fresh
+    /// `window.weight(i, n)` call — otherwise the windowed signal, and so
+    /// the encoded bytes, would shift. Checks every window across several
+    /// block sizes, on a cold cache, on a warm hit, and after the cache has
+    /// served an interleaved set of other `(window, n)` keys (so a wrong
+    /// row can't be masked by lookup order).
+    #[test]
+    fn cached_window_weights_match_inline_weight() {
+        let windows = [
+            ApodizationWindow::Welch,
+            ApodizationWindow::Hann,
+            ApodizationWindow::Tukey {
+                alpha_num: 1,
+                alpha_den: 2,
+            },
+            ApodizationWindow::Bartlett,
+            ApodizationWindow::BlackmanHarris,
+        ];
+        let sizes = [1usize, 2, 16, 17, 256, 4096];
+        let mut cache: Vec<WindowWeights> = Vec::new();
+
+        // Exact f64 bit-equality: cached row vs direct weight call.
+        for &w in &windows {
+            for &n in &sizes {
+                let row = window_weights(&mut cache, w, n).to_vec();
+                assert_eq!(row.len(), n);
+                for (i, &cached) in row.iter().enumerate() {
+                    let direct = w.weight(i, n);
+                    assert_eq!(
+                        cached.to_bits(),
+                        direct.to_bits(),
+                        "cached weight != weight(i,n) for {w:?} n={n} i={i}"
+                    );
+                }
+            }
+        }
+
+        // Warm-hit path: re-querying a served key must still match exactly,
+        // and `apply_window`'s product must equal the inline taper.
+        let samples: Vec<i32> = (0..256i32).map(|i| (i * 37 - 911) % 9001).collect();
+        for &w in &windows {
+            let mut windowed = Vec::new();
+            apply_window(&mut cache, &mut windowed, &samples, w);
+            assert_eq!(windowed.len(), samples.len());
+            for (i, (&s, &got)) in samples.iter().zip(windowed.iter()).enumerate() {
+                let want = s as f64 * w.weight(i, samples.len());
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "apply_window product != inline taper for {w:?} i={i}"
+                );
             }
         }
     }

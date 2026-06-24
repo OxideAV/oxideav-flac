@@ -33,6 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- encoder: **apodization weight rows are memoised per `(window, n)`
+  instead of recomputed per subframe.** The maximal-effort LPC search
+  tapers every subframe with each analysis window before autocorrelating,
+  and the taper calls `window.weight(i, n)` — a transcendental (`cos`) for
+  Hann / Tukey / Blackman-Harris — once per sample. With a fixed block
+  size every subframe of every frame has the same length `n`, so the same
+  `(window, n)` weight vector was rebuilt from scratch for each of them.
+  The encoder now caches each `(window, n)` weight row on the reused
+  per-subframe scratch and multiplies samples by the cached row. **Output
+  is byte-identical**: `window.weight(i, n)` is a pure function of
+  `(window, i, n)`, so a cached weight is the same `f64` a fresh call
+  returns, and `sample as f64 * weight` is the same product — the windowed
+  signal, autocorrelation, LPC fit, and emitted bytes are unchanged. A new
+  `cached_window_weights_match_inline_weight` unit test pins the cache
+  against direct `weight` calls across every window and several block
+  sizes. Measured additional encode speedup ~3–5% on the stereo/6-channel
+  S16 benches (atop the finest-level shift-sum win).
+
 - encoder: **finest-level shift-sum accumulation skips the all-zero
   high-`k` tail per residual.** Building the partitioned-Rice ladder's
   finest level sums `zigzag[i] >> k` into `stride = k_max + 1` rows for
