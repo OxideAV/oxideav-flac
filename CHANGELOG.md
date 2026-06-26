@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- tests: **cross-implementation encode oracle** — a new
+  `reference_decode_oracle` suite encodes PCM with this crate's encoder,
+  assembles a complete `.flac` stream (`fLaC` magic + finalised
+  STREAMINFO/PADDING chain + frame packets) and decodes it with an
+  *independent* black-box reference `flac` decoder, asserting sample-exact
+  recovery. This closes a blind spot the existing self-round-trip cannot:
+  an encoder + decoder that share a bitstream bug which cancels out would
+  pass `roundtrip.rs` but be caught here. 13 cases span every supported
+  bit depth (U8/S16/S24/S32), mono → 7.1, CONSTANT silence, 6-bit
+  wasted-bits shift, 256-sample blocks (last-frame remainder path),
+  PADDING, the fast preset, and a non-subset config (LPC order 32 +
+  partition order 15). The reference binary is invoked purely as an opaque
+  process (its source is never read); the suite skips cleanly when the
+  binary is absent, so it never reddens CI on a host without it.
+
 - encoder: **encode-time verify (`--verify`)** — opt-in
   `FlacEncoderOptions { verify: true, .. }` (and the
   `FlacEncoderOptions::verifying()` preset) decode each frame back to PCM

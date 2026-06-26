@@ -266,6 +266,16 @@ the `compression_quality` test suite:
   compressed/PCM ratio ceiling, so a change that quietly de-tuned the RDO
   search (e.g. dropping a default window or narrowing a search range)
   trips a size regression rather than passing silently.
+- **Independent-decoder oracle.** The `reference_decode_oracle` suite
+  assembles a complete `.flac` stream from the encoder's output and decodes
+  it with a **black-box** reference decoder (invoked as an opaque process —
+  its source is never read), asserting sample-exact recovery across every
+  bit depth (U8/S16/S24/S32), channel layout (mono → 7.1), and the
+  CONSTANT, wasted-bits, small-block, PADDING, fast-preset, and non-subset
+  (LPC 32 / partition 15) paths. Self-round-trip proves the encoder and
+  decoder agree with each other; the oracle proves the *bitstream* is
+  correct against an outside implementation. The suite skips when no
+  reference decoder is on `PATH`.
 
 ## Native container
 
