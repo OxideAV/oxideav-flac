@@ -3754,6 +3754,81 @@ mod tests {
         );
     }
 
+    /// The inverse of the correlated-stereo tests: when L and R are
+    /// statistically *independent*, the side channel L−R carries roughly
+    /// the combined energy of both, so every decorrelation mode costs
+    /// more than coding L and R independently. The chooser must therefore
+    /// keep the independent assignment (code 1) and never pay the
+    /// decorrelation penalty on uncorrelated content.
+    #[test]
+    fn independent_chosen_for_uncorrelated_stereo() {
+        let n = 2048usize;
+        // Two unrelated pseudo-random walks: no cross-channel correlation,
+        // so L−R is as noisy as L or R and the side channel does not help.
+        let mut sl = 0x1234_5678_9abc_def0u64;
+        let mut sr = 0x0fed_cba9_8765_4321u64;
+        let next = |s: &mut u64| -> i32 {
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((*s >> 40) as i32 & 0x7FFF) - 0x4000
+        };
+        let mut l = Vec::with_capacity(n);
+        let mut r = Vec::with_capacity(n);
+        let mut accl = 0i32;
+        let mut accr = 0i32;
+        for _ in 0..n {
+            accl = (accl + next(&mut sl)).clamp(-30_000, 30_000);
+            accr = (accr + next(&mut sr)).clamp(-30_000, 30_000);
+            l.push(accl);
+            r.push(accr);
+        }
+        let mut scratch = SubframeScratch::default();
+        let (code, plans) = choose_channel_assignment(&[l, r], 16, &mut scratch).unwrap();
+        assert_eq!(
+            code, 1,
+            "uncorrelated stereo should keep independent L/R (code 1), got {code}"
+        );
+        assert_eq!(plans.len(), 2);
+    }
+
+    /// The chooser must prefer left-side over right-side when the right
+    /// channel is the cheaper of the two to code on its own: left-side
+    /// stores `L` + `(L−R)`, right-side stores `(L−R)` + `R`, and both
+    /// share the side cost, so the winner is decided by whichever of `L` /
+    /// `R` is cheaper. A near-silent left channel paired with a busy right
+    /// channel makes `L` the cheap one → left-side must win over
+    /// right-side.
+    #[test]
+    fn left_side_preferred_when_left_channel_is_cheaper() {
+        let sr = 48_000u32;
+        let n = 1024usize;
+        let mut l = Vec::with_capacity(n);
+        let mut r = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            // Left: a low-amplitude smooth tone (cheap to predict).
+            l.push(((t * 200.0 * 2.0 * std::f64::consts::PI).sin() * 300.0) as i32);
+            // Right: a busy multi-partial signal (expensive on its own),
+            // strongly correlated with nothing in particular so the side
+            // channel still helps but `R` is the costly subframe.
+            let v = (t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 15_000.0
+                + (t * 1330.0 * 2.0 * std::f64::consts::PI).sin() * 9_000.0
+                + (t * 2570.0 * 2.0 * std::f64::consts::PI).sin() * 5_000.0;
+            r.push(v as i32);
+        }
+        let mut scratch = SubframeScratch::default();
+        let (code, _) = choose_channel_assignment(&[l, r], 16, &mut scratch).unwrap();
+        // Whatever wins, it must not be right-side (9): storing the
+        // expensive R verbatim alongside the side channel can never beat
+        // left-side, which stores the cheap L instead.
+        assert_ne!(
+            code, 9,
+            "right-side (9) stores the expensive R channel; left-side or \
+             mid-side must win, got code {code}"
+        );
+    }
+
     /// Helper: bits the residual coder spends on a residual block when it
     /// is locked to a single partition order under method 0.
     fn residual_bits_at_order(

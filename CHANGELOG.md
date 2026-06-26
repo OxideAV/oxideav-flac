@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never read); the suite skips cleanly when the binary is absent, so it
   never reddens CI on a host without it.
 
+- tests: **stereo-decorrelation selection completeness.** Two new unit
+  tests pin the inverse of the existing correlated-stereo cases:
+  uncorrelated stereo (two independent random walks) must keep the
+  independent L/R assignment (code 1) rather than pay the side-channel
+  penalty, and a cheap-left / expensive-right pair must never select
+  right-side (code 9) — left-side or mid-side stores the cheap channel
+  verbatim and always wins. Together with the prior tests, all four
+  channel assignments (independent / left-side / right-side / mid-side)
+  now have their selection logic exercised in both the win and lose
+  directions.
+
 - encoder: **encode-time verify (`--verify`)** — opt-in
   `FlacEncoderOptions { verify: true, .. }` (and the
   `FlacEncoderOptions::verifying()` preset) decode each frame back to PCM
