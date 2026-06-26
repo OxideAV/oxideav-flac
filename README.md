@@ -113,7 +113,10 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 
 ## Encode support
 
-- **Bit depths**: 8 (`U8`), 16 (`S16`), 24 (`S24`), 32 (`S32`) bps.
+- **Bit depths**: 8 (`U8`), 16 (`S16`), 24 (`S24`), 32 (`S32`) bps. Each
+  frame header carries the explicit RFC 9639 §9.1.4 Table 17 bit-depth
+  code (including `0b111` for 32 bps), so every frame self-describes its
+  depth without relying on STREAMINFO.
 - **Sample rates**: any rate the STREAMINFO format can hold
   (up to 655_350 Hz).
 - **Channels**: 1..=8 independent. For stereo inputs the encoder

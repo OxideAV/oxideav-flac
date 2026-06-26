@@ -1456,6 +1456,13 @@ fn encode_sample_rate(sr: u32) -> (u8, u32, u32) {
     }
 }
 
+/// Map a stream bit depth onto the 3-bit frame-header sample-size code
+/// (RFC 9639 §9.1.4 Table 17). Every depth this encoder accepts has an
+/// explicit table entry, so each frame is self-describing — a decoder
+/// recovers the bit depth from the frame header without consulting
+/// STREAMINFO. A depth with no table entry falls back to code `0b000`
+/// ("from STREAMINFO"). The field is 3 bits wide for every code, so the
+/// choice has no effect on frame size.
 fn encode_sample_size(bps: u8) -> u8 {
     match bps {
         8 => 1,
@@ -1463,6 +1470,7 @@ fn encode_sample_size(bps: u8) -> u8 {
         16 => 4,
         20 => 5,
         24 => 6,
+        32 => 7,
         _ => 0,
     }
 }
@@ -6720,5 +6728,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn encode_sample_size_emits_table17_codes() {
+        // Every depth the encoder accepts has an explicit RFC 9639
+        // §9.1.4 Table 17 frame-header code, so each frame self-describes
+        // its bit depth; an out-of-table depth degrades to 0b000 ("from
+        // STREAMINFO"). 32-bit must map to 0b111 (code 7), not 0.
+        assert_eq!(encode_sample_size(8), 1);
+        assert_eq!(encode_sample_size(12), 2);
+        assert_eq!(encode_sample_size(16), 4);
+        assert_eq!(encode_sample_size(20), 5);
+        assert_eq!(encode_sample_size(24), 6);
+        assert_eq!(encode_sample_size(32), 7);
+        // A depth with no table entry falls back to "from STREAMINFO".
+        assert_eq!(encode_sample_size(10), 0);
+    }
+
+    #[test]
+    fn encoded_32bit_frame_header_self_describes_depth() {
+        // A 32-bit frame the encoder emits must carry sample-size code
+        // 0b111 in its header and parse back to 32 bps *without*
+        // consulting STREAMINFO (i.e. the frame is self-describing).
+        let n = 512usize;
+        let l: Vec<i32> = (0..n as i32).map(|i| (i * 70_000) - 18_000_000).collect();
+        let r: Vec<i32> = (0..n as i32).map(|i| 9_000_000 - (i * 55_000)).collect();
+        let mut scratch = SubframeScratch::default();
+        let frame = encode_frame(0, n as u32, 192_000, 32, &[l, r], &mut scratch).unwrap();
+        let hdr = crate::frame::parse_frame_header(&frame).unwrap();
+        assert_eq!(
+            hdr.bits_per_sample, 32,
+            "32-bit frame header must self-describe its depth as 32 bps"
+        );
     }
 }

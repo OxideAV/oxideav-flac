@@ -57,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- encoder: **32-bit frames now self-describe their bit depth.** The
+  frame-header sample-size field emitted code `0b000` ("from STREAMINFO")
+  for 32-bit input — every other supported depth (8/12/16/20/24) already
+  wrote its explicit RFC 9639 §9.1.4 Table 17 code. 32-bit now writes
+  `0b111` (code 7) like the others, so a 32-bit frame carries its own
+  depth and decodes correctly even if separated from its STREAMINFO. The
+  field is 3 bits wide for every code, so frame size is unchanged; the
+  emitted 32-bit bytes differ only in that one header field, and remain a
+  valid stream that decodes sample-exact (verified through the
+  independent-decoder oracle).
+
 - decoder: **accept the 32-bit frame-header bit-depth code (`0b111`).**
   RFC 9639 §9.1.4 Table 17 assigns sample-size code `0b111` to 32 bits
   per sample, but the frame-header parser treated it as reserved and
