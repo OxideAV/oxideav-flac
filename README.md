@@ -76,7 +76,11 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 
 - **Bit depths**: 8, 12, 16, 20, 24, 32 bits per sample. Output format
   is `U8` for 8 bps, `S16` for 9..=16, `S24` for 17..=24, `S32` for
-  25..=32.
+  25..=32. Every RFC 9639 §9.1.4 Table 17 frame-header bit-depth code is
+  honoured, including `0b111` (32 bits per sample) — the code a reference
+  encoder writes in every frame of a genuine 32-bit file. Streams an
+  outside encoder produced decode sample-exact (see the
+  `reference_encode_decode` oracle).
 - **Sample rates**: full spec range (1 Hz up to 655_350 Hz), including
   the 11 fixed rate codes and the three variable-rate escapes.
 - **Channels**: 1..=8 independent, plus the three decorrelated stereo

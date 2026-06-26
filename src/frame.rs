@@ -136,6 +136,9 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
         }
     };
 
+    // RFC 9639 §9.1.4 Table 17 — sample-size (bit-depth) code:
+    //   0b000 → from STREAMINFO, 0b001 → 8, 0b010 → 12, 0b011 reserved,
+    //   0b100 → 16, 0b101 → 20, 0b110 → 24, 0b111 → 32.
     let bits_per_sample = match sample_size_code {
         0 => 0, // get from streaminfo
         1 => 8,
@@ -144,7 +147,7 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
         4 => 16,
         5 => 20,
         6 => 24,
-        7 => return Err(Error::invalid("FLAC frame: reserved sample size code 7")),
+        7 => 32,
         _ => unreachable!(),
     };
 
@@ -215,5 +218,32 @@ mod tests {
         let last = crc::crc8(&hdr[..5]);
         *hdr.last_mut().unwrap() = last;
         assert!(parse_frame_header(&hdr).is_ok());
+    }
+
+    /// Build a minimal 192-sample / 48 kHz / mono frame header carrying
+    /// the given 3-bit `sample_size_code`, returning the parse result.
+    fn parse_with_sample_size_code(code: u8) -> Result<FrameHeader> {
+        let mut hdr = vec![0xFF, 0xF8];
+        hdr.push((0b0001 << 4) | 0b1010); // block_size 192 + sample_rate 48k
+        hdr.push((code & 0b111) << 1); // channel(mono=0) + sample_size + reserved 0
+        hdr.push(0x00); // frame number = 0
+        let c = crc::crc8(&hdr);
+        hdr.push(c);
+        parse_frame_header(&hdr)
+    }
+
+    #[test]
+    fn sample_size_code_table_rfc9639_table17() {
+        // RFC 9639 §9.1.4 Table 17: every bit-depth code maps to the
+        // documented depth (0 → "from STREAMINFO", reported as 0).
+        assert_eq!(parse_with_sample_size_code(0).unwrap().bits_per_sample, 0);
+        assert_eq!(parse_with_sample_size_code(1).unwrap().bits_per_sample, 8);
+        assert_eq!(parse_with_sample_size_code(2).unwrap().bits_per_sample, 12);
+        assert!(parse_with_sample_size_code(3).is_err()); // 0b011 reserved
+        assert_eq!(parse_with_sample_size_code(4).unwrap().bits_per_sample, 16);
+        assert_eq!(parse_with_sample_size_code(5).unwrap().bits_per_sample, 20);
+        assert_eq!(parse_with_sample_size_code(6).unwrap().bits_per_sample, 24);
+        // 0b111 → 32 bits per sample (previously rejected as reserved).
+        assert_eq!(parse_with_sample_size_code(7).unwrap().bits_per_sample, 32);
     }
 }

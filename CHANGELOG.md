@@ -46,6 +46,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1/2/6-channel), and the failure path (mismatching input → error naming
   the channel/sample; positive control accepts the true input).
 
+- tests: **foreign-encoder decode oracle** — `reference_encode_decode`
+  encodes raw PCM with a black-box reference `flac` encoder and decodes
+  the result through this crate's container + decoder, asserting
+  sample-exact recovery across 8/16/24/32-bit and mono/stereo. The
+  mirror image of the encode oracle: that proves our bytes decode
+  elsewhere; this proves we decode bytes produced elsewhere. The headline
+  case is genuine 32-bit audio, which carries bit-depth code `0b111` in
+  every frame header (see the Fixed entry below).
+
+### Fixed
+
+- decoder: **accept the 32-bit frame-header bit-depth code (`0b111`).**
+  RFC 9639 §9.1.4 Table 17 assigns sample-size code `0b111` to 32 bits
+  per sample, but the frame-header parser treated it as reserved and
+  rejected the frame. A reference encoder emits exactly this code in
+  every frame of a genuine 32-bit FLAC file, so before this fix the
+  decoder could not read any real 32-bit stream (it could only fall back
+  to the STREAMINFO-supplied depth via code `0b000`). The parser now maps
+  `0b111 → 32` per the table; covered by a new exhaustive Table-17 unit
+  test plus the foreign-encoder 32-bit decode oracle.
+
 ### Changed
 
 - encoder: **apodization weight rows are memoised per `(window, n)`
