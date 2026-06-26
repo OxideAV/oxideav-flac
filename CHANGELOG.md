@@ -19,10 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass `roundtrip.rs` but be caught here. 13 cases span every supported
   bit depth (U8/S16/S24/S32), mono → 7.1, CONSTANT silence, 6-bit
   wasted-bits shift, 256-sample blocks (last-frame remainder path),
-  PADDING, the fast preset, and a non-subset config (LPC order 32 +
-  partition order 15). The reference binary is invoked purely as an opaque
-  process (its source is never read); the suite skips cleanly when the
-  binary is absent, so it never reddens CI on a host without it.
+  PADDING, the fast preset, a non-subset config (LPC order 32 +
+  partition order 15), and each public apodization window driven alone
+  (Welch / Hann / Tukey / Bartlett / Blackman-Harris) so a window with a
+  broken weight function would surface as a foreign-decoder mismatch. The
+  reference binary is invoked purely as an opaque process (its source is
+  never read); the suite skips cleanly when the binary is absent, so it
+  never reddens CI on a host without it.
 
 - encoder: **encode-time verify (`--verify`)** — opt-in
   `FlacEncoderOptions { verify: true, .. }` (and the

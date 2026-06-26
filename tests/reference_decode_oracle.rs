@@ -488,3 +488,55 @@ fn reference_decodes_fast_preset() {
         "fast-preset",
     );
 }
+
+#[test]
+fn reference_decodes_each_apodization_window() {
+    // Drive each public apodization window as the *sole* analysis window
+    // and prove the resulting stream decodes sample-exact through the
+    // independent decoder. A window only shapes the LPC analysis (no
+    // on-wire footprint per RFC 9639 §9.2.6), so the produced stream must
+    // always be valid regardless of which window the search used. Running
+    // each window alone forces the search to commit to it for every LPC
+    // subframe rather than letting another window win, so a window with a
+    // broken weight function (e.g. producing a NaN coefficient or an
+    // out-of-range quantised shift) would surface here.
+    use oxideav_flac::encoder::Apodization;
+    let sr = 44_100;
+    let n = 5000;
+    // A signal with closely-spaced partials + a slow drift so the LPC fit
+    // is non-trivial and the window choice actually matters.
+    let l: Vec<i32> = (0..n)
+        .map(|i| {
+            let t = i as f64 / sr as f64;
+            ((t * 440.0 * 2.0 * std::f64::consts::PI).sin() * 12_000.0
+                + (t * 446.0 * 2.0 * std::f64::consts::PI).sin() * 9_000.0) as i32
+        })
+        .collect();
+    let r = noisy_walk(n, 15_000, 0xABCD_1234);
+
+    let windows = [
+        ("welch", Apodization::Welch),
+        ("hann", Apodization::Hann),
+        (
+            "tukey",
+            Apodization::Tukey {
+                alpha_num: 1,
+                alpha_den: 4,
+            },
+        ),
+        ("bartlett", Apodization::Bartlett),
+        ("blackman-harris", Apodization::BlackmanHarris),
+    ];
+    for (name, w) in windows {
+        let mut opts = oxideav_flac::encoder::FlacEncoderOptions::default();
+        opts.apodization = Some(vec![w]);
+        assert_reference_roundtrip(
+            SampleFormat::S16,
+            2,
+            sr,
+            vec![l.clone(), r.clone()],
+            Some(opts),
+            &format!("apodization-{name}"),
+        );
+    }
+}
