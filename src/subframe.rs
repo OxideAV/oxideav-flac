@@ -93,17 +93,60 @@ fn decode_fixed(br: &mut BitReader, block_size: u32, bps: u32, order: usize) -> 
     Ok(samples)
 }
 
+/// Reconstruct the block by running the §9.2.6 fixed predictor over the
+/// decoded residual. `samples` enters holding exactly `order` warm-up
+/// samples and is grown by `residual.len()` reconstructed samples.
+///
+/// Each order's difference equation is unrolled into a branch-free
+/// closed form so the per-sample inner loop carries no coefficient
+/// iterator, no `samples.len()` recomputation, and — because the
+/// output buffer is pre-extended to its final length and driven by an
+/// absolute index `t` with the predictor window `samples[t-order..t]`
+/// — no per-access bounds check. Output is bit-identical to the naive
+/// `sum(coeff[i] * samples[len-1-i]) + r` form: the coefficients here
+/// are the same Table-of-differences constants
+/// (`{}`, `{1}`, `{2,-1}`, `{3,-3,1}`, `{4,-6,4,-1}`), just spelled
+/// out. All arithmetic stays in `i64` and truncates to `i32` exactly
+/// as before.
 fn apply_fixed_predictor(samples: &mut Vec<i32>, residual: &[i32], order: usize) {
-    // Fixed-predictor coefficients applied to the previous samples.
-    const COEFFS: [&[i32]; 5] = [&[], &[1], &[2, -1], &[3, -3, 1], &[4, -6, 4, -1]];
-    let c = COEFFS[order];
-    for &r in residual {
-        let mut pred: i64 = 0;
-        for (i, &ci) in c.iter().enumerate() {
-            let s = samples[samples.len() - 1 - i] as i64;
-            pred += (ci as i64) * s;
+    let warm = samples.len();
+    debug_assert_eq!(warm, order, "fixed predictor warm-up length");
+    let total = warm + residual.len();
+    samples.resize(total, 0);
+    let buf = &mut samples[..];
+    match order {
+        0 => {
+            // Prediction is 0: the reconstructed sample *is* the residual.
+            for (t, &r) in (warm..total).zip(residual) {
+                buf[t] = r;
+            }
         }
-        samples.push((pred + r as i64) as i32);
+        1 => {
+            for (t, &r) in (warm..total).zip(residual) {
+                let p = buf[t - 1] as i64;
+                buf[t] = (p + r as i64) as i32;
+            }
+        }
+        2 => {
+            for (t, &r) in (warm..total).zip(residual) {
+                let p = 2 * buf[t - 1] as i64 - buf[t - 2] as i64;
+                buf[t] = (p + r as i64) as i32;
+            }
+        }
+        3 => {
+            for (t, &r) in (warm..total).zip(residual) {
+                let p = 3 * buf[t - 1] as i64 - 3 * buf[t - 2] as i64 + buf[t - 3] as i64;
+                buf[t] = (p + r as i64) as i32;
+            }
+        }
+        _ => {
+            // order == 4 (the only remaining legal value; §9.2.6).
+            for (t, &r) in (warm..total).zip(residual) {
+                let p = 4 * buf[t - 1] as i64 - 6 * buf[t - 2] as i64 + 4 * buf[t - 3] as i64
+                    - buf[t - 4] as i64;
+                buf[t] = (p + r as i64) as i32;
+            }
+        }
     }
 }
 
@@ -130,15 +173,52 @@ fn decode_lpc(br: &mut BitReader, block_size: u32, bps: u32, order: usize) -> Re
     Ok(samples)
 }
 
+/// Reconstruct the block by running the §9.2.5 quantised LPC predictor
+/// over the decoded residual. `samples` enters holding exactly
+/// `coeffs.len()` warm-up samples and is grown by `residual.len()`
+/// reconstructed samples.
+///
+/// The output buffer is pre-extended to its final length so the
+/// per-sample inner product runs over the fixed-length window
+/// `buf[t-order..t]` against a same-length reversed coefficient view.
+/// Reversing the coefficients once up front (into a small stack
+/// buffer for the common `order <= 32` case) turns the naive
+/// `coeffs[i] * samples[len-1-i]` (a descending index) into two
+/// forward-scanned equal-length slices, which the compiler can walk
+/// without re-deriving `samples.len()` or bounds-checking each access.
+/// Output is bit-identical to the naive form: the same products are
+/// summed in `i64`, the same `>> qlp_shift` is applied, and the same
+/// `wrapping_add` truncation to `i32` closes each sample.
 fn apply_lpc(samples: &mut Vec<i32>, residual: &[i32], coeffs: &[i32], qlp_shift: u32) {
-    for &r in residual {
+    let order = coeffs.len();
+    let warm = samples.len();
+    debug_assert_eq!(warm, order, "LPC warm-up length");
+    let total = warm + residual.len();
+    samples.resize(total, 0);
+    let buf = &mut samples[..];
+
+    // Reversed coefficients: `rc[j]` multiplies the sample `order-1-j`
+    // steps back, so the window `buf[t-order..t]` (ascending in time)
+    // pairs element-for-element with `rc`. The FLAC LPC order is 1..=32
+    // (§9.2.5, subframe type `0b1xxxxx` → order `(code & 0x1F) + 1`), so
+    // a 32-entry stack buffer always holds the reversed row; the
+    // `min(32)` keeps the copy bounded even if a caller ever passed a
+    // longer coefficient slice.
+    let mut rc_stack = [0i32; 32];
+    let n = order.min(32);
+    for (j, &c) in coeffs.iter().rev().take(n).enumerate() {
+        rc_stack[j] = c;
+    }
+    let rc = &rc_stack[..n];
+
+    for (t, &r) in (warm..total).zip(residual) {
+        let window = &buf[t - order..t];
         let mut pred: i64 = 0;
-        for (i, &c) in coeffs.iter().enumerate() {
-            let s = samples[samples.len() - 1 - i] as i64;
-            pred += (c as i64) * s;
+        for (&s, &c) in window.iter().zip(rc) {
+            pred += (c as i64) * (s as i64);
         }
         let predicted = (pred >> qlp_shift) as i32;
-        samples.push(predicted.wrapping_add(r));
+        buf[t] = predicted.wrapping_add(r);
     }
 }
 

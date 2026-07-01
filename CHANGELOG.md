@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- decode: **faster fixed / LPC reconstruction (byte-identical output).**
+  The per-sample reconstruction loops in `subframe::apply_fixed_predictor`
+  and `apply_lpc` were rewritten to pre-extend the output buffer to its
+  final length and drive it by an absolute time index over a fixed-length
+  predictor window, instead of repeatedly `push`-ing and re-deriving
+  `samples.len() - 1 - i` on every coefficient. The fixed predictor's five
+  §9.2.6 orders are unrolled into their closed-form difference equations;
+  the LPC inner product runs over `buf[t-order..t]` paired with a
+  once-reversed coefficient row so both operands scan forward and the
+  compiler can hoist the bounds checks out of the hot loop. Decoded PCM is
+  bit-for-bit unchanged (all 214 unit tests + the `reference_decode_oracle`
+  black-box suite still pass). Criterion `decode` bench: ~4–10% faster on
+  the fixed/LPC-dominated scenarios (mono-wasted −9.6%, 6-channel −6.5%,
+  mono-s24 −6.8%, stereo-s16 −5.9%, noise −4.0%); the Rice-read-dominated
+  s32 scenario is unchanged (its cost is in the unary residual reader, not
+  the predictor).
+
 ### Added
 
 - tests: **cross-implementation encode oracle** — a new
