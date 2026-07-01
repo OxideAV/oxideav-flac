@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- decode: **residual coded straight into the reconstruction buffer
+  (byte-identical output).** The subframe decoder used to allocate a
+  separate `residual` `Vec`, then a second pass copied it into the
+  reconstructed-sample buffer. The §9.2.7 partitioned-Rice decoder now
+  appends its output directly onto the tail of the warm-up-primed sample
+  buffer (`decode_residual_into`), and the fixed / LPC predictors run
+  **in place** over that tail — each position is overwritten by
+  `prediction + residual` after its predictor window (strictly earlier
+  positions) has been read, so no separate residual storage or copy is
+  needed. One fewer heap allocation and one fewer O(block) copy per
+  subframe. Decoded PCM is bit-for-bit unchanged (214 unit tests +
+  `reference_decode_oracle` + `verify_md5` pass). Criterion `decode`
+  bench vs. the prior tip: mono-s24 −11.1%, stereo-s24 −6.9%, mono-s16
+  −8.1%, wasted −7.4%, stereo-s16 −6.0%, s32 −2.1%; the two
+  Rice-read-dominated scenarios (6-channel, noise) are flat.
 - decode: **faster fixed / LPC reconstruction (byte-identical output).**
   The per-sample reconstruction loops in `subframe::apply_fixed_predictor`
   and `apply_lpc` were rewritten to pre-extend the output buffer to its
