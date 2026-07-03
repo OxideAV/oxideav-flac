@@ -1,5 +1,7 @@
 # oxideav-flac
 
+[![CI](https://github.com/OxideAV/oxideav-flac/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-flac/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-flac.svg)](https://crates.io/crates/oxideav-flac) [![docs.rs](https://docs.rs/oxideav-flac/badge.svg)](https://docs.rs/oxideav-flac) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **FLAC** lossless audio codec + native container — decoder,
 encoder, demuxer, muxer. Zero C dependencies, no FFI, no `*-sys` crates.
 
