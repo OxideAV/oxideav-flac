@@ -41,10 +41,12 @@
 //!   * `bps` ∈ 1..=33 — 1..=32 are the spec per-sample depths; 33 is the
 //!     `bps + 1` side-channel depth that left/right/mid-side
 //!     decorrelation asks for when STREAMINFO declares 32-bit samples.
-//!     33 must be *rejected* (the §9.2.8 wasted-bits + `read_i32`'s
-//!     32-bit ceiling can't represent it) rather than panicking — this
-//!     is the exact shape of the 2026-05-10 regression. We also include
-//!     0 and a few out-of-range values to confirm the guard.
+//!     `decode_subframe` (the narrow ≤ 32-bit path) must *reject* 33 —
+//!     the shape of the 2026-05-10 regression — while the wide `i64`
+//!     path `decode_subframe_wide` *accepts* exactly 33 and must decode
+//!     it panic-free (its predictors use wrapping arithmetic so a hostile
+//!     residual can never overflow `i64`). This target drives both entry
+//!     points; 0 and a few out-of-range values confirm each guard.
 //!
 //! The contract under test is pure panic-freedom: every call MUST return
 //! a `Result` for any combination of `(block_size, bps, bitstream)`.
@@ -86,7 +88,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::bits::BitReader;
-use oxideav_flac::subframe::decode_subframe;
+use oxideav_flac::subframe::{decode_subframe, decode_subframe_wide};
 
 /// Largest block size a §9.1 frame header can encode (16-bit immediate).
 const MAX_BLOCK_SIZE: u32 = 65535;
@@ -99,6 +101,11 @@ fuzz_target!(|data: &[u8]| {
         for &bps in &[0u32, 1, 16, 32, 33] {
             let mut br = BitReader::new(data);
             let _ = decode_subframe(&mut br, 1, bps);
+        }
+        // The wide path accepts only bps == 33; drive it too.
+        {
+            let mut br = BitReader::new(data);
+            let _ = decode_subframe_wide(&mut br, 1, 33);
         }
         return;
     }
@@ -120,6 +127,13 @@ fuzz_target!(|data: &[u8]| {
     {
         let mut br = BitReader::new(body);
         let _ = decode_subframe(&mut br, block_size, bps);
+    }
+    // Drive the wide (33-bit side-channel) path over the same body. It
+    // rejects every width but 33, so pin bps to 33 here; the body still
+    // steers type_code / predictor order / residual layout freely.
+    {
+        let mut br = BitReader::new(body);
+        let _ = decode_subframe_wide(&mut br, block_size, 33);
     }
 
     // A second call with the block_size and bps swapped through a
@@ -152,6 +166,9 @@ fuzz_target!(|data: &[u8]| {
                 let mut br = BitReader::new(slice);
                 let _ = decode_subframe(&mut br, bs, bp);
             }
+            // Sweep the wide path across the same block sizes.
+            let mut br = BitReader::new(slice);
+            let _ = decode_subframe_wide(&mut br, bs, 33);
         }
     }
 });

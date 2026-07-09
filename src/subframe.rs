@@ -385,6 +385,14 @@ fn decode_fixed_wide(
 
 /// `i64` twin of [`apply_fixed_predictor`] — same difference-equation
 /// constants, widened storage. See that function for the derivation.
+///
+/// All arithmetic is `wrapping_*`, mirroring the narrow path's `as i32`
+/// truncation: a valid 33-bit stream keeps every reconstructed sample and
+/// predictor sum well inside `i64` (a 33-bit value times the ≤ 6 fixed
+/// coefficient is ≤ 36 bits), so no wrap ever occurs and the output is
+/// exact; a hostile/invalid stream that would otherwise grow a sample past
+/// `i64::MAX` wraps instead of panicking (debug overflow check), preserving
+/// the crate-wide panic-freedom contract exercised by the fuzz harnesses.
 fn apply_fixed_predictor_wide(samples: &mut [i64], order: usize) {
     let total = samples.len();
     let buf = samples;
@@ -392,25 +400,32 @@ fn apply_fixed_predictor_wide(samples: &mut [i64], order: usize) {
         0 => {}
         1 => {
             for t in order..total {
-                buf[t] += buf[t - 1];
+                buf[t] = buf[t].wrapping_add(buf[t - 1]);
             }
         }
         2 => {
             for t in order..total {
-                let p = 2 * buf[t - 1] - buf[t - 2];
-                buf[t] += p;
+                let p = buf[t - 1].wrapping_mul(2).wrapping_sub(buf[t - 2]);
+                buf[t] = buf[t].wrapping_add(p);
             }
         }
         3 => {
             for t in order..total {
-                let p = 3 * buf[t - 1] - 3 * buf[t - 2] + buf[t - 3];
-                buf[t] += p;
+                let p = buf[t - 1]
+                    .wrapping_mul(3)
+                    .wrapping_sub(buf[t - 2].wrapping_mul(3))
+                    .wrapping_add(buf[t - 3]);
+                buf[t] = buf[t].wrapping_add(p);
             }
         }
         _ => {
             for t in order..total {
-                let p = 4 * buf[t - 1] - 6 * buf[t - 2] + 4 * buf[t - 3] - buf[t - 4];
-                buf[t] += p;
+                let p = buf[t - 1]
+                    .wrapping_mul(4)
+                    .wrapping_sub(buf[t - 2].wrapping_mul(6))
+                    .wrapping_add(buf[t - 3].wrapping_mul(4))
+                    .wrapping_sub(buf[t - 4]);
+                buf[t] = buf[t].wrapping_add(p);
             }
         }
     }
@@ -448,7 +463,10 @@ fn decode_lpc_wide(
 /// exactly as the narrow path does (which already promoted to `i64`), so
 /// this is bit-identical to the ≤ 32-bit form on any sample that fits both
 /// widths; the only difference is the reconstructed samples themselves are
-/// stored `i64`-wide.
+/// stored `i64`-wide. Arithmetic is `wrapping_*` for the same reason as
+/// [`apply_fixed_predictor_wide`]: a valid 33-bit stream never wraps (a
+/// 33-bit sample times a ≤ 15-bit coefficient summed over ≤ 32 taps is
+/// ≤ 53 bits), while a hostile stream wraps rather than panicking.
 fn apply_lpc_wide(samples: &mut [i64], coeffs: &[i64], qlp_shift: u32) {
     let order = coeffs.len();
     let total = samples.len();
@@ -457,9 +475,9 @@ fn apply_lpc_wide(samples: &mut [i64], coeffs: &[i64], qlp_shift: u32) {
         let window = &buf[t - order..t];
         let mut pred: i64 = 0;
         for (&s, &c) in window.iter().zip(coeffs.iter().rev()) {
-            pred += c * s;
+            pred = pred.wrapping_add(c.wrapping_mul(s));
         }
-        buf[t] += pred >> qlp_shift;
+        buf[t] = buf[t].wrapping_add(pred >> qlp_shift);
     }
 }
 
@@ -697,5 +715,26 @@ mod tests {
             decode_subframe_wide(&mut br, 16, 34),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    /// A hostile stream can drive the 4th-order fixed reconstruction past
+    /// `i64::MAX` (the sample sequence grows ~ `t^4`). Without wrapping
+    /// arithmetic that overflow panics in a debug/fuzz build; the wrapping
+    /// predictor must complete instead. Exercises the panic-freedom
+    /// contract at the predictor directly (the widest block a §9.1 header
+    /// can encode).
+    #[test]
+    fn wide_fixed_predictor_order4_wraps_without_panic() {
+        let mut buf = vec![i64::MAX; 65535];
+        apply_fixed_predictor_wide(&mut buf, 4);
+    }
+
+    /// Same contract for the wide LPC reconstruction: a maximal
+    /// coefficient against maximal samples must wrap, not panic.
+    #[test]
+    fn wide_lpc_predictor_wraps_without_panic() {
+        let mut buf = vec![i64::MAX; 4096];
+        let coeffs = vec![i64::from(i16::MAX); 32]; // wider than any real qlp coeff
+        apply_lpc_wide(&mut buf, &coeffs, 0);
     }
 }
