@@ -20,9 +20,28 @@ pub trait BitReaderExt {
     /// byte-aligned on entry. Supports values up to 36 bits via the
     /// FLAC-extended `0xFE` lead byte.
     fn read_utf8_u64(&mut self) -> Result<u64>;
+
+    /// Read `n` bits (0..=64) as a signed integer, sign-extended from the
+    /// high bit. The generic [`BitReader::read_i32`] tops out at 32 bits;
+    /// FLAC needs 33-bit reads for the side channel of a 32-bit
+    /// stereo-decorrelated frame (RFC 9639 §4.2 / Appendix A.2 — "the side
+    /// channel needs one extra bit of bit depth"), so the widest subframe
+    /// samples do not fit in `i32`.
+    fn read_i64(&mut self, n: u32) -> Result<i64>;
 }
 
 impl BitReaderExt for BitReader<'_> {
+    fn read_i64(&mut self, n: u32) -> Result<i64> {
+        if n == 0 {
+            return Ok(0);
+        }
+        debug_assert!(n <= 64, "read_i64 supports up to 64 bits");
+        let raw = self.read_u64(n)? as i64;
+        let shift = 64 - n;
+        // Arithmetic shift right sign-extends from bit `n-1`.
+        Ok((raw << shift) >> shift)
+    }
+
     fn read_utf8_u64(&mut self) -> Result<u64> {
         if !self.is_byte_aligned() {
             return Err(Error::invalid(
@@ -99,6 +118,32 @@ impl BitWriterExt for BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_i64_sign_extends_wide_widths() {
+        // Round-trip a set of values through 33-bit signed writes/reads,
+        // including the extremes of the 33-bit range and values whose
+        // bit-32 pattern a 32-bit read would misinterpret.
+        for &v in &[
+            0i64,
+            1,
+            -1,
+            4_294_967_295,  // max positive 33-bit
+            -4_294_967_296, // min negative 33-bit
+            3_000_000_000,  // bit 31 set: positive at 33-bit, negative at 32-bit
+            -3_000_000_000,
+        ] {
+            let mut w = BitWriter::new();
+            w.write_u64(v as u64, 33);
+            w.align_to_byte();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.read_i64(33).unwrap(), v, "read_i64(33) for {v}");
+        }
+        // Zero-width read yields 0 and consumes nothing.
+        let mut r = BitReader::new(&[0xFF]);
+        assert_eq!(r.read_i64(0).unwrap(), 0);
+    }
 
     #[test]
     fn utf8_u64_roundtrip_small() {

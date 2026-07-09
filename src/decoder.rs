@@ -8,7 +8,7 @@ use oxideav_core::{
 use crate::crc;
 use crate::frame::{parse_frame_header, ChannelAssignment};
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
-use crate::subframe::decode_subframe;
+use crate::subframe::{decode_subframe, decode_subframe_wide};
 use oxideav_core::bits::BitReader;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -140,23 +140,33 @@ pub fn decode_frame_channels(data: &[u8], streaminfo: &StreamInfo) -> Result<Dec
 
     let mut br = BitReader::new(&data[body_offset..]);
 
-    let n_channels = header.channels.channel_count() as usize;
-    let mut channels: Vec<Vec<i32>> = Vec::with_capacity(n_channels);
-    for ch in 0..n_channels {
-        let bps_for_channel = match header.channels {
-            ChannelAssignment::LeftSide if ch == 1 => bps + 1,
-            ChannelAssignment::RightSide if ch == 0 => bps + 1,
-            ChannelAssignment::MidSide if ch == 1 => bps + 1,
-            _ => bps,
-        };
-        let samples = decode_subframe(&mut br, header.block_size, bps_for_channel)?;
-        if samples.len() != header.block_size as usize {
-            return Err(Error::invalid("subframe sample count mismatch"));
+    // A stereo-decorrelated frame at the 32-bit ceiling carries a 33-bit
+    // side channel (RFC 9639 §4.2 / Appendix A.2). That one channel does
+    // not fit in `i32`, so it is decoded through the wider `i64` path; the
+    // reconstructed left/right pair fits back inside `i32` because the
+    // original samples are at most 32-bit.
+    let decorrelated = !matches!(header.channels, ChannelAssignment::Independent(_));
+    let channels: Vec<Vec<i32>> = if bps == 32 && decorrelated {
+        decode_decorrelated_wide(&mut br, header.block_size, bps, header.channels)?
+    } else {
+        let n_channels = header.channels.channel_count() as usize;
+        let mut channels: Vec<Vec<i32>> = Vec::with_capacity(n_channels);
+        for ch in 0..n_channels {
+            let bps_for_channel = match header.channels {
+                ChannelAssignment::LeftSide if ch == 1 => bps + 1,
+                ChannelAssignment::RightSide if ch == 0 => bps + 1,
+                ChannelAssignment::MidSide if ch == 1 => bps + 1,
+                _ => bps,
+            };
+            let samples = decode_subframe(&mut br, header.block_size, bps_for_channel)?;
+            if samples.len() != header.block_size as usize {
+                return Err(Error::invalid("subframe sample count mismatch"));
+            }
+            channels.push(samples);
         }
-        channels.push(samples);
-    }
-
-    apply_decorrelation(&mut channels, header.channels);
+        apply_decorrelation(&mut channels, header.channels);
+        channels
+    };
 
     // Skip frame-body padding to reach the byte-aligned 16-bit CRC at end.
     br.align_to_byte();
@@ -234,6 +244,79 @@ fn decode_one_frame(
     }))
 }
 
+/// Decode a stereo-decorrelated frame at the 32-bit ceiling, where the
+/// side channel is 33-bit and must be carried in `i64`.
+///
+/// The two subframes are decoded in wire order (`ch0` then `ch1`), one at
+/// the declared 32-bit depth and the other — the side — at 33 bits. The
+/// per-channel decode itself is the same code the narrow path uses (the
+/// 32-bit channel goes through [`decode_subframe`], the side through
+/// [`decode_subframe_wide`]); only the inverse decorrelation runs in `i64`
+/// before narrowing the recovered left/right pair back to `i32`.
+fn decode_decorrelated_wide(
+    br: &mut BitReader,
+    block_size: u32,
+    bps: u32,
+    assign: ChannelAssignment,
+) -> Result<Vec<Vec<i32>>> {
+    // Which of the two channels is the wide (side) one.
+    // LeftSide: ch0=left(32), ch1=side(33). RightSide: ch0=side(33),
+    // ch1=right(32). MidSide: ch0=mid(32), ch1=side(33).
+    let ch0_wide = matches!(assign, ChannelAssignment::RightSide);
+
+    let read_plane = |br: &mut BitReader, wide: bool| -> Result<Vec<i64>> {
+        let plane = if wide {
+            decode_subframe_wide(br, block_size, bps + 1)?
+        } else {
+            decode_subframe(br, block_size, bps)?
+                .into_iter()
+                .map(|s| s as i64)
+                .collect()
+        };
+        if plane.len() != block_size as usize {
+            return Err(Error::invalid("subframe sample count mismatch"));
+        }
+        Ok(plane)
+    };
+
+    let ch0 = read_plane(br, ch0_wide)?;
+    let ch1 = read_plane(br, !ch0_wide)?;
+
+    let n = ch0.len();
+    let mut left = vec![0i32; n];
+    let mut right = vec![0i32; n];
+    match assign {
+        ChannelAssignment::LeftSide => {
+            // ch0 = left, ch1 = side = left - right → right = left - side.
+            for i in 0..n {
+                left[i] = ch0[i] as i32;
+                right[i] = (ch0[i] - ch1[i]) as i32;
+            }
+        }
+        ChannelAssignment::RightSide => {
+            // ch0 = side = left - right, ch1 = right → left = right + side.
+            for i in 0..n {
+                left[i] = (ch1[i] + ch0[i]) as i32;
+                right[i] = ch1[i] as i32;
+            }
+        }
+        ChannelAssignment::MidSide => {
+            // ch0 = mid (with absorbed LSB), ch1 = side.
+            for i in 0..n {
+                let mid = ch0[i];
+                let side = ch1[i];
+                let m = (mid << 1) | (side & 1);
+                left[i] = ((m + side) >> 1) as i32;
+                right[i] = ((m - side) >> 1) as i32;
+            }
+        }
+        ChannelAssignment::Independent(_) => {
+            unreachable!("decode_decorrelated_wide is only reached for decorrelated assignments")
+        }
+    }
+    Ok(vec![left, right])
+}
+
 fn apply_decorrelation(channels: &mut [Vec<i32>], assign: ChannelAssignment) {
     match assign {
         ChannelAssignment::Independent(_) => {}
@@ -306,6 +389,103 @@ mod tests {
         for &bps in &[8u8, 12, 16, 20, 24, 32] {
             let r = make_decoder(&make_params(bps));
             assert!(r.is_ok(), "make_decoder({bps} bps) failed: {:?}", r.err());
+        }
+    }
+
+    // --- 32-bit stereo-decorrelated frame (33-bit side channel) --------
+    use crate::bits_ext::BitWriterExt;
+    use oxideav_core::bits::BitWriter;
+
+    fn write_verbatim(w: &mut BitWriter, samples: &[i64], bps: u32) {
+        w.write_u32(0, 1); // subframe header pad
+        w.write_u32(0b000001, 6); // VERBATIM
+        w.write_u32(0, 1); // no wasted bits
+        for &s in samples {
+            w.write_u64(s as u64, bps);
+        }
+    }
+
+    /// Assemble one complete, CRC-correct 32-bit FLAC frame for the given
+    /// channel assignment from raw left/right planes, encoding both
+    /// subframes VERBATIM (so no predictor search is needed) with the side
+    /// channel written at 33 bits.
+    fn build_32bit_frame(assign_code: u8, left: &[i64], right: &[i64]) -> Vec<u8> {
+        let n = left.len();
+        let mut fw = BitWriter::new();
+        // Frame header (fixed blocking, 192 kHz, 32-bit).
+        fw.write_u32(0b11111111111110, 14); // sync
+        fw.write_u32(0, 1); // reserved
+        fw.write_u32(0, 1); // blocking = fixed
+        fw.write_u32(7, 4); // block size code 7 → explicit 16-bit
+        fw.write_u32(3, 4); // sample rate code 3 → 192000
+        fw.write_u32(assign_code as u32, 4); // channel assignment
+        fw.write_u32(7, 3); // sample size code 7 → 32 bits
+        fw.write_u32(0, 1); // reserved
+        fw.write_utf8_u64(0); // frame number 0
+        fw.write_u32((n - 1) as u32, 16); // explicit block size
+                                          // Header is byte-aligned here; append its CRC-8.
+        let hdr = fw.bytes().to_vec();
+        let c8 = crc::crc8(&hdr);
+        fw.write_u32(c8 as u32, 8);
+
+        // Build the two decorrelated subframes for this assignment.
+        let side: Vec<i64> = left.iter().zip(right).map(|(&l, &r)| l - r).collect();
+        let mid: Vec<i64> = left
+            .iter()
+            .zip(right)
+            .map(|(&l, &r)| (l + r) >> 1)
+            .collect();
+        match assign_code {
+            8 => {
+                // Left-side: ch0 = left (32), ch1 = side (33).
+                write_verbatim(&mut fw, left, 32);
+                write_verbatim(&mut fw, &side, 33);
+            }
+            9 => {
+                // Right-side: ch0 = side (33), ch1 = right (32).
+                write_verbatim(&mut fw, &side, 33);
+                write_verbatim(&mut fw, right, 32);
+            }
+            10 => {
+                // Mid-side: ch0 = mid (32), ch1 = side (33).
+                write_verbatim(&mut fw, &mid, 32);
+                write_verbatim(&mut fw, &side, 33);
+            }
+            _ => unreachable!(),
+        }
+
+        fw.align_to_byte();
+        let body = fw.bytes().to_vec();
+        let c16 = crc::crc16(&body);
+        fw.write_u32(c16 as u32, 16);
+        fw.finish()
+    }
+
+    fn decode_32bit_frame(assign_code: u8, left: &[i64], right: &[i64]) -> (Vec<i32>, Vec<i32>) {
+        let frame = build_32bit_frame(assign_code, left, right);
+        let extradata = streaminfo_extradata(32);
+        let si = StreamInfo::parse(&extradata[4..]).unwrap();
+        let decoded = decode_frame_channels(&frame, &si).unwrap();
+        assert_eq!(decoded.bits_per_sample, 32);
+        (decoded.channels[0].clone(), decoded.channels[1].clone())
+    }
+
+    /// A 32-bit stereo frame under each decorrelation mode must reconstruct
+    /// the exact left/right pair even when the side channel (`L - R`)
+    /// overflows `i32` — the case the decoder used to reject outright.
+    #[test]
+    fn decode_32bit_decorrelated_frame_recovers_full_range() {
+        // side = L - R reaches 4_000_000_000 (> i32::MAX), so a 32-bit
+        // side buffer would corrupt the reconstruction.
+        let left: Vec<i64> = vec![2_000_000_000, -2_000_000_000, 100, -100, 7];
+        let right: Vec<i64> = vec![-2_000_000_000, 2_000_000_000, -100, 100, -7];
+        let expect_l: Vec<i32> = left.iter().map(|&x| x as i32).collect();
+        let expect_r: Vec<i32> = right.iter().map(|&x| x as i32).collect();
+
+        for &code in &[8u8, 9, 10] {
+            let (l, r) = decode_32bit_frame(code, &left, &right);
+            assert_eq!(l, expect_l, "left mismatch for assignment {code}");
+            assert_eq!(r, expect_r, "right mismatch for assignment {code}");
         }
     }
 }
