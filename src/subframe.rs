@@ -737,4 +737,67 @@ mod tests {
         let coeffs = vec![i64::from(i16::MAX); 32]; // wider than any real qlp coeff
         apply_lpc_wide(&mut buf, &coeffs, 0);
     }
+
+    /// Wasted-bits on the wide path: the unary-coded count reduces the
+    /// effective read width, and the final left-shift restores the low
+    /// zero bits. Values are chosen divisible by `2^wasted` so the shift
+    /// round-trips exactly, and near the 33-bit ceiling so the shifted-out
+    /// magnitude genuinely needs the wide storage.
+    #[test]
+    fn wide_verbatim_honours_wasted_bits() {
+        let wasted = 2u32;
+        let eff = 33 - wasted; // 31-bit stored samples
+        let vals: [i64; 3] = [4_000_000_000, -2_000_000_004, 8];
+        for &v in &vals {
+            assert_eq!(v % (1 << wasted), 0, "test value must be divisible");
+        }
+        let mut w = BitWriter::new();
+        w.write_u32(0, 1); // pad
+        w.write_u32(0b000001, 6); // VERBATIM
+        w.write_u32(1, 1); // has wasted bits
+        w.write_unary(wasted - 1); // unary count → wasted = count + 1
+        for &v in &vals {
+            w.write_u64((v >> wasted) as u64, eff);
+        }
+        w.align_to_byte();
+        let bytes = w.finish();
+        let mut br = BitReader::new(&bytes);
+        let s = decode_subframe_wide(&mut br, vals.len() as u32, 33).unwrap();
+        assert_eq!(s, vals.to_vec());
+    }
+
+    /// Wide FIXED order-4 correctness (the panic test only proved the
+    /// order-4 predictor wraps, not that it reconstructs the right values).
+    #[test]
+    fn wide_fixed_order4_reconstructs_via_escape_residual() {
+        let warmup: [i64; 4] = [4_000_000_000, 4_100_000_000, 4_150_000_000, 4_180_000_000];
+        let residuals: [i64; 4] = [3, -5, 7, -2];
+        let mut expected = warmup.to_vec();
+        for &r in &residuals {
+            let t = expected.len();
+            let p =
+                4 * expected[t - 1] - 6 * expected[t - 2] + 4 * expected[t - 3] - expected[t - 4];
+            expected.push(p + r);
+        }
+
+        let mut w = BitWriter::new();
+        w.write_u32(0, 1);
+        w.write_u32(0b001100, 6); // FIXED order 4
+        w.write_u32(0, 1);
+        for &v in &warmup {
+            w.write_u64(v as u64, 33);
+        }
+        w.write_u32(0, 2); // residual method 0
+        w.write_u32(0, 4); // partition order 0
+        w.write_u32(15, 4); // escape marker
+        w.write_u32(8, 5); // raw_bps = 8
+        for &r in &residuals {
+            w.write_u32((r as i32) as u32 & 0xFF, 8);
+        }
+        w.align_to_byte();
+        let bytes = w.finish();
+        let mut br = BitReader::new(&bytes);
+        let s = decode_subframe_wide(&mut br, 8, 33).unwrap();
+        assert_eq!(s, expected);
+    }
 }
