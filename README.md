@@ -86,7 +86,12 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Sample rates**: full spec range (1 Hz up to 655_350 Hz), including
   the 11 fixed rate codes and the three variable-rate escapes.
 - **Channels**: 1..=8 independent, plus the three decorrelated stereo
-  layouts (left/side, right/side, mid/side).
+  layouts (left/side, right/side, mid/side). At the 32-bit depth ceiling
+  the decorrelated layouts carry a **33-bit side channel** (RFC 9639 §4.2
+  / Appendix A.2 — the side signal `L - R` needs one extra bit of depth);
+  that one channel is decoded through a wider `i64` path and the recovered
+  left/right pair narrows back to 32-bit losslessly. The ≤ 32-bit path is
+  unchanged.
 - **Blocking strategy**: fixed and variable block size, any block size
   the spec allows.
 - **Subframe types**: CONSTANT, VERBATIM, FIXED predictor (orders 0–4),
@@ -124,7 +129,10 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Channels**: 1..=8 independent. For stereo inputs the encoder
   evaluates all four spec-defined channel assignments (independent
   L/R, left-side, right-side, mid-side) per frame and picks the
-  smallest total subframe size.
+  smallest total subframe size. At the 32-bit depth ceiling it emits
+  independent L/R only (the decorrelated layouts would need a 33-bit
+  side subframe, which the subframe encoder does not yet write — the
+  *decoder* reads such frames from other encoders; see Decode support).
 - **Predictors**: per subframe the encoder tries CONSTANT, FIXED
   orders 0..=4, LPC orders 1..=12 and VERBATIM, and keeps the
   smallest. The default LPC ceiling is 12 — which is also the

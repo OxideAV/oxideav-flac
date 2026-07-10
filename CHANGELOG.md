@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decode: **32-bit stereo-decorrelated frames (33-bit side channel).** A
+  left-side / right-side / mid-side frame whose declared bit depth is the
+  32-bit ceiling carries its side channel at one extra bit of depth (RFC
+  9639 §4.2 / Appendix A.2 — "the side channel needs one extra bit of bit
+  depth, as the subtraction can produce sample values twice as large as
+  the maximum possible in any given bit depth"), i.e. 33 bits, which does
+  not fit in `i32`. The decoder previously rejected every such frame with
+  `Error::Unsupported`; a conformant decoder must handle the streams other
+  encoders produce. A wide `i64` decode path (`subframe::decode_subframe_wide`
+  plus `i64` twins of the fixed / LPC predictors and the partitioned-Rice
+  residual, and a `BitReaderExt::read_i64` for sign-extended reads past 32
+  bits) now decodes that one channel; the recovered left/right pair narrows
+  back to `i32` losslessly because the original samples are at most 32-bit.
+  The narrow ≤ 32-bit hot loop is untouched (byte-identical). The wide
+  predictors use wrapping arithmetic — bit-exact for valid streams, and
+  panic-free on hostile input where a reconstructed sample would otherwise
+  overflow `i64` (the `subframe_decode` fuzz target now drives both paths).
+  Covered by wide subframe unit tests across all four subframe types over
+  the full 33-bit range, a full-frame integration decode under every
+  decorrelation mode where `L - R` overflows `i32`, and an end-to-end
+  streaming-decoder S32 packing test.
+
 ### Changed
 
 - decode: **residual coded straight into the reconstruction buffer

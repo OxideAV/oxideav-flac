@@ -488,4 +488,32 @@ mod tests {
             assert_eq!(r, expect_r, "right mismatch for assignment {code}");
         }
     }
+
+    /// End-to-end through the public streaming decoder: a 32-bit
+    /// left-side frame must surface as interleaved little-endian S32 PCM,
+    /// exercising the `decode_one_frame` packing path (not just the
+    /// `decode_frame_channels` core the other test drives).
+    #[test]
+    fn streaming_decoder_emits_s32_for_32bit_decorrelated_frame() {
+        let left: Vec<i64> = vec![2_000_000_000, -2_000_000_000, 100, -100];
+        let right: Vec<i64> = vec![-2_000_000_000, 2_000_000_000, -100, 100];
+        let frame = build_32bit_frame(8, &left, &right); // left-side
+        let params = make_params(32);
+        let mut dec = make_decoder(&params).unwrap();
+
+        let pkt = Packet::new(0, oxideav_core::TimeBase::new(1, 192_000), frame);
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected an audio frame");
+        };
+        assert_eq!(af.samples, left.len() as u32);
+
+        // Rebuild the expected interleaved S32 LE byte stream.
+        let mut expected = Vec::new();
+        for i in 0..left.len() {
+            expected.extend_from_slice(&(left[i] as i32).to_le_bytes());
+            expected.extend_from_slice(&(right[i] as i32).to_le_bytes());
+        }
+        assert_eq!(af.data[0], expected);
+    }
 }
