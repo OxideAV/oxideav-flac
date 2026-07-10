@@ -516,4 +516,29 @@ mod tests {
         }
         assert_eq!(af.data[0], expected);
     }
+
+    /// The verify-decoder MD5 path (RFC 9639 §8.2) must reach `Match` for a
+    /// 32-bit decorrelated frame: the wide decode feeds the same serialiser
+    /// as any other depth, and 32-bit samples pack four bytes each. Proves
+    /// the whole decode → PCM-serialise → digest pipeline is lossless for
+    /// the 33-bit-side case.
+    #[test]
+    fn verify_frame_stream_matches_for_32bit_decorrelated() {
+        let left: Vec<i64> = vec![2_000_000_000, -2_000_000_000, 100, -100];
+        let right: Vec<i64> = vec![-2_000_000_000, 2_000_000_000, -100, 100];
+        let frame = build_32bit_frame(10, &left, &right); // mid-side
+
+        let base = streaminfo_extradata(32);
+        let mut si = StreamInfo::parse(&base[4..]).unwrap();
+        si.channels = 2;
+        si.bits_per_sample = 32;
+        // Compute the expected digest from the decoded PCM, then store it.
+        let decoded = decode_frame_channels(&frame, &si).unwrap();
+        let mut v = crate::verify::Md5Verifier::new(32);
+        v.update(&decoded.channels);
+        si.md5 = v.finalize();
+
+        let outcome = crate::verify::verify_frame_stream(&frame, &si).unwrap();
+        assert_eq!(outcome, crate::verify::VerifyOutcome::Match);
+    }
 }
