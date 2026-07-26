@@ -673,3 +673,151 @@ fn all_knobs_combined_never_inflate_and_stay_lossless() {
         },
     );
 }
+
+#[test]
+fn narrower_precision_search_never_deflates() {
+    // The mirror of the "richer search shrinks-or-ties" invariant, for a
+    // *narrowing* knob. Restricting the per-subframe coefficient-precision
+    // sweep to the block-size heuristic alone (span 0) removes candidates
+    // from the search, so its output can only grow-or-tie against the
+    // default span of 4 — and must stay lossless either way.
+    assert_monotone_and_lossless(
+        "precision_span",
+        || {
+            let mut o = FlacEncoderOptions::default();
+            o.lpc_precision_search_span = Some(0);
+            o
+        },
+        FlacEncoderOptions::default,
+    );
+}
+
+#[test]
+fn narrower_partition_search_never_deflates() {
+    // Capping the residual partition-order ceiling below the subset
+    // default (8) removes legal layouts from the search; the coder keeps
+    // the smallest layout it is offered, so a lower ceiling can only
+    // grow-or-tie the payload.
+    assert_monotone_and_lossless(
+        "partition_ceiling",
+        || {
+            let mut o = FlacEncoderOptions::default();
+            o.max_partition_order = Some(2);
+            o
+        },
+        FlacEncoderOptions::default,
+    );
+}
+
+#[test]
+fn narrowing_knobs_default_to_the_historical_search() {
+    // `None` must be indistinguishable from not setting the field at all.
+    // Byte-equality (not just size) pins that the new options are a pure
+    // API addition: an existing caller's output is unchanged.
+    for &kind in ALL_KINDS {
+        let pcm = signal_block(kind, PROPERTY_BLOCK_LEN);
+        let (baseline, _) = roundtrip(
+            &pcm,
+            1,
+            PROPERTY_SR,
+            SampleFormat::S16,
+            FlacEncoderOptions::default(),
+        );
+        let explicit_none = {
+            let mut o = FlacEncoderOptions::default();
+            o.lpc_precision_search_span = None;
+            o.max_partition_order = None;
+            o
+        };
+        let (same, _) = roundtrip(&pcm, 1, PROPERTY_SR, SampleFormat::S16, explicit_none);
+        assert_eq!(
+            baseline, same,
+            "kind={kind}: explicit `None` changed the emitted bytes"
+        );
+    }
+}
+
+#[test]
+fn max_partition_order_cannot_escape_the_subset_bound() {
+    // `max_partition_order` is a *narrowing* control only. Asking for the
+    // full 4-bit range (15) without also opting into non-subset output
+    // must clamp to the subset ceiling of 8 — i.e. produce exactly the
+    // default bytes, not the wider non-subset search's.
+    for &kind in ALL_KINDS {
+        let pcm = signal_block(kind, PROPERTY_BLOCK_LEN);
+        let (subset_default, _) = roundtrip(
+            &pcm,
+            1,
+            PROPERTY_SR,
+            SampleFormat::S16,
+            FlacEncoderOptions::default(),
+        );
+        let clamped = {
+            let mut o = FlacEncoderOptions::default();
+            o.max_partition_order = Some(15);
+            o
+        };
+        let (clamped_bytes, recovered) =
+            roundtrip(&pcm, 1, PROPERTY_SR, SampleFormat::S16, clamped);
+        assert_eq!(
+            subset_default, clamped_bytes,
+            "kind={kind}: max_partition_order(15) escaped the streamable-subset ceiling"
+        );
+        assert_eq!(
+            recovered,
+            pcm_to_i32(&pcm, SampleFormat::S16, 1),
+            "kind={kind}: clamped partition ceiling is not lossless"
+        );
+    }
+}
+
+#[test]
+fn out_of_range_narrowing_values_clamp_instead_of_failing() {
+    // Saturating values must clamp to something legal and stay lossless
+    // rather than panicking or emitting an invalid stream. A span far
+    // above the largest legal precision is meaningless but harmless: the
+    // floor is still MIN_LPC_QLP_PRECISION.
+    for &kind in BRACKET_KINDS {
+        let pcm = signal_block(kind, PROPERTY_BLOCK_LEN);
+        let reference = pcm_to_i32(&pcm, SampleFormat::S16, 1);
+        let extreme = {
+            let mut o = FlacEncoderOptions::default();
+            o.lpc_precision_search_span = Some(u32::MAX);
+            o.max_partition_order = Some(u32::MAX);
+            o
+        };
+        let (bytes, recovered) = roundtrip(&pcm, 1, PROPERTY_SR, SampleFormat::S16, extreme);
+        assert!(bytes > 0, "kind={kind}: extreme values produced no output");
+        assert_eq!(
+            recovered, reference,
+            "kind={kind}: extreme narrowing values broke losslessness"
+        );
+    }
+}
+
+#[test]
+fn a_fully_narrowed_search_is_still_lossless() {
+    // The leanest configuration the narrowing knobs can express, combined
+    // with the existing lean settings: one window, one precision, a low
+    // partition ceiling, and the smallest LPC ceiling. This is the shape a
+    // latency-sensitive caller would actually ship, so it needs an
+    // explicit losslessness guard rather than only a monotonicity one.
+    for &kind in ALL_KINDS {
+        let pcm = signal_block(kind, PROPERTY_BLOCK_LEN);
+        let reference = pcm_to_i32(&pcm, SampleFormat::S16, 1);
+        let leanest = {
+            let mut o = FlacEncoderOptions::default();
+            o.apodization = Some(vec![Apodization::Welch]);
+            o.max_lpc_order = Some(1);
+            o.lpc_precision_search_span = Some(0);
+            o.max_partition_order = Some(0);
+            o
+        };
+        let (bytes, recovered) = roundtrip(&pcm, 1, PROPERTY_SR, SampleFormat::S16, leanest);
+        assert!(bytes > 0, "kind={kind}: leanest search produced no output");
+        assert_eq!(
+            recovered, reference,
+            "kind={kind}: fully narrowed search is not lossless"
+        );
+    }
+}
