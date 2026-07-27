@@ -285,18 +285,29 @@ fn decode_decorrelated_wide(
     let n = ch0.len();
     let mut left = vec![0i32; n];
     let mut right = vec![0i32; n];
+    // Inverse decorrelation runs in `i64` because the side channel is
+    // 33-bit (RFC 9639 §4.2). For any *valid* 32-bit stream the operands
+    // are bounded — mid/left/right at 32 bits, side at 33 — so every sum or
+    // difference below fits comfortably inside `i64` and never overflows.
+    // A malformed stream, however, can drive the wide `_wide` predictors
+    // (which reconstruct with wrapping arithmetic) to an out-of-range side
+    // sample far beyond its spec-legal 33-bit envelope; the reconstruction
+    // arithmetic would then overflow `i64`. That can only mean the input is
+    // invalid, so the checked ops surface a typed decode error rather than
+    // panicking (debug) or silently wrapping to a bogus sample.
+    let overflow = || Error::invalid("FLAC 32-bit decorrelation: reconstructed sample exceeds i64");
     match assign {
         ChannelAssignment::LeftSide => {
             // ch0 = left, ch1 = side = left - right → right = left - side.
             for i in 0..n {
                 left[i] = ch0[i] as i32;
-                right[i] = (ch0[i] - ch1[i]) as i32;
+                right[i] = (ch0[i].checked_sub(ch1[i]).ok_or_else(overflow)?) as i32;
             }
         }
         ChannelAssignment::RightSide => {
             // ch0 = side = left - right, ch1 = right → left = right + side.
             for i in 0..n {
-                left[i] = (ch1[i] + ch0[i]) as i32;
+                left[i] = (ch1[i].checked_add(ch0[i]).ok_or_else(overflow)?) as i32;
                 right[i] = ch1[i] as i32;
             }
         }
@@ -305,9 +316,11 @@ fn decode_decorrelated_wide(
             for i in 0..n {
                 let mid = ch0[i];
                 let side = ch1[i];
+                // `mid` is the narrow (≤ 32-bit) channel, so `mid << 1`
+                // never overflows; only the ± side steps can.
                 let m = (mid << 1) | (side & 1);
-                left[i] = ((m + side) >> 1) as i32;
-                right[i] = ((m - side) >> 1) as i32;
+                left[i] = (m.checked_add(side).ok_or_else(overflow)? >> 1) as i32;
+                right[i] = (m.checked_sub(side).ok_or_else(overflow)? >> 1) as i32;
             }
         }
         ChannelAssignment::Independent(_) => {
