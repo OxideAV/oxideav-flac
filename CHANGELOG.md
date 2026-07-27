@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- registry: **payload magic claims for tag-less carriage.** The codec
+  registration now declares `payload_magic(b"\x7fFLAC")` — the
+  five-byte prefix (0x7F 0x46 0x4C 0x41 0x43) that opens the first
+  packet of every FLAC-in-Ogg logical bitstream (RFC 9639 §10.1
+  Table 24) — and `payload_magic(b"fLaC")`, the stream signature that
+  heads every raw container-less FLAC stream. Ogg demuxers and
+  raw-stream probers can now resolve the codec from the payload head
+  via `CodecRegistry::resolve_payload_magic_ref` /
+  `CodecResolver::resolve_payload_magic` (oxideav-core 0.1.33) with no
+  codec tag in play. Covered by resolution tests: Table 24
+  first-packet layout, bare-prefix and truncated-prefix behaviour,
+  foreign-magic and case-sensitivity negatives, dyn-resolver path, and
+  enumeration order.
+
 - decode: **32-bit stereo-decorrelated frames (33-bit side channel).** A
   left-side / right-side / mid-side frame whose declared bit depth is the
   32-bit ceiling carries its side channel at one extra bit of depth (RFC

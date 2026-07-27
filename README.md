@@ -294,6 +294,19 @@ the `compression_quality` test suite:
   correct against an outside implementation. The suite skips when no
   reference decoder is on `PATH`.
 
+## Codec identification
+
+Registration claims the WAVEFORMATEX tag `0xF1AC` (FLAC-in-WAV/AVI)
+plus two payload magic prefixes for tag-less carriage, resolved via
+`CodecRegistry::resolve_payload_magic_ref` / the `CodecResolver`
+trait:
+
+- `\x7fFLAC` — first packet of a FLAC-in-Ogg logical bitstream
+  (RFC 9639 §10.1 Table 24); Ogg demuxers identify the mapped codec
+  by this prefix alone.
+- `fLaC` — the raw-stream signature heading every container-less
+  FLAC stream.
+
 ## Native container
 
 - **Demuxer**: parses `fLaC` magic + metadata block chain
