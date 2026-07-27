@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fuzz: **`frame_header` harness no longer treats sample-size code 7 as
+  reserved.** The scheduled Fuzz workflow had been red daily: the
+  harness's deterministic reserved-code sweep asserted that a frame
+  header carrying bit-depth code `0b111` must fail to parse, but RFC
+  9639 Table 17 assigns `0b111` to 32 bits per sample (only `0b011` is
+  reserved), and the parser rightly started accepting it when 32-bit
+  decode support landed. The stale assertion panicked on every fuzz
+  iteration — including the empty input, hence the deterministic daily
+  failure. Code 7 now sits in the positive boundary sweep (expected bps
+  = 32) plus a dedicated deterministic regression check pinning the
+  exact crash arc.
+
 ### Added
 
 - decode: **32-bit stereo-decorrelated frames (33-bit side channel).** A

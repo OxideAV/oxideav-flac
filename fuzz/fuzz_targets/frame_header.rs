@@ -51,8 +51,9 @@
 //!     correct trailing CRC-8). The parser must accept every
 //!     well-formed combination AND reject every code value the spec
 //!     marks reserved (`block_size_code == 0`,
-//!     `sample_rate_code == 15`, `sample_size_code == 3 | 7`,
-//!     `channel_code in 11..=15`).
+//!     `sample_rate_code == 15`, `sample_size_code == 3`,
+//!     `channel_code in 11..=15`). Note RFC 9639 Table 17 assigns
+//!     `0b111` to 32 bits per sample — only `0b011` is reserved.
 //! 2.  **CRC verification stability.** After a successful parse the
 //!     harness flips one bit of the header (rotating offsets) and
 //!     asserts the parser surfaces the bit-flip via either a CRC
@@ -112,8 +113,17 @@ use oxideav_flac::frame::{parse_frame_header, BlockingStrategy, ChannelAssignmen
 const RESERVED_BLOCK_SIZE: u8 = 0;
 /// Reserved sample-rate code (table entry 15 — "forbidden, sync code").
 const RESERVED_SAMPLE_RATE: u8 = 15;
-/// Reserved sample-size codes (table entries 3 + 7).
-const RESERVED_SAMPLE_SIZE: [u8; 2] = [3, 7];
+/// Reserved sample-size code (RFC 9639 Table 17 — only `0b011` is
+/// reserved; `0b111` codes 32 bits per sample).
+///
+/// r431 regression note: this list used to (incorrectly) also contain
+/// 7, which made the deterministic reserved-code sweep below assert
+/// that a 32-bps header must fail to parse. When the crate gained
+/// 32-bit decode support the parser (correctly, per Table 17) started
+/// accepting code 7 and the sweep panicked on every input — including
+/// the empty one — turning the scheduled Fuzz run red. Code 7 now
+/// lives in the positive boundary sweep instead.
+const RESERVED_SAMPLE_SIZE: [u8; 1] = [3];
 /// Channel codes 11..=15 are reserved (only 0..=10 are assigned).
 const RESERVED_CHANNEL: [u8; 5] = [11, 12, 13, 14, 15];
 
@@ -212,6 +222,7 @@ fn build_header(
         4 => 16,
         5 => 20,
         6 => 24,
+        7 => 32,
         _ => unreachable!("reserved sample size codes are filtered above"),
     };
 
@@ -374,10 +385,10 @@ fuzz_target!(|data: &[u8]| {
     // every channel-code, every sample-size-code) is hit even when
     // the fuzzer hasn't yet produced the right input bytes.
     //
-    // 16 × 16 × 11 × 6 = 16 896 combinations; sweep a deterministic
-    // subset on every iteration (all 4 outer dimensions × 6
+    // 16 × 16 × 11 × 7 = 19 712 combinations; sweep a deterministic
+    // subset on every iteration (all 4 outer dimensions × 7
     // representative coded-number boundary values × {fixed,variable}
-    // blocking == ~24 192 well-formed headers per iter). Most modern
+    // blocking == ~28 000 well-formed headers per iter). Most modern
     // fuzzers hit ~50 K iter/s so this is well inside the budget.
     // -----------------------------------------------------------------
     let coded_number_boundaries: [u64; 7] = [
@@ -394,7 +405,7 @@ fuzz_target!(|data: &[u8]| {
             for bsc in 1u8..16 {
                 for src in 0u8..15 {
                     for cc in 0u8..11 {
-                        for ssc in [0u8, 1, 2, 4, 5, 6] {
+                        for ssc in [0u8, 1, 2, 4, 5, 6, 7] {
                             if let Some((bytes, exp)) = build_header(
                                 variable, bsc, /* block_size_imm */ 0xA5, src,
                                 /* sample_rate_imm */ 0x1234, cc, ssc, cn,
@@ -452,7 +463,8 @@ fuzz_target!(|data: &[u8]| {
             "reserved sample_rate_code 15 must be rejected",
         );
     }
-    // Sample-size codes 3 and 7.
+    // Sample-size code 3 (the only reserved bit-depth code — Table 17
+    // assigns 7 to 32 bps; see the r431 note on RESERVED_SAMPLE_SIZE).
     for &ssc in &RESERVED_SAMPLE_SIZE {
         let mut w = BitWriter::new();
         w.write_u32(0b11_1111_1111_1110, 14);
@@ -471,6 +483,32 @@ fuzz_target!(|data: &[u8]| {
             parse_frame_header(&bytes).is_err(),
             "reserved sample_size_code {} must be rejected",
             ssc,
+        );
+    }
+    // r431 regression (crash-da39a3ee…, the empty input): sample-size
+    // code 7 is NOT reserved — RFC 9639 Table 17 assigns it 32 bits
+    // per sample and the parser must accept it. This deterministic
+    // positive check runs on every iteration, so the exact arc that
+    // turned the scheduled Fuzz run red stays pinned.
+    {
+        let mut w = BitWriter::new();
+        w.write_u32(0b11_1111_1111_1110, 14);
+        w.write_u32(0, 1);
+        w.write_u32(0, 1); // fixed
+        w.write_u32(1, 4); // 192
+        w.write_u32(9, 4); // 44.1k
+        w.write_u32(0, 4); // mono
+        w.write_u32(7, 3); // 32 bps (Table 17: 0b111)
+        w.write_u32(0, 1);
+        w.write_utf8_u64(0);
+        let mut bytes = w.finish();
+        let c = crc8(&bytes);
+        bytes.push(c);
+        let parsed = parse_frame_header(&bytes)
+            .expect("sample_size_code 7 (32 bps, RFC 9639 Table 17) must parse");
+        assert_eq!(
+            parsed.bits_per_sample, 32,
+            "sample_size_code 7 must decode to 32 bits per sample",
         );
     }
     // Channel codes 11..=15.
