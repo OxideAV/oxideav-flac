@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-flac/compare/v0.0.11...v0.0.12) - 2026-09-01
+
+### Other
+
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- checked wide-decorrelation arithmetic — reject out-of-range 33-bit side channel
+- payload magic claims — \x7fFLAC (Ogg mapping) + fLaC (raw stream)
+- frame_header — sample-size code 7 is 32 bps, not reserved
+- wide-path wasted-bits + order-4 fixed correctness tests
+- MD5 verify-decoder Match test for 32-bit decorrelated frame
+- streaming-path S32 test + document 33-bit side-channel decode
+- wrapping arithmetic in wide predictors + fuzz the 33-bit path
+- decode 32-bit stereo-decorrelated frames (33-bit side channel)
+- add CI / crates.io / docs.rs / MIT-license badges
+- decode residual straight into the reconstruction buffer
+- faster fixed/LPC reconstruction (byte-identical PCM)
+- stereo-decorrelation selection completeness tests
+- per-apodization-window encode oracle (each window decoded independently)
+- 32-bit frames self-describe their depth (Table 17 code 0b111)
+- accept 32-bit frame-header bit-depth code 0b111 (RFC 9639 Table 17)
+- independent-decoder encode oracle (RFC 9639 full-stream roundtrip)
+- memoise apodization weight rows per (window, n)
+- skip all-zero high-k tail in finest-level shift-sum loop
+- encode-time verify (--verify) self-check
+- bottom-up partition-cost merge for Rice residual search
+- speed up encode ([#12](https://github.com/OxideAV/oxideav-flac/pull/12)) — per-window single LPC solve + fast() preset
+- SEEKTABLE-generation edge cases + README
+- end-to-end SEEKTABLE-generation integration tests
+- muxer-side SEEKTABLE generation (RFC 9639 §8.5)
+- fix stale verify_stream doc — error is InvalidData, not Crc
+- correct verify-path MD5 citation to RFC 9639 §8.2
+- encode->verify MD5 roundtrip + document the verify path
+- verify-decoder MD5 against the reference corpus (RFC 9639 §9.2.1)
+- verify-decoder MD5 path — Md5Verifier + verify_stream (RFC 9639 §9.2.1)
+- skip real-fixture compression guard when docs submodule absent
+- five-window default apodization search (RFC 9639 §9.2.6)
+- compression-quality regression suite (RFC 9639 §9.2.5–§9.2.7)
+- add Bartlett + Blackman-Harris apodization windows (RFC 9639 §9.2.6)
+- demuxer seektable-less seeking via frame-header scan (RFC 9639 §8.5)
+- caller-configurable per-frame block size (RFC 9639 §9.1)
+- caller-configurable apodization window set (RFC 9639 §9.2.6)
+- add target 13 `seek` — demuxer seek_to panic-freedom (RFC 9639 §8.5)
+- opt-in higher LPC predictor orders (RFC 9639 §9.2.6, up to 32)
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - fuzz: **`frame_header` harness no longer treats sample-size code 7 as
