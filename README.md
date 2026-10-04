@@ -21,27 +21,26 @@ oxideav-flac = "0.0"
 Open a `.flac` file through the container, then decode packets to PCM:
 
 ```rust
-use oxideav_core::{CodecRegistry, ContainerRegistry, Frame};
+use oxideav_core::{Frame, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_flac::register_codecs(&mut codecs);
-oxideav_flac::register_containers(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_flac::register(&mut ctx); // codec "flac" + the native FLAC container
 
-let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
+let input: Box<dyn oxideav_core::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("song.flac")?),
 );
-let mut dmx = containers.open("flac", input)?;
-let stream = &dmx.streams()[0];
-let mut dec = codecs.make_decoder(&stream.params)?;
+let mut dmx = ctx.containers.open_demuxer("flac", input, &ctx.codecs)?;
+let params = dmx.streams()[0].params.clone();
+let mut dec = ctx.codecs.first_decoder(&params)?;
 
 loop {
     match dmx.next_packet() {
         Ok(pkt) => {
             dec.send_packet(&pkt)?;
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-                // af.format is one of S16 / S24 / S32 / U8 per the
-                // STREAMINFO bit depth. af.data[0] is interleaved PCM.
+                // params.sample_format is one of S16 / S24 / S32 / U8 per
+                // the STREAMINFO bit depth. af.data[0] is interleaved PCM.
+                let _ = af;
             }
         }
         Err(oxideav_core::Error::Eof) => break,
@@ -51,21 +50,34 @@ loop {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+`first_decoder` picks the first registered implementation; applications
+that register several implementations of a codec and want
+priority/preference-aware selection use
+`oxideav_pipeline::make_decoder_with` instead.
+
 ### Encoder
 
 ```rust
-use oxideav_core::{CodecId, CodecParameters, Frame, SampleFormat};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, RuntimeContext, SampleFormat};
+
+let mut ctx = RuntimeContext::new();
+oxideav_flac::register(&mut ctx);
 
 let mut params = CodecParameters::audio(CodecId::new("flac"));
 params.channels = Some(2);
 params.sample_rate = Some(48_000);
 params.sample_format = Some(SampleFormat::S16);
-let mut enc = codecs.make_encoder(&params)?;
+let mut enc = ctx.codecs.first_encoder(&params)?;
+
+// 1024 stereo S16 samples of silence, interleaved.
+let pcm_frame = AudioFrame { samples: 1024, pts: Some(0), data: vec![vec![0u8; 1024 * 2 * 2]] };
 enc.send_frame(&Frame::Audio(pcm_frame))?;
 enc.flush()?;
 while let Ok(pkt) = enc.receive_packet() {
-    muxer.write_packet(&pkt)?;
+    // hand `pkt` to a muxer (e.g. the FLAC muxer via ctx.containers.open_muxer)
+    let _ = pkt;
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The encoder emits a STREAMINFO metadata block into
