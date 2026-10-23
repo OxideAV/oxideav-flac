@@ -66,7 +66,7 @@
 //!     sanity check that survives every iteration).
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_flac::md5::{compute, Md5};
+use oxideav_flac::md5::{Md5, compute};
 
 /// Cap on the payload tail. Big enough to push every input across
 /// several 64-byte blocks AND across the 32-bit overflow boundary of

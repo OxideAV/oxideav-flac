@@ -77,9 +77,9 @@
 //! it is itself anchored to the four RFC 1321 §A.5 test vectors
 //! covered in `src/md5.rs`'s unit tests.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_flac::md5::{compute, Md5};
+use oxideav_flac::md5::{Md5, compute};
 
 /// Cheap deterministic xorshift32 — synthesises realistic random
 /// byte content for the MD5 bench buffers. A pure-zero buffer is

@@ -110,8 +110,8 @@ fn synth_streaminfo(seed: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&4096u16.to_be_bytes()); // max_block
     out.extend_from_slice(&[0, 0, 0]); // min_frame
     out.extend_from_slice(&[0, 0, 0]); // max_frame
-                                       // Pack: sr=44100 (20 b), ch=2-1=1 (3 b), bps=16-1=15 (5 b), total=0 (36 b).
-                                       // 44100 == 0xAC44; 20 bits.
+    // Pack: sr=44100 (20 b), ch=2-1=1 (3 b), bps=16-1=15 (5 b), total=0 (36 b).
+    // 44100 == 0xAC44; 20 bits.
     let sr: u32 = 44_100;
     let ch_minus_1: u32 = 1;
     let bps_minus_1: u32 = 15;

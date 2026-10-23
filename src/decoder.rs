@@ -6,7 +6,7 @@ use oxideav_core::{
 };
 
 use crate::crc;
-use crate::frame::{parse_frame_header, ChannelAssignment};
+use crate::frame::{ChannelAssignment, parse_frame_header};
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 use crate::subframe::{decode_subframe, decode_subframe_wide};
 use oxideav_core::bits::BitReader;
@@ -231,7 +231,7 @@ fn decode_one_frame(
                 _ => {
                     return Err(Error::unsupported(
                         "FLAC decoder output format not supported",
-                    ))
+                    ));
                 }
             }
         }
@@ -436,7 +436,7 @@ mod tests {
         fw.write_u32(0, 1); // reserved
         fw.write_utf8_u64(0); // frame number 0
         fw.write_u32((n - 1) as u32, 16); // explicit block size
-                                          // Header is byte-aligned here; append its CRC-8.
+        // Header is byte-aligned here; append its CRC-8.
         let hdr = fw.bytes().to_vec();
         let c8 = crc::crc8(&hdr);
         fw.write_u32(c8 as u32, 8);

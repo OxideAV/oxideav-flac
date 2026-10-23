@@ -61,7 +61,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
-use oxideav_flac::encoder::{make_encoder_with_options, FlacEncoderOptions};
+use oxideav_flac::encoder::{FlacEncoderOptions, make_encoder_with_options};
 use oxideav_flac::metadata::{BlockHeader, BlockType};
 
 /// Header byte count for a metadata block (RFC 9639 §6).
@@ -380,7 +380,7 @@ fn clamp_pcm_in_place(pcm: &mut [u8], format: SampleFormat) {
             // resulting i32 stays in `[-2^23, 2^23)`. The encoder
             // reads three bytes and sign-extends; we just need to
             // make sure the input bytes match a 24-bit signed value.
-            for chunk in pcm.chunks_exact_mut(3) {
+            for chunk in pcm.as_chunks_mut::<3>().0 {
                 // Mask the high byte to 24 valid bits; no further
                 // work needed because the high byte was just the
                 // sign byte and we already wrote three bytes.

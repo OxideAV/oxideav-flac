@@ -251,7 +251,7 @@ fn decode_residual_into(
     };
     let partition_order = br.read_u32(4)?;
     let n_partitions = 1u32 << partition_order;
-    if block_size % n_partitions != 0 {
+    if !block_size.is_multiple_of(n_partitions) {
         return Err(Error::invalid(
             "FLAC residual: block_size not divisible by partition count",
         ));
@@ -497,7 +497,7 @@ fn decode_residual_into_wide(
     };
     let partition_order = br.read_u32(4)?;
     let n_partitions = 1u32 << partition_order;
-    if block_size % n_partitions != 0 {
+    if !block_size.is_multiple_of(n_partitions) {
         return Err(Error::invalid(
             "FLAC residual: block_size not divisible by partition count",
         ));
@@ -693,7 +693,7 @@ mod tests {
         w.write_u32(4 - 1, 4); // qlp precision 4 → field value precision-1
         w.write_u32(shift, 5); // qlp shift
         w.write_u32(coeff as u32 & 0xF, 4); // one 4-bit coefficient
-                                            // Residual: method 0, partition order 0, Rice param k=3.
+        // Residual: method 0, partition order 0, Rice param k=3.
         w.write_u32(0, 2);
         w.write_u32(0, 4);
         w.write_u32(3, 4); // k

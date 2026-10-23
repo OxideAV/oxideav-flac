@@ -60,8 +60,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_flac::metadata::{
-    Application, BlockHeader, CueSheet, CueSheetIndex, CueSheetTrack, MetadataBlock, MetadataChain,
-    Picture, SeekPoint, StreamInfo, VorbisComment, FLAC_MAGIC,
+    Application, BlockHeader, CueSheet, CueSheetIndex, CueSheetTrack, FLAC_MAGIC, MetadataBlock,
+    MetadataChain, Picture, SeekPoint, StreamInfo, VorbisComment,
 };
 
 /// Inputs larger than this are pure throughput waste for a
@@ -113,11 +113,7 @@ impl<'a> Lex<'a> {
             .iter()
             .map(|&b| {
                 let c = 0x20 + (b % 0x5F); // 0x20..=0x7E
-                if c == b'=' {
-                    b'-'
-                } else {
-                    c
-                }
+                if c == b'=' { b'-' } else { c }
             })
             .map(char::from)
             .collect()
@@ -391,24 +387,24 @@ fn mutate_wire(wire: &[u8], chain: &MetadataChain, lex: &mut Lex) {
     // the content as all-zero, so the typed chain must be unchanged
     // and the re-write must scrub the byte back to zero.
     for (i, block) in chain.blocks.iter().enumerate() {
-        if let MetadataBlock::Padding(len) = block {
-            if *len > 0 {
-                let mut dirty = wire.to_vec();
-                let off = spans[i].0 + 4 + (lex.u32() as usize) % (*len as usize);
-                dirty[off] = 0xAA;
-                let (scrubbed, _) =
-                    MetadataChain::parse(&dirty).expect("non-zero padding content still parses");
-                assert_eq!(
-                    &scrubbed, chain,
-                    "padding content leaked into the typed chain"
-                );
-                assert_eq!(
-                    scrubbed.write().expect("re-write"),
-                    wire,
-                    "padding corruption survived a chain re-write"
-                );
-                break;
-            }
+        if let MetadataBlock::Padding(len) = block
+            && *len > 0
+        {
+            let mut dirty = wire.to_vec();
+            let off = spans[i].0 + 4 + (lex.u32() as usize) % (*len as usize);
+            dirty[off] = 0xAA;
+            let (scrubbed, _) =
+                MetadataChain::parse(&dirty).expect("non-zero padding content still parses");
+            assert_eq!(
+                &scrubbed, chain,
+                "padding content leaked into the typed chain"
+            );
+            assert_eq!(
+                scrubbed.write().expect("re-write"),
+                wire,
+                "padding corruption survived a chain re-write"
+            );
+            break;
         }
     }
 

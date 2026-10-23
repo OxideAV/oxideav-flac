@@ -19,8 +19,8 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, ContainerRegistry, Error, Frame, NullCodecResolver,
     Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_flac::container::{open_muxer_with_options, FlacMuxerOptions};
-use oxideav_flac::encoder::{make_encoder_with_options, FlacEncoderOptions};
+use oxideav_flac::container::{FlacMuxerOptions, open_muxer_with_options};
+use oxideav_flac::encoder::{FlacEncoderOptions, make_encoder_with_options};
 
 /// Interleave per-channel S16 PCM into one `AudioFrame`. The nested
 /// index loop is a channel-major→interleaved transpose; iterator form

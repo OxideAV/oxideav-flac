@@ -104,7 +104,7 @@ fn process_block(state: &mut [u32; 4], block: &[u8; 64]) {
     let [mut a, mut b, mut c, mut d] = *state;
 
     macro_rules! round {
-        ($f:expr, $a:ident, $b:ident, $c:ident, $d:ident, $xi:expr, $s:expr, $ac:expr) => {
+        ($f:expr_2021, $a:ident, $b:ident, $c:ident, $d:ident, $xi:expr_2021, $s:expr_2021, $ac:expr_2021) => {
             $a = $b.wrapping_add(
                 $a.wrapping_add($f($b, $c, $d))
                     .wrapping_add($xi)

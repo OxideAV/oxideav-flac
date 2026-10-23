@@ -249,7 +249,7 @@ fuzz_target!(|data: &[u8]| {
     // distributions so the fuzzer can reach both the dense
     // low-value range and the sparse high-value range.
     // -----------------------------------------------------------------
-    for chunk in tail.chunks_exact(8).take(8) {
+    for chunk in tail.as_chunks::<8>().0.iter().take(8) {
         let raw = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
@@ -273,7 +273,7 @@ fuzz_target!(|data: &[u8]| {
     // sentinel).
     // -----------------------------------------------------------------
     parse_arbitrary(tail);
-    if tail.len() >= 1 {
+    if !tail.is_empty() {
         parse_arbitrary(&tail[1..]);
     }
     if tail.len() >= 2 {

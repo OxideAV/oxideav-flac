@@ -267,7 +267,7 @@ fn flac_write_cuesheet_round_trips_through_demuxer() {
     // FLAC stream, demux, and verify the same track structure surfaces
     // through chapters(). This is the symmetric end-to-end roundtrip
     // for the writer added in this round.
-    use oxideav_flac::metadata::{write_cuesheet, CueSheet, CueSheetIndex, CueSheetTrack};
+    use oxideav_flac::metadata::{CueSheet, CueSheetIndex, CueSheetTrack, write_cuesheet};
 
     let cs = CueSheet {
         media_catalog_number: {

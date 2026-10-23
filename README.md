@@ -412,7 +412,7 @@ Helpers `BlockType::to_byte`, `BlockHeader::write_into` /
 panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM: `panic_free_decode`,
 `decode`, `roundtrip`, `flac_oracle_decode` (cross-decode against an
-optional system black-box validator loaded via `libloading`, skipped
+optional system black-box validator loaded via `dlsym`, skipped
 silently when absent), `metadata_walker`, `encoder_options`,
 `md5_streaming`, `utf8_varint`, `frame_header`, `metadata_chain`,
 `subframe_decode`, `application`, and `seek` (demuxer `seek_to` +

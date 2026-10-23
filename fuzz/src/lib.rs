@@ -20,8 +20,8 @@
 #![allow(unsafe_code)]
 
 pub mod libavcodec {
-    use libloading::{Library, Symbol};
-    use std::ffi::c_void;
+    use dlsym::Library;
+    use std::ffi::{CStr, c_void};
     use std::sync::OnceLock;
 
     /// `AV_CODEC_ID_FLAC` — documented value `86028` (`0x15002`) in the
@@ -61,11 +61,11 @@ pub mod libavcodec {
         static LIB: OnceLock<Option<Library>> = OnceLock::new();
         LIB.get_or_init(|| {
             for name in CANDIDATES {
-                // SAFETY: `Library::new` is documented as unsafe because
+                // SAFETY: `Library::open` is documented as unsafe because
                 // the loaded library may run code at load time. We
                 // accept that risk for fuzz tooling — libavcodec is a
                 // well-behaved shared library distributed by distros.
-                if let Ok(l) = unsafe { Library::new(name) } {
+                if let Ok(l) = unsafe { Library::open(name) } {
                     return Some(l);
                 }
             }
@@ -80,6 +80,21 @@ pub mod libavcodec {
     /// don't fire).
     pub fn available() -> bool {
         lib().is_some()
+    }
+
+    /// Helper: resolve a symbol or `None`, detached from the
+    /// `Symbol` borrow. Keeps the call sites readable when many
+    /// functions need to be looked up at once.
+    ///
+    /// # Safety
+    ///
+    /// `T` must match the C signature of `name`. Detaching is sound
+    /// here because `l` comes from [`lib`]'s `OnceLock`, which lives
+    /// for the program lifetime, so the library is never unloaded.
+    unsafe fn sym<T: dlsym::SymbolType>(l: &'static Library, name: &CStr) -> Option<T> {
+        // SAFETY: forwarded to the caller (signature) + the 'static
+        // library above (lifetime).
+        unsafe { l.get::<T>(name).ok().map(|s| s.into_inner()) }
     }
 
     /// Per-channel decoded samples. For FLAC the libavcodec output is
@@ -128,10 +143,10 @@ pub mod libavcodec {
 
         let l = lib()?;
         unsafe {
-            let find_decoder: Symbol<FindDecoderFn> = l.get(b"avcodec_find_decoder").ok()?;
-            let alloc_context3: Symbol<AllocContext3Fn> = l.get(b"avcodec_alloc_context3").ok()?;
-            let open2: Symbol<Open2Fn> = l.get(b"avcodec_open2").ok()?;
-            let av_malloc: Symbol<AvMallocFn> = l.get(b"av_malloc").ok()?;
+            let find_decoder: FindDecoderFn = sym(l, c"avcodec_find_decoder")?;
+            let alloc_context3: AllocContext3Fn = sym(l, c"avcodec_alloc_context3")?;
+            let open2: Open2Fn = sym(l, c"avcodec_open2")?;
+            let av_malloc: AvMallocFn = sym(l, c"av_malloc")?;
 
             let codec = find_decoder(AV_CODEC_ID_FLAC);
             if codec.is_null() {
@@ -157,8 +172,8 @@ pub mod libavcodec {
 
             if open2(ctx, codec, std::ptr::null_mut()) < 0 {
                 let mut ctx_mut = ctx;
-                if let Ok(free_context) =
-                    l.get::<unsafe extern "C" fn(*mut *mut c_void)>(b"avcodec_free_context")
+                if let Some(free_context) =
+                    sym::<unsafe extern "C" fn(*mut *mut c_void)>(l, c"avcodec_free_context")
                 {
                     free_context(&mut ctx_mut);
                 }
@@ -168,9 +183,14 @@ pub mod libavcodec {
         }
     }
 
-    /// Free an AVCodecContext returned by `open_decoder`. Safe to call
-    /// with a NULL pointer (no-op).
-    pub fn free_decoder(mut ctx: *mut c_void) {
+    /// Free an AVCodecContext returned by `open_decoder`. A NULL
+    /// pointer is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be NULL or a context returned by [`open_decoder`]
+    /// that has not been freed yet.
+    pub unsafe fn free_decoder(mut ctx: *mut c_void) {
         if ctx.is_null() {
             return;
         }
@@ -178,8 +198,8 @@ pub mod libavcodec {
             return;
         };
         unsafe {
-            if let Ok(free_context) =
-                l.get::<unsafe extern "C" fn(*mut *mut c_void)>(b"avcodec_free_context")
+            if let Some(free_context) =
+                sym::<unsafe extern "C" fn(*mut *mut c_void)>(l, c"avcodec_free_context")
             {
                 free_context(&mut ctx);
             }
@@ -190,7 +210,12 @@ pub mod libavcodec {
     /// the `fLaC` magic + STREAMINFO when this is the first packet)
     /// then drain a single frame. Returns `Rejected` on any error or
     /// EOF-without-frame; `Frame(...)` on the first picture produced.
-    pub fn decode_packet(ctx: *mut c_void, data: &[u8]) -> OracleResult {
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be a context returned by [`open_decoder`] that has
+    /// not been passed to [`free_decoder`].
+    pub unsafe fn decode_packet(ctx: *mut c_void, data: &[u8]) -> OracleResult {
         type PacketAllocFn = unsafe extern "C" fn() -> *mut c_void;
         type FrameAllocFn = unsafe extern "C" fn() -> *mut c_void;
         type SendPacketFn = unsafe extern "C" fn(*mut c_void, *const c_void) -> i32;
@@ -205,29 +230,29 @@ pub mod libavcodec {
             return OracleResult::Unavailable;
         }
         unsafe {
-            let packet_alloc: Symbol<PacketAllocFn> = match l.get(b"av_packet_alloc") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
+            let packet_alloc: PacketAllocFn = match sym(l, c"av_packet_alloc") {
+                Some(s) => s,
+                None => return OracleResult::Unavailable,
             };
-            let frame_alloc: Symbol<FrameAllocFn> = match l.get(b"av_frame_alloc") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
+            let frame_alloc: FrameAllocFn = match sym(l, c"av_frame_alloc") {
+                Some(s) => s,
+                None => return OracleResult::Unavailable,
             };
-            let send_packet: Symbol<SendPacketFn> = match l.get(b"avcodec_send_packet") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
+            let send_packet: SendPacketFn = match sym(l, c"avcodec_send_packet") {
+                Some(s) => s,
+                None => return OracleResult::Unavailable,
             };
-            let receive_frame: Symbol<ReceiveFrameFn> = match l.get(b"avcodec_receive_frame") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
+            let receive_frame: ReceiveFrameFn = match sym(l, c"avcodec_receive_frame") {
+                Some(s) => s,
+                None => return OracleResult::Unavailable,
             };
-            let packet_free: Symbol<PacketFreeFn> = match l.get(b"av_packet_free") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
+            let packet_free: PacketFreeFn = match sym(l, c"av_packet_free") {
+                Some(s) => s,
+                None => return OracleResult::Unavailable,
             };
-            let frame_free: Symbol<FrameFreeFn> = match l.get(b"av_frame_free") {
-                Ok(s) => s,
-                Err(_) => return OracleResult::Unavailable,
+            let frame_free: FrameFreeFn = match sym(l, c"av_frame_free") {
+                Some(s) => s,
+                None => return OracleResult::Unavailable,
             };
 
             let mut pkt = packet_alloc();

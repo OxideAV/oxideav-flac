@@ -2,7 +2,7 @@
 name = "oxideav-flac-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oxideav-core = "0.1"
-# libloading is the only libavcodec interop: the cross-decode oracle
+# dlsym is the only libavcodec interop: the cross-decode oracle
 # `dlopen`s the system-installed shared library at startup. No
 # `ffmpeg-sys` / `rusty_ffmpeg`-style build-script dep that would pull
 # libavcodec source into the workspace's cargo dep tree. The harness
@@ -19,7 +19,7 @@ oxideav-core = "0.1"
 #
 # Why libavcodec instead of libFLAC: libFLAC's `<FLAC/stream_decoder.h>`
 # API is callback-driven (read / seek / eof / write / error / metadata
-# callbacks) — wrapping that cleanly through `libloading` requires
+# callbacks) — wrapping that cleanly through `dlsym` requires
 # trampolines that hold per-call state, which is awkward and fragile.
 # libavcodec exposes the simpler `avcodec_send_packet` /
 # `avcodec_receive_frame` buffer-in/buffer-out API for `AV_CODEC_ID_FLAC`
@@ -28,7 +28,7 @@ oxideav-core = "0.1"
 # — we only inspect the public C headers (<libavcodec/avcodec.h>,
 # <libavutil/frame.h>, <libavutil/samplefmt.h>) for function signatures
 # + opaque pointer typedefs.
-libloading = "0.8"
+dlsym = "0.0.2"
 
 [dependencies.oxideav-flac]
 path = ".."

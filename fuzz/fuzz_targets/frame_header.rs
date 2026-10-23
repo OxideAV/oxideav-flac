@@ -106,7 +106,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::bits::BitWriter;
 use oxideav_flac::bits_ext::BitWriterExt;
 use oxideav_flac::crc::crc8;
-use oxideav_flac::frame::{parse_frame_header, BlockingStrategy, ChannelAssignment};
+use oxideav_flac::frame::{BlockingStrategy, ChannelAssignment, parse_frame_header};
 
 /// Reserved block-size code (RFC 9639 §9.1 — table entry 0 is
 /// reserved). Parser must always reject.

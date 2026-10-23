@@ -168,19 +168,23 @@ fuzz_target!(|data: &[u8]| {
     let mut oracle_ok_at_least_one = false;
     for (i, pkt) in packets.iter().enumerate() {
         let bytes: &[u8] = if i == 0 { &prefixed_first } else { &pkt.data };
-        match libavcodec::decode_packet(oracle_ctx, bytes) {
+        // SAFETY: `oracle_ctx` came from `open_decoder` above and is
+        // only freed on the paths that return.
+        match unsafe { libavcodec::decode_packet(oracle_ctx, bytes) } {
             libavcodec::OracleResult::Frame(audio) => {
                 if audio.planes.is_empty() {
                     // Format we don't oracle-compare (e.g. 8-bit U8 lands
                     // as S32P with libavcodec's internal upcast). Skip
                     // the equality assertion for this iteration.
-                    libavcodec::free_decoder(oracle_ctx);
+                    // SAFETY: freed exactly once; the function returns right after.
+                    unsafe { libavcodec::free_decoder(oracle_ctx) };
                     return;
                 }
                 if audio.channels != channels as usize {
                     // Channel-count mismatch is a real disagreement —
                     // surface it.
-                    libavcodec::free_decoder(oracle_ctx);
+                    // SAFETY: freed exactly once; the function returns right after.
+                    unsafe { libavcodec::free_decoder(oracle_ctx) };
                     panic!(
                         "libavcodec sees {} channels but encoder declared {} \
                          (sample_fmt={}, nb_samples={})",
@@ -196,16 +200,19 @@ fuzz_target!(|data: &[u8]| {
                 // libavcodec didn't accept this packet — the per-sample
                 // equality contract only kicks in when libavcodec
                 // accepts. Abandon the comparison for this iteration.
-                libavcodec::free_decoder(oracle_ctx);
+                // SAFETY: freed exactly once; the function returns right after.
+                unsafe { libavcodec::free_decoder(oracle_ctx) };
                 return;
             }
             libavcodec::OracleResult::Unavailable => {
-                libavcodec::free_decoder(oracle_ctx);
+                // SAFETY: freed exactly once; the function returns right after.
+                unsafe { libavcodec::free_decoder(oracle_ctx) };
                 return;
             }
         }
     }
-    libavcodec::free_decoder(oracle_ctx);
+    // SAFETY: freed exactly once; the function returns right after.
+    unsafe { libavcodec::free_decoder(oracle_ctx) };
 
     if !oracle_ok_at_least_one {
         return;
@@ -328,8 +335,8 @@ fn build_audio_frame(
     let bytes_per_sample = format.bytes_per_sample();
     let mut interleaved: Vec<u8> = Vec::with_capacity(n * channels as usize * bytes_per_sample);
     for i in 0..n {
-        for c in 0..channels as usize {
-            let s = pcm_per_channel[c][i];
+        for plane in pcm_per_channel.iter().take(channels as usize) {
+            let s = plane[i];
             match format {
                 SampleFormat::S16 => {
                     interleaved.extend_from_slice(&(s as i16).to_le_bytes());

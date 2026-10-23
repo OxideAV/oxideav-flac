@@ -34,7 +34,7 @@
 //! size regression here rather than passing silently.
 
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat};
-use oxideav_flac::encoder::{make_encoder_with_options, Apodization, FlacEncoderOptions};
+use oxideav_flac::encoder::{Apodization, FlacEncoderOptions, make_encoder_with_options};
 
 /// Minimal RIFF/WAVE reader: returns `(channels, sample_rate,
 /// bits_per_sample, data_bytes)` for the PCM fixtures under

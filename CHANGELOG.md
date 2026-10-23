@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95; fuzz harness loads its libavcodec reference through dlsym instead of libloading.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-flac/compare/v0.0.11...v0.0.12) - 2026-10-04
 
 ### Other

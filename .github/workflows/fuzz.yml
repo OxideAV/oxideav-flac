@@ -2,7 +2,7 @@ name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
 # 30-minute total budget across the 13 targets (~138 s each). The
-# `flac_oracle_decode` target dlopens libavcodec via libloading; the CI
+# `flac_oracle_decode` target dlopens libavcodec via dlsym; the CI
 # runner needs `ffmpeg` (which pulls libavcodec61 on current Ubuntu)
 # installed so the oracle actually validates instead of silently
 # skipping. We also install `flac libflac-dev` so the system carries

@@ -58,9 +58,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_flac::metadata::{
-    parse_cuesheet, parse_picture, parse_seektable, parse_vorbis_comment, write_cuesheet,
-    write_padding, write_picture, write_seektable, write_vorbis_comment, BlockHeader, BlockType,
-    Picture, StreamInfo, VorbisComment, FLAC_MAGIC,
+    BlockHeader, BlockType, FLAC_MAGIC, Picture, StreamInfo, VorbisComment, parse_cuesheet,
+    parse_picture, parse_seektable, parse_vorbis_comment, write_cuesheet, write_padding,
+    write_picture, write_seektable, write_vorbis_comment,
 };
 
 /// Cap the walker so a fuzzer can't make us iterate forever on a
@@ -165,11 +165,11 @@ fuzz_target!(|data: &[u8]| {
     // CUESHEET: parser + writer both fail noisily on invalid input.
     // Round-trip an Ok parse through write_cuesheet and confirm the
     // re-parse equals the original.
-    if let Ok(cs) = parse_cuesheet(data) {
-        if let Ok(written) = write_cuesheet(&cs) {
-            let re = parse_cuesheet(&written).expect("write_cuesheet output must re-parse");
-            assert_eq!(re, cs, "cuesheet round-trip drift");
-        }
+    if let Ok(cs) = parse_cuesheet(data)
+        && let Ok(written) = write_cuesheet(&cs)
+    {
+        let re = parse_cuesheet(&written).expect("write_cuesheet output must re-parse");
+        assert_eq!(re, cs, "cuesheet round-trip drift");
     }
 
     // PICTURE: parser + writer both validate; only well-formed
@@ -268,12 +268,12 @@ fn try_typed_round_trip(block_type: BlockType, payload: &[u8]) {
             }
         }
         BlockType::CueSheet => {
-            if let Ok(cs) = parse_cuesheet(payload) {
-                if let Ok(written) = write_cuesheet(&cs) {
-                    let re = parse_cuesheet(&written)
-                        .expect("write_cuesheet must round-trip through parse_cuesheet");
-                    assert_eq!(re, cs);
-                }
+            if let Ok(cs) = parse_cuesheet(payload)
+                && let Ok(written) = write_cuesheet(&cs)
+            {
+                let re = parse_cuesheet(&written)
+                    .expect("write_cuesheet must round-trip through parse_cuesheet");
+                assert_eq!(re, cs);
             }
         }
         BlockType::Picture => {

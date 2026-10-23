@@ -30,7 +30,7 @@ fn build_streaminfo() -> Vec<u8> {
     let mut block = vec![0u8; 34];
     block[0..2].copy_from_slice(&192u16.to_be_bytes()); // min block size
     block[2..4].copy_from_slice(&192u16.to_be_bytes()); // max block size
-                                                        // packed: sr(20)=48000, ch-1(3)=0 (mono), bps-1(5)=15 (16-bit), total(36)=0
+    // packed: sr(20)=48000, ch-1(3)=0 (mono), bps-1(5)=15 (16-bit), total(36)=0
     let packed: u64 = (48_000u64 << 44) | (15u64 << 36);
     block[10..18].copy_from_slice(&packed.to_be_bytes());
     block

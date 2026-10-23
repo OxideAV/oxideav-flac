@@ -214,17 +214,17 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
             case.name
         );
     }
-    if let Some(want) = case.bits_per_sample {
-        if bps != want {
-            // Don't hard-fail — the FLAC container projects STREAMINFO's
-            // bps onto a `SampleFormat` enum (U8 / S16 / S24 / S32), and
-            // an unusual bit depth (e.g. 12 bps) would round to a wider
-            // variant. Log so a follow-up can investigate.
-            eprintln!(
-                "{}: WARN STREAMINFO sample_format implies {bps} bps, expected {want}",
-                case.name
-            );
-        }
+    if let Some(want) = case.bits_per_sample
+        && bps != want
+    {
+        // Don't hard-fail — the FLAC container projects STREAMINFO's
+        // bps onto a `SampleFormat` enum (U8 / S16 / S24 / S32), and
+        // an unusual bit depth (e.g. 12 bps) would round to a wider
+        // variant. Log so a follow-up can investigate.
+        eprintln!(
+            "{}: WARN STREAMINFO sample_format implies {bps} bps, expected {want}",
+            case.name
+        );
     }
 
     let mut decoder = match oxideav_flac::decoder::make_decoder(&params) {
@@ -444,7 +444,7 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
     if is_float {
         match bits_per_sample {
             32 => {
-                for chunk in data.chunks_exact(4) {
+                for chunk in data.as_chunks::<4>().0 {
                     let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                     // Scale [-1, 1] f32 to i32 full-scale. Saturate to
                     // avoid wrap on out-of-range float values.
@@ -460,7 +460,7 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
                 }
             }
             64 => {
-                for chunk in data.chunks_exact(8) {
+                for chunk in data.as_chunks::<8>().0 {
                     let f = f64::from_le_bytes([
                         chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
                         chunk[7],
@@ -493,12 +493,12 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
                 }
             }
             16 => {
-                for chunk in data.chunks_exact(2) {
+                for chunk in data.as_chunks::<2>().0 {
                     samples.push(i16::from_le_bytes([chunk[0], chunk[1]]) as i32);
                 }
             }
             24 => {
-                for chunk in data.chunks_exact(3) {
+                for chunk in data.as_chunks::<3>().0 {
                     let mut v =
                         (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
                     if v & 0x0080_0000 != 0 {
@@ -508,7 +508,7 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
                 }
             }
             32 => {
-                for chunk in data.chunks_exact(4) {
+                for chunk in data.as_chunks::<4>().0 {
                     samples.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
             }

@@ -27,7 +27,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::decoder::{decode_frame_channels, DecodedFrame};
+use crate::decoder::{DecodedFrame, decode_frame_channels};
 use crate::md5::Md5;
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 

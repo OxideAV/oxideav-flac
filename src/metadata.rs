@@ -1151,7 +1151,7 @@ pub struct Picture {
 /// parser surfaces both issues to the caller.
 pub fn parse_picture(bytes: &[u8]) -> Result<Picture> {
     fn need(bytes: &[u8], i: usize, n: usize, what: &str) -> Result<()> {
-        if i.checked_add(n).map_or(true, |end| end > bytes.len()) {
+        if i.checked_add(n).is_none_or(|end| end > bytes.len()) {
             return Err(Error::invalid(format!(
                 "FLAC PICTURE: payload truncated reading {what} \
                  (need {n} bytes at offset {i}, have {})",
@@ -1461,7 +1461,7 @@ fn check_vorbis_field_name(name: &str) -> Result<()> {
 ///   surface up the stack).
 pub fn parse_vorbis_comment(bytes: &[u8]) -> Result<VorbisComment> {
     fn read_u32_le(bytes: &[u8], i: &mut usize, what: &str) -> Result<u32> {
-        if i.checked_add(4).map_or(true, |end| end > bytes.len()) {
+        if i.checked_add(4).is_none_or(|end| end > bytes.len()) {
             return Err(Error::invalid(format!(
                 "FLAC VORBIS_COMMENT: payload truncated reading {what} length \
                  (need 4 bytes at offset {i}, have {})",
@@ -1476,7 +1476,7 @@ pub fn parse_vorbis_comment(bytes: &[u8]) -> Result<VorbisComment> {
     let mut i = 0usize;
     let vendor_len = read_u32_le(bytes, &mut i, "vendor")? as usize;
     if i.checked_add(vendor_len)
-        .map_or(true, |end| end > bytes.len())
+        .is_none_or(|end| end > bytes.len())
     {
         return Err(Error::invalid(format!(
             "FLAC VORBIS_COMMENT: vendor string overruns payload \
@@ -1493,9 +1493,7 @@ pub fn parse_vorbis_comment(bytes: &[u8]) -> Result<VorbisComment> {
     let mut comments = Vec::with_capacity(count.min(64));
     for n in 0..count {
         let field_len = read_u32_le(bytes, &mut i, "field")? as usize;
-        if i.checked_add(field_len)
-            .map_or(true, |end| end > bytes.len())
-        {
+        if i.checked_add(field_len).is_none_or(|end| end > bytes.len()) {
             return Err(Error::invalid(format!(
                 "FLAC VORBIS_COMMENT: field {n} ({field_len} bytes) overruns payload \
                  at offset {i} (payload {} bytes)",
@@ -2189,8 +2187,8 @@ mod tests {
         let mut block = vec![0u8; 34];
         block[0..2].copy_from_slice(&4096u16.to_be_bytes()); // min block size
         block[2..4].copy_from_slice(&4096u16.to_be_bytes()); // max block size
-                                                             // min/max frame size: 0 (unknown) — leave zeros.
-                                                             // packed: sample_rate(20)=48000, channels-1(3)=1, bps-1(5)=15, total(36)=96000
+        // min/max frame size: 0 (unknown) — leave zeros.
+        // packed: sample_rate(20)=48000, channels-1(3)=1, bps-1(5)=15, total(36)=96000
         let packed: u64 = (48_000u64 << 44) | (1u64 << 41) | (15u64 << 36) | 96_000u64;
         block[10..18].copy_from_slice(&packed.to_be_bytes());
         // md5 left as zeros.
@@ -3708,7 +3706,7 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes()); // vendor len
         buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // field len = huge
-                                                        // No further bytes.
+        // No further bytes.
         assert!(parse_vorbis_comment(&buf).is_err());
     }
 

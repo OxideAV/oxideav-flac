@@ -59,7 +59,7 @@
 //!    phase 3 always lands on the writer's in-range (`Ok`) branch.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_flac::metadata::{parse_application, write_application, Application, BlockHeader};
+use oxideav_flac::metadata::{Application, BlockHeader, parse_application, write_application};
 
 /// Cap the synthesised `data` run so a fuzz iteration can't be steered
 /// into a multi-MiB allocation. The 24-bit ceiling itself is checked

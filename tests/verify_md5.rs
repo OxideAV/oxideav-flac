@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
-use oxideav_flac::verify::{verify_stream, VerifyOutcome};
+use oxideav_flac::verify::{VerifyOutcome, verify_stream};
 
 fn fixtures_root() -> PathBuf {
     PathBuf::from("../../docs/audio/flac/fixtures")

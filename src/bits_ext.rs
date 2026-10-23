@@ -11,8 +11,8 @@
 //! oxideav_flac::bits_ext::{BitReaderExt, BitWriterExt};`.
 
 use oxideav_core::{
-    bits::{BitReader, BitWriter},
     Error, Result,
+    bits::{BitReader, BitWriter},
 };
 
 pub trait BitReaderExt {

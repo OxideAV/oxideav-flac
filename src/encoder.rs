@@ -28,7 +28,7 @@ use crate::bits_ext::BitWriterExt;
 use crate::crc;
 use crate::decoder::decode_frame_channels;
 use crate::md5::Md5;
-use crate::metadata::{write_padding, BlockHeader, BlockType, StreamInfo};
+use crate::metadata::{BlockHeader, BlockType, StreamInfo, write_padding};
 use oxideav_core::bits::BitWriter;
 
 /// Caller-supplied tuning knobs for [`make_encoder_with_options`]. All
@@ -831,14 +831,14 @@ pub fn make_encoder_with_options(
     }
     // Validate padding length up front so the failure point is
     // construction, not the first call to `flush`.
-    if let Some(n) = options.padding_bytes {
-        if n > BlockHeader::MAX_LENGTH as usize {
-            return Err(Error::invalid(format!(
-                "FLAC encoder: padding_bytes {} exceeds 24-bit metadata length max ({})",
-                n,
-                BlockHeader::MAX_LENGTH
-            )));
-        }
+    if let Some(n) = options.padding_bytes
+        && n > BlockHeader::MAX_LENGTH as usize
+    {
+        return Err(Error::invalid(format!(
+            "FLAC encoder: padding_bytes {} exceeds 24-bit metadata length max ({})",
+            n,
+            BlockHeader::MAX_LENGTH
+        )));
     }
 
     // Resolve + validate the per-frame block size (RFC 9639 §9.1).
@@ -1104,13 +1104,13 @@ impl FlacEncoder {
             .ok_or_else(|| Error::invalid("empty frame"))?;
         match self.sample_format {
             SampleFormat::S16 => {
-                for chunk in data.chunks_exact(2) {
+                for chunk in data.as_chunks::<2>().0 {
                     self.interleaved
                         .push(i16::from_le_bytes([chunk[0], chunk[1]]) as i32);
                 }
             }
             SampleFormat::S24 => {
-                for chunk in data.chunks_exact(3) {
+                for chunk in data.as_chunks::<3>().0 {
                     let mut v =
                         (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
                     if v & 0x0080_0000 != 0 {
@@ -1120,7 +1120,7 @@ impl FlacEncoder {
                 }
             }
             SampleFormat::S32 => {
-                for chunk in data.chunks_exact(4) {
+                for chunk in data.as_chunks::<4>().0 {
                     self.interleaved
                         .push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                 }
@@ -1443,11 +1443,11 @@ fn encode_sample_rate(sr: u32) -> (u8, u32, u32) {
         48_000 => (10, 0, 0),
         96_000 => (11, 0, 0),
         _ => {
-            if sr % 1000 == 0 && sr / 1000 <= 255 {
+            if sr.is_multiple_of(1000) && sr / 1000 <= 255 {
                 (12, sr / 1000, 8)
             } else if sr <= 0xFFFF {
                 (13, sr, 16)
-            } else if sr % 10 == 0 && sr / 10 <= 0xFFFF {
+            } else if sr.is_multiple_of(10) && sr / 10 <= 0xFFFF {
                 (14, sr / 10, 16)
             } else {
                 (0, 0, 0)
@@ -1637,10 +1637,10 @@ fn best_subframe_with_wasted_s(
         if n <= order {
             continue;
         }
-        if let Some(plan) = encode_fixed_plan_s(samples, bps, order, wasted, scratch) {
-            if plan.bits < best.bits {
-                best = plan;
-            }
+        if let Some(plan) = encode_fixed_plan_s(samples, bps, order, wasted, scratch)
+            && plan.bits < best.bits
+        {
+            best = plan;
         }
     }
 
@@ -2266,7 +2266,7 @@ fn partition_layout_cost(
     k_max: u32,
 ) -> Option<u64> {
     let n_partitions = 1usize << partition_order;
-    if block_size % n_partitions != 0 {
+    if !block_size.is_multiple_of(n_partitions) {
         return None;
     }
     let partition_size = block_size / n_partitions;
@@ -2307,7 +2307,7 @@ fn partition_layout_cost_z(
 ) -> Option<u64> {
     debug_assert_eq!(residuals.len(), zigzag.len());
     let n_partitions = 1usize << partition_order;
-    if block_size % n_partitions != 0 {
+    if !block_size.is_multiple_of(n_partitions) {
         return None;
     }
     let partition_size = block_size / n_partitions;
@@ -2365,7 +2365,7 @@ fn partition_layout_cost_zp(
     debug_assert_eq!(prefix.len(), zigzag.len() + 1);
     debug_assert_eq!(raw_bits.len(), zigzag.len());
     let n_partitions = 1usize << partition_order;
-    if block_size % n_partitions != 0 {
+    if !block_size.is_multiple_of(n_partitions) {
         return None;
     }
     let partition_size = block_size / n_partitions;
@@ -2410,7 +2410,7 @@ fn finest_legal_partition_order(block_size: usize, predictor_order: usize, max_p
     let mut finest = 0u32;
     for p in 1..=max_po {
         let n_partitions = 1usize << p;
-        if block_size % n_partitions != 0 {
+        if !block_size.is_multiple_of(n_partitions) {
             break;
         }
         if block_size / n_partitions <= predictor_order {
@@ -4133,11 +4133,11 @@ mod tests {
         let mut window_min = u64::MAX;
         let mut window_argmin = ceiling;
         for p in floor..=ceiling {
-            if let Some(plan) = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, p) {
-                if plan.bits < window_min {
-                    window_min = plan.bits;
-                    window_argmin = p;
-                }
+            if let Some(plan) = encode_lpc_plan_at(&samples, 16, order, 0, &coeffs, p)
+                && plan.bits < window_min
+            {
+                window_min = plan.bits;
+                window_argmin = p;
             }
         }
         assert!(
@@ -6158,7 +6158,7 @@ mod tests {
             let t = i as f64 / sr as f64;
             tail.push(((t * 1_000.0 * 2.0 * std::f64::consts::PI).sin() * 15_000.0) as i32);
         }
-        tail.extend(std::iter::repeat(0i32).take(2048));
+        tail.extend(std::iter::repeat_n(0i32, 2048));
         cases.push(("tonal_then_silence".into(), tail));
 
         for (name, samples) in &cases {
@@ -6355,7 +6355,9 @@ mod tests {
             let pcm: Vec<u8> = match fmt {
                 SampleFormat::S16 => base,
                 SampleFormat::S24 => base
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .flat_map(|c| {
                         let v = i16::from_le_bytes([c[0], c[1]]) as i32 * 64;
                         [
@@ -6366,14 +6368,18 @@ mod tests {
                     })
                     .collect(),
                 SampleFormat::S32 => base
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .flat_map(|c| {
                         let v = i16::from_le_bytes([c[0], c[1]]) as i32 * 1024;
                         v.to_le_bytes()
                     })
                     .collect(),
                 SampleFormat::U8 => base
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let v = i16::from_le_bytes([c[0], c[1]]);
                         ((v >> 8) as i32 + 128).clamp(0, 255) as u8
@@ -6448,7 +6454,9 @@ mod tests {
 
         let enc = test_flac_encoder(1, sr, 16);
         let truth: Vec<i32> = pcm
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
             .collect();
         enc.verify_frame(&frames[0], &[truth])
@@ -6573,14 +6581,16 @@ mod tests {
     fn subset_block_size_ceiling_is_rate_dependent() {
         // ≤ 48 kHz: 4608 is the ceiling.
         let low = build_audio_params(1, 44_100, SampleFormat::S16);
-        assert!(make_encoder_with_options(
-            &low,
-            FlacEncoderOptions {
-                block_size: Some(4_608),
-                ..FlacEncoderOptions::default()
-            },
-        )
-        .is_ok());
+        assert!(
+            make_encoder_with_options(
+                &low,
+                FlacEncoderOptions {
+                    block_size: Some(4_608),
+                    ..FlacEncoderOptions::default()
+                },
+            )
+            .is_ok()
+        );
         assert!(
             make_encoder_with_options(
                 &low,
@@ -6593,26 +6603,30 @@ mod tests {
             "4609 should exceed the ≤48 kHz subset ceiling"
         );
         // Same 4609 clears with the opt-in.
-        assert!(make_encoder_with_options(
-            &low,
-            FlacEncoderOptions {
-                block_size: Some(4_609),
-                allow_non_subset_block_size: true,
-                ..FlacEncoderOptions::default()
-            },
-        )
-        .is_ok());
+        assert!(
+            make_encoder_with_options(
+                &low,
+                FlacEncoderOptions {
+                    block_size: Some(4_609),
+                    allow_non_subset_block_size: true,
+                    ..FlacEncoderOptions::default()
+                },
+            )
+            .is_ok()
+        );
 
         // > 48 kHz: 16384 is the ceiling, so 8192 is subset-legal.
         let high = build_audio_params(1, 96_000, SampleFormat::S16);
-        assert!(make_encoder_with_options(
-            &high,
-            FlacEncoderOptions {
-                block_size: Some(8_192),
-                ..FlacEncoderOptions::default()
-            },
-        )
-        .is_ok());
+        assert!(
+            make_encoder_with_options(
+                &high,
+                FlacEncoderOptions {
+                    block_size: Some(8_192),
+                    ..FlacEncoderOptions::default()
+                },
+            )
+            .is_ok()
+        );
         assert!(
             make_encoder_with_options(
                 &high,

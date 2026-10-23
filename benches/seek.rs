@@ -73,13 +73,13 @@
 
 use std::io::Cursor;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, ContainerRegistry, Frame, NullCodecResolver, Packet,
     ReadSeek, SampleFormat,
 };
-use oxideav_flac::metadata::{write_seektable, BlockHeader, BlockType, SeekPoint, FLAC_MAGIC};
+use oxideav_flac::metadata::{BlockHeader, BlockType, FLAC_MAGIC, SeekPoint, write_seektable};
 
 // -----------------------------------------------------------------------
 // PCM + encoder helpers (mirrors `benches/decode.rs::build_pcm_per_channel`

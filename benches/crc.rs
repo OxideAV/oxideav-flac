@@ -56,9 +56,9 @@
 //! Run with:
 //!     cargo bench -p oxideav-flac --bench crc
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_flac::crc::{crc16, crc8, Crc16, Crc8};
+use oxideav_flac::crc::{Crc8, Crc16, crc8, crc16};
 
 /// Cheap deterministic xorshift32 — synthesises realistic random byte
 /// content for the CRC bench buffers. A pure-zero buffer would still

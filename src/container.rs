@@ -17,10 +17,10 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, Muxer, ReadSeek, WriteSeek};
 
-use crate::frame::{parse_frame_header, BlockingStrategy, FrameHeader};
+use crate::frame::{BlockingStrategy, FrameHeader, parse_frame_header};
 use crate::metadata::{
-    parse_cuesheet, parse_picture, parse_seektable, BlockHeader, BlockType, CueSheet,
-    MetadataBlock, MetadataChain, SeekPoint, StreamInfo as Si, FLAC_MAGIC,
+    BlockHeader, BlockType, CueSheet, FLAC_MAGIC, MetadataBlock, MetadataChain, SeekPoint,
+    StreamInfo as Si, parse_cuesheet, parse_picture, parse_seektable,
 };
 
 pub fn register(reg: &mut oxideav_core::ContainerRegistry) {
@@ -87,10 +87,10 @@ fn open_demuxer(
         if parsed.block_type == BlockType::VorbisComment {
             parse_vorbis_comment(&payload, &mut metadata);
         }
-        if parsed.block_type == BlockType::Picture {
-            if let Some(pic) = parse_flac_picture_block(&payload) {
-                pictures.push(pic);
-            }
+        if parsed.block_type == BlockType::Picture
+            && let Some(pic) = parse_flac_picture_block(&payload)
+        {
+            pictures.push(pic);
         }
         // RFC 9639 §8.7: only the first CUESHEET block is meaningful;
         // additional ones (some taggers append per-disc CUESHEETs in
@@ -98,10 +98,11 @@ fn open_demuxer(
         // CUESHEET is *not* treated as fatal — it just doesn't get
         // surfaced as chapters. Logging that decision in the demuxer
         // would be nicer, but we don't have a log surface here.
-        if cuesheet.is_none() && parsed.block_type == BlockType::CueSheet {
-            if let Ok(cs) = parse_cuesheet(&payload) {
-                cuesheet = Some(cs);
-            }
+        if cuesheet.is_none()
+            && parsed.block_type == BlockType::CueSheet
+            && let Ok(cs) = parse_cuesheet(&payload)
+        {
+            cuesheet = Some(cs);
         }
         extradata.extend_from_slice(&hdr);
         extradata.extend_from_slice(&payload);
@@ -426,11 +427,11 @@ impl FrameScanner {
     fn next_valid_frame(&self, start: usize) -> Option<(usize, FrameHeader)> {
         let mut i = start;
         while i + 1 < self.buffer.len() {
-            if self.buffer[i] == 0xFF && (self.buffer[i + 1] == 0xF8 || self.buffer[i + 1] == 0xF9)
+            if self.buffer[i] == 0xFF
+                && (self.buffer[i + 1] == 0xF8 || self.buffer[i + 1] == 0xF9)
+                && let Ok(h) = parse_frame_header(&self.buffer[i..])
             {
-                if let Ok(h) = parse_frame_header(&self.buffer[i..]) {
-                    return Some((i, h));
-                }
+                return Some((i, h));
             }
             i += 1;
         }
@@ -643,17 +644,17 @@ impl Demuxer for FlacDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            if !self.scan.buffer.is_empty() {
-                if let Some(emitted) = self.scan.try_take(self.eof) {
-                    self.scan.compact();
-                    let stream = &self.streams[0];
-                    let mut pkt = Packet::new(0, stream.time_base, emitted.data);
-                    pkt.pts = Some(emitted.pts);
-                    pkt.dts = Some(emitted.pts);
-                    pkt.duration = Some(emitted.duration);
-                    pkt.flags.keyframe = true;
-                    return Ok(pkt);
-                }
+            if !self.scan.buffer.is_empty()
+                && let Some(emitted) = self.scan.try_take(self.eof)
+            {
+                self.scan.compact();
+                let stream = &self.streams[0];
+                let mut pkt = Packet::new(0, stream.time_base, emitted.data);
+                pkt.pts = Some(emitted.pts);
+                pkt.dts = Some(emitted.pts);
+                pkt.duration = Some(emitted.duration);
+                pkt.flags.keyframe = true;
+                return Ok(pkt);
             }
             if self.eof {
                 return Err(Error::Eof);
@@ -1063,10 +1064,10 @@ impl Muxer for FlacMuxer {
         // STREAMINFO min_block_size. For a fixed-blocking stream the
         // encoder writes min == max == the nominal block size, so a
         // fixed frame's `coded_number * block_size` is its first sample.
-        if let Ok((chain, _)) = MetadataChain::parse(&self.extradata) {
-            if let Some(si) = chain.stream_info() {
-                self.streaminfo_block_size = si.min_block_size as u32;
-            }
+        if let Ok((chain, _)) = MetadataChain::parse(&self.extradata)
+            && let Some(si) = chain.stream_info()
+        {
+            self.streaminfo_block_size = si.min_block_size as u32;
         }
         if self.buffering() {
             // Defer all output to write_trailer, where the SEEKTABLE is

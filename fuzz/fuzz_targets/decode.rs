@@ -45,7 +45,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{ContainerRegistry, NullCodecResolver};
 use oxideav_flac::frame::parse_frame_header;
-use oxideav_flac::metadata::{parse_cuesheet, parse_seektable, BlockHeader, StreamInfo};
+use oxideav_flac::metadata::{BlockHeader, StreamInfo, parse_cuesheet, parse_seektable};
 
 fuzz_target!(|data: &[u8]| {
     // -----------------------------------------------------------------
