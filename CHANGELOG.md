@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FlacEncoderOptions::lpc_precision_search_span` and `FlacEncoderOptions::max_partition_order` — the two remaining search-narrowing knobs (coefficient-precision sweep width, partition-order ceiling), both `None` by default so existing output is byte-identical (#13, follow-up to #12).
+
 ### Changed
 
 - edition 2024, MSRV 1.95; fuzz harness loads its libavcodec reference through dlsym instead of libloading.
