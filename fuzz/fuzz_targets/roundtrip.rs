@@ -194,7 +194,11 @@ fn parse_fuzz_input(data: &[u8]) -> Option<TestCase> {
         _ => return None,
     };
     for i in 0..n {
-        for ch in 0..channels as usize {
+        for (ch, plane) in pcm_per_channel
+            .iter_mut()
+            .enumerate()
+            .take(channels as usize)
+        {
             let off = (i * channels as usize + ch) * bps;
             let chunk = &rest[off..off + bps];
             let v = match format {
@@ -211,7 +215,7 @@ fn parse_fuzz_input(data: &[u8]) -> Option<TestCase> {
                 SampleFormat::S32 => i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
                 _ => return None,
             };
-            pcm_per_channel[ch].push(v.clamp(min_val, max_val));
+            plane.push(v.clamp(min_val, max_val));
         }
     }
     Some(TestCase {
