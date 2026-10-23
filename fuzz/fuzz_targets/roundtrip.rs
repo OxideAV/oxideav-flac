@@ -231,8 +231,8 @@ fn build_audio_frame(
     let bytes_per_sample = format.bytes_per_sample();
     let mut interleaved: Vec<u8> = Vec::with_capacity(n * channels as usize * bytes_per_sample);
     for i in 0..n {
-        for c in 0..channels as usize {
-            let s = pcm_per_channel[c][i];
+        for plane in pcm_per_channel.iter().take(channels as usize) {
+            let s = plane[i];
             match format {
                 SampleFormat::U8 => interleaved.push(((s + 128) & 0xFF) as u8),
                 SampleFormat::S16 => {
