@@ -9,12 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `FlacEncoderOptions::lpc_precision_search_span` and `FlacEncoderOptions::max_partition_order` — the two remaining search-narrowing knobs (coefficient-precision sweep width, partition-order ceiling), both `None` by default so existing output is byte-identical (#13, follow-up to #12).
+- Compression levels 0–8 (`FlacEncoderOptions::level(n)`, `compression_level`, `DEFAULT_COMPRESSION_LEVEL` = 5) driving a new estimate-driven encoder search (#12). Candidates are ranked by cheap statistics and only the winners are encoded:
+  - stereo layout from per-channel FIXED/LPC estimates;
+  - FIXED order from one multi-order magnitude pass;
+  - LPC orders from the Levinson-Durbin error plus a coefficient-quantisation term;
+  - Rice partitioning from per-partition sums, refined exactly for the emitted layout only.
+
+  Output is written through a 64-bit-accumulator bit writer. The default level encodes a 3-minute 44.1 kHz stereo file in about 0.4 s of CPU (was ~150 s), at 1.7–1.9× the `flac -5` CPU time and 0.15–9.6 % smaller files on the measured inputs.
+- `FlacEncoderOptions::exhaustive()` / `exhaustive_search`: the historical exact-cost search, byte-identical to the previous default output (pinned by test).
+- `FlacEncoderOptions::new()` and `with_*` builders for every option (`with_compression_level`, `with_max_lpc_order`, `with_apodization`, `with_block_size`, `with_verify`, …).
+- `FlacEncoderOptions::lpc_precision_search_span` and `FlacEncoderOptions::max_partition_order` — the two remaining search-narrowing knobs (coefficient-precision sweep width, partition-order ceiling); `None` keeps the level's value (#13, follow-up to #12).
 
 ### Changed
 
+- **Default encoder output changed**: `make_encoder` / `FlacEncoderOptions::default()` now mean compression level 5 instead of the exhaustive search. Streams stay valid streamable-subset FLAC and decode bit-exactly; use `FlacEncoderOptions::exhaustive()` for the old bytes. `None` for `apodization`, `max_lpc_order`, `lpc_precision_search_span` and `max_partition_order` now means "the level's value"; under `exhaustive_search` it keeps the historical meaning.
+- `FlacEncoderOptions::fast()` is now `level(4)`.
+- Feeding a long recording in one `send_frame` no longer memmoves the remaining input once per block (quadratic in input length): blocks are consumed from a cursor and the queue is compacted once per call.
 - CRC-16 runs slice-by-8 (eight table lookups per eight bytes instead of a serial byte chain); tables derived at compile time and cross-checked against `docs/audio/flac/tables/crc16-table-sliced.csv`. Same values, faster frame encode and decode.
 - edition 2024, MSRV 1.95; fuzz harness loads its libavcodec reference through dlsym instead of libloading.
+
+### Fixed
+
+- Residuals equal to −2³¹ are now rejected in both searches (RFC 9639 §9.2.7.3 requires |residual| < 2³¹); the subframe falls back to another predictor or VERBATIM.
 
 ## [0.0.12](https://github.com/OxideAV/oxideav-flac/compare/v0.0.11...v0.0.12) - 2026-10-04
 

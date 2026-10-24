@@ -228,12 +228,20 @@ struct FixtureExpect {
     dir: &'static str,
     /// Inclusive upper bound on payload/PCM. `None` for the incompressible
     /// VERBATIM fixture, where the only guarantee is "no worse than raw +
-    /// small constant overhead", checked separately.
+    /// small constant overhead", checked separately. Locked against the
+    /// exhaustive exact-cost search ([`FlacEncoderOptions::exhaustive`]).
     max_ratio: Option<f64>,
+    /// The same bound for the default compression level (the
+    /// estimate-driven search), locked separately.
+    default_max_ratio: Option<f64>,
 }
 
 /// Conservative ratio ceilings, locked in against the encoder's measured
-/// RDO output (each set ~5% above the current achieved ratio). A change
+/// output (each set ~5% above the current achieved ratio) — once for the
+/// exhaustive exact-cost search and once for the default level. Every
+/// fixture is a synthetic pure tone, where the exhaustive search's extra
+/// candidates pay off most; on longer, richer material the default level
+/// lands within about 1% of it. A change
 /// that regressed the residual / predictor / window search would push the
 /// real ratio above its ceiling and fail here.
 /// Cap on the interchannel-sample prefix encoded per fixture. Two full
@@ -246,54 +254,67 @@ const FIXTURE_EXPECTATIONS: &[FixtureExpect] = &[
     FixtureExpect {
         dir: "constant-subframe-silence",
         max_ratio: Some(0.01),
+        default_max_ratio: Some(0.01),
     },
     FixtureExpect {
         dir: "fixed-subframe-low-order",
         max_ratio: Some(0.13),
+        default_max_ratio: Some(0.12),
     },
     FixtureExpect {
         dir: "left-right-channel-pair",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.17),
     },
     FixtureExpect {
         dir: "left-side-channel-pair",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.17),
     },
     FixtureExpect {
         dir: "lpc-subframe-typical-music",
         max_ratio: Some(0.17),
+        default_max_ratio: Some(0.19),
     },
     FixtureExpect {
         dir: "mid-side-channel-pair",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.17),
     },
     FixtureExpect {
         dir: "mono-16bit-44100-fixed-blocksize",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.15),
     },
     FixtureExpect {
         dir: "right-side-channel-pair",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.17),
     },
     FixtureExpect {
         dir: "stereo-16bit-44100-fixed",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.20),
     },
     FixtureExpect {
         dir: "stereo-16bit-44100-small-blocksize",
         max_ratio: Some(0.15),
+        default_max_ratio: Some(0.20),
     },
     FixtureExpect {
         dir: "stereo-24bit-96000",
         max_ratio: Some(0.28),
+        default_max_ratio: Some(0.33),
     },
     FixtureExpect {
         dir: "surround-7_1-24bit-48000",
         max_ratio: Some(0.25),
+        default_max_ratio: Some(0.29),
     },
     FixtureExpect {
         dir: "verbatim-subframe-noise",
         max_ratio: None,
+        default_max_ratio: None,
     },
 ];
 
@@ -343,40 +364,53 @@ fn real_fixtures_roundtrip_bit_exact_and_meet_ratio_floor() {
         let cap_bytes = (MAX_FIXTURE_SAMPLES * bytes_per_iframe).min(data_full.len());
         let data = &data_full[..cap_bytes];
 
-        let (payload, recovered) = roundtrip(data, ch, sr, fmt, FlacEncoderOptions::default());
         let reference = pcm_to_i32(data, fmt, ch);
-        assert_eq!(
-            recovered.len(),
-            reference.len(),
-            "fixture {}: decoded sample count {} != input {}",
-            exp.dir,
-            recovered.len(),
-            reference.len()
-        );
-        assert!(
-            recovered == reference,
-            "fixture {}: round-trip is not bit-exact (FLAC must be lossless)",
-            exp.dir
-        );
-
-        let ratio = payload as f64 / data.len() as f64;
-        match exp.max_ratio {
-            Some(ceiling) => assert!(
-                ratio <= ceiling,
-                "fixture {}: compression ratio {ratio:.4} exceeds locked ceiling {ceiling:.4} \
-                 — the RDO search regressed (payload {payload} B over {} B PCM)",
-                exp.dir,
-                data.len()
+        for (label, opts, max_ratio) in [
+            (
+                "exhaustive",
+                FlacEncoderOptions::exhaustive(),
+                exp.max_ratio,
             ),
-            None => {
-                // Incompressible content: the encoder must not balloon it.
-                // VERBATIM plus per-frame/header overhead stays within a
-                // few percent of the raw PCM size.
-                assert!(
-                    ratio <= 1.05,
-                    "fixture {}: incompressible content inflated to ratio {ratio:.4} (>1.05)",
-                    exp.dir
-                );
+            (
+                "default",
+                FlacEncoderOptions::default(),
+                exp.default_max_ratio,
+            ),
+        ] {
+            let (payload, recovered) = roundtrip(data, ch, sr, fmt, opts);
+            assert_eq!(
+                recovered.len(),
+                reference.len(),
+                "fixture {}: decoded sample count {} != input {}",
+                exp.dir,
+                recovered.len(),
+                reference.len()
+            );
+            assert!(
+                recovered == reference,
+                "fixture {}: round-trip is not bit-exact (FLAC must be lossless)",
+                exp.dir
+            );
+
+            let ratio = payload as f64 / data.len() as f64;
+            match max_ratio {
+                Some(ceiling) => assert!(
+                    ratio <= ceiling,
+                    "fixture {} ({label}): compression ratio {ratio:.4} exceeds locked ceiling \
+                 {ceiling:.4} — the search regressed (payload {payload} B over {} B PCM)",
+                    exp.dir,
+                    data.len()
+                ),
+                None => {
+                    // Incompressible content: the encoder must not balloon it.
+                    // VERBATIM plus per-frame/header overhead stays within a
+                    // few percent of the raw PCM size.
+                    assert!(
+                        ratio <= 1.05,
+                        "fixture {}: incompressible content inflated to ratio {ratio:.4} (>1.05)",
+                        exp.dir
+                    );
+                }
             }
         }
         checked += 1;

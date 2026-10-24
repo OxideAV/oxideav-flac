@@ -1,8 +1,19 @@
 //! Pure-Rust FLAC encoder.
 //!
 //! Produces valid FLAC streams that decode bit-exactly via any compliant
-//! decoder. Per-subframe the encoder tries CONSTANT, FIXED orders 0..=4,
-//! LPC orders 1..=12 and VERBATIM, and picks the smallest. Each LPC order
+//! decoder. Two searches share the bitstream writers:
+//!
+//! * **Compression levels 0–8** (the default is 5): the estimate-driven
+//!   search in `fast` ranks candidate predictors, stereo layouts and
+//!   Rice partitionings from cheap statistics and encodes only the
+//!   winners — see [`FlacEncoderOptions::compression_level`].
+//! * **[`FlacEncoderOptions::exhaustive`]**: the exact-cost search
+//!   described below, which writes out every candidate and keeps the
+//!   smallest.
+//!
+//! In the exhaustive search, per subframe the encoder tries CONSTANT,
+//! FIXED orders 0..=4, LPC orders 1..=12 and VERBATIM, and picks the
+//! smallest. Each LPC order
 //! additionally searches the coefficient precision over a small window
 //! beneath a block-size-derived ceiling (larger blocks amortise the
 //! coefficient cost, so the ceiling rises with `log2(block_len)` up to
@@ -31,15 +42,20 @@ use crate::md5::Md5;
 use crate::metadata::{BlockHeader, BlockType, StreamInfo, write_padding};
 use oxideav_core::bits::BitWriter;
 
-/// Caller-supplied tuning knobs for [`make_encoder_with_options`]. All
-/// fields default to "match the historical `make_encoder` behaviour", so
-/// constructing the default and passing it in is observationally
-/// identical to calling `make_encoder` directly.
+mod fast;
+
+/// Caller-supplied tuning knobs for [`make_encoder_with_options`]. The
+/// default ([`FlacEncoderOptions::new`] / `Default`) is compression level
+/// 5 — the same encoder [`make_encoder`] builds.
 ///
-/// The struct is `#[non_exhaustive]` so additions in later rounds (e.g.
-/// per-frame block-size override, LPC-order cap) don't break existing
-/// callers; build one with `FlacEncoderOptions::default()` and mutate
-/// the fields you want to set.
+/// Most callers only pick a level: `FlacEncoderOptions::level(n)` for
+/// `n` in `0..=8` (faster ↔ smaller; see
+/// [`compression_level`](Self::compression_level)). The individual search
+/// knobs below override one axis of the chosen level each.
+///
+/// The struct is `#[non_exhaustive]`: build it from a constructor
+/// (`new()`, `level(n)`, `fast()`, `exhaustive()`, `verifying()`) and
+/// adjust it with the `with_*` builders or by assigning fields.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct FlacEncoderOptions {
@@ -79,19 +95,21 @@ pub struct FlacEncoderOptions {
     pub allow_non_subset_partition_order: bool,
 
     /// Highest LPC predictor order (RFC 9639 §9.2.6) the per-subframe
-    /// search will try. `None` (the default) keeps the historical
-    /// ceiling of 12, which is also the streamable-subset boundary for
-    /// audio with a sample rate ≤ 48000 Hz (RFC 9639 §7: "Linear
+    /// search will try. `None` (the default) uses the compression level's
+    /// ceiling — at most 12, which is also the streamable-subset boundary
+    /// for audio with a sample rate ≤ 48000 Hz (RFC 9639 §7: "Linear
     /// prediction subframes ... MUST have a predictor order less than or
-    /// equal to 12").
+    /// equal to 12"). Levels 0–2 use no LPC at all; an explicit value
+    /// enables it at those levels too.
     ///
     /// `Some(k)` raises the search ceiling to `k`, clamped to the spec
     /// maximum of 32 (the subframe-type field stores `order - 1` in 5
     /// bits, so 32 is the largest representable order); a value below 1
-    /// is treated as 1. The `best_subframe` driver always keeps the
-    /// minimum-bit plan across every order it tries, so a higher ceiling
-    /// can only ever shrink or tie the output — orders that don't earn
-    /// their warm-up + coefficient overhead are silently discarded.
+    /// is treated as 1. The search keeps the smallest plan among the
+    /// orders it codes, and orders that don't earn their warm-up +
+    /// coefficient overhead are discarded (under
+    /// [`exhaustive_search`](Self::exhaustive_search) a higher ceiling can
+    /// only ever shrink or tie the output).
     ///
     /// The trade is encode cost (Levinson-Durbin is O(order²) and the
     /// per-order residual search is linear in order) and, for ≤48 kHz
@@ -106,8 +124,10 @@ pub struct FlacEncoderOptions {
 
     /// Override the set of apodization (analysis) windows the
     /// per-subframe LPC search evaluates. `None` (the default) uses the
-    /// five-window set — Welch, Hann, Tukey(1/4), Bartlett, and
-    /// Blackman-Harris.
+    /// compression level's windows (Tukey(1/2) at levels 3–5, then Welch,
+    /// Blackman-Harris and Hann added at 6–8); under
+    /// [`exhaustive_search`](Self::exhaustive_search) it is the five-window
+    /// set Welch, Hann, Tukey(1/4), Bartlett, Blackman-Harris.
     ///
     /// An apodization window tapers a block before the autocorrelation
     /// that feeds Levinson-Durbin (RFC 9639 §9.2.6). It has **no**
@@ -116,14 +136,12 @@ pub struct FlacEncoderOptions {
     /// shaped the analysis is invisible to the decoder. Different windows
     /// trade spectral leakage against retained edge energy, and the best
     /// one is signal-dependent, so the encoder solves under each window
-    /// in the set, residual-codes the result, and keeps whichever LPC
-    /// subframe encodes smallest. Because the minimum-bit `best_subframe`
-    /// driver always keeps the smallest plan across every `(window,
-    /// order, precision)` candidate it visits, adding windows can only
-    /// ever shrink or tie the output — a window that never wins is
-    /// silently discarded. The trade is encode cost: each extra window is
-    /// one more Levinson-Durbin solve (plus its precision sweep) per LPC
-    /// order per subframe.
+    /// in the set, residual-codes its best candidates, and keeps whichever
+    /// LPC subframe encodes smallest — a window that never wins is
+    /// discarded (under `exhaustive_search`, adding windows can only ever
+    /// shrink or tie the output). The trade is encode cost: each extra
+    /// window is one more autocorrelation + Levinson-Durbin solve plus the
+    /// residual passes of its candidates, per subframe.
     ///
     /// `Some(set)` replaces the default windows with `set` — useful both
     /// to add a window the default set omits and to trim to a leaner set
@@ -216,76 +234,184 @@ pub struct FlacEncoderOptions {
     pub verify: bool,
 
     /// How many coefficient precisions below the block-size heuristic the
-    /// per-subframe LPC search evaluates, overriding the built-in
-    /// [`LPC_PRECISION_SEARCH_SPAN`] (4, i.e. five candidates per
-    /// `(order, window)` pair).
+    /// per-subframe LPC search evaluates for each candidate order.
     ///
-    /// `None` (the default) keeps the full sweep. `Some(0)` evaluates only
-    /// the heuristic ceiling itself — one quantise + residual + Rice pass
-    /// per `(order, window)` pair instead of five. Values are clamped to
-    /// [`MAX_LPC_QLP_PRECISION`]; the floor is still
-    /// [`MIN_LPC_QLP_PRECISION`], so a large span cannot widen the search
-    /// below what the quantiser supports.
+    /// `None` (the default) uses the compression level's span: 0 (the
+    /// heuristic precision only) at levels ≤ 6, 1 at levels 7–8, and 4 —
+    /// five candidates per `(order, window)` pair — under
+    /// [`exhaustive_search`](Self::exhaustive_search). Values are clamped
+    /// to 15 (the largest legal precision); the floor is still the
+    /// quantiser's minimum precision of 5, so a large span cannot widen the
+    /// search below what the quantiser supports.
     ///
-    /// This is the **largest single speed axis** in the default
-    /// configuration, and the cheapest in ratio terms. Unlike the LPC
-    /// order ceiling, it multiplies the whole quantise/residual/partition
-    /// pipeline without changing which predictors are considered: the
-    /// Levinson-Durbin solve is already shared across the sweep, so every
-    /// extra precision is pure repeated downstream work. RFC 9639 §9.2.6
-    /// leaves the precision a free encoder parameter, so narrowing the
-    /// search is purely a rate decision — the driver still keeps the
-    /// minimum-bit plan, so a narrower sweep can only grow or tie the
-    /// output, never corrupt it.
-    ///
-    /// Measured on 16 kHz mono speech (5.3 minutes of real recorded
-    /// audio), reducing this axis alone from 4 to 0 gave **3.9x** the
-    /// encode throughput for **+0.09 %** output size — a materially better
-    /// trade than lowering [`max_lpc_order`](Self::max_lpc_order), which
-    /// on the same input gave 1.5x for +0.70 %.
+    /// Each extra precision repeats the whole quantise + residual +
+    /// partition pass for every candidate while the Levinson-Durbin solve
+    /// is shared, so it is pure repeated downstream work for little ratio.
+    /// RFC 9639 §9.2.6 leaves the precision a free encoder parameter, so
+    /// this is purely a rate decision. (Measured on 16 kHz mono speech
+    /// under the exhaustive search, reducing the span from 4 to 0 gave
+    /// 3.9× the throughput for +0.09 % size.)
     pub lpc_precision_search_span: Option<u32>,
 
     /// Highest partition order the partitioned-Rice residual search
-    /// evaluates (RFC 9639 §9.2.7), overriding the ceiling implied by
-    /// [`allow_non_subset_partition_order`](Self::allow_non_subset_partition_order).
+    /// evaluates (RFC 9639 §9.2.7).
     ///
-    /// `None` (the default) keeps that ceiling: 8 for streamable-subset
-    /// output, or 15 when non-subset output is allowed. An explicit value
-    /// is **clamped down** to the applicable ceiling, so this can only ever
-    /// narrow the search — it is never a way to escape the subset bound.
-    /// Use `allow_non_subset_partition_order` for that.
+    /// `None` (the default) uses the compression level's ceiling (3, 4
+    /// and 6 at levels 0–2; 8, the streamable-subset bound, from level 3
+    /// up), or 15 when
+    /// [`allow_non_subset_partition_order`](Self::allow_non_subset_partition_order)
+    /// is set. An explicit value is **clamped down** to the subset ceiling
+    /// of 8 (or 15 with that opt-in), so this can never escape the subset
+    /// bound on its own — that stays the bool's job.
     ///
-    /// Each partition order costs one layout-cost pass per Rice method, so
-    /// capping the ceiling trims the tail of the residual search. The
-    /// search keeps the smallest layout it finds, so a lower ceiling can
-    /// only grow or tie the residual payload. On 16 kHz mono speech,
-    /// dropping the ceiling from 8 to 4 gave 1.5x throughput for +0.01 %
-    /// size.
+    /// The residual coder keeps the cheapest layout among the orders it
+    /// scores, so a lower ceiling trims the search at a small size cost on
+    /// content whose residual statistics change within a block.
     pub max_partition_order: Option<u32>,
+
+    /// Compression level `0..=8` (values above 8 clamp to 8); `None` means
+    /// the default level, [`DEFAULT_COMPRESSION_LEVEL`] (5).
+    ///
+    /// Each level fixes how wide the estimate-driven search is; any
+    /// explicitly set knob ([`apodization`](Self::apodization),
+    /// [`max_lpc_order`](Self::max_lpc_order),
+    /// [`lpc_precision_search_span`](Self::lpc_precision_search_span),
+    /// [`max_partition_order`](Self::max_partition_order)) overrides the
+    /// level's value for that axis. Every level emits a valid
+    /// streamable-subset stream (unless a non-subset option is set):
+    ///
+    /// | level | predictors | LPC order | windows | stereo layout |
+    /// |---|---|---|---|---|
+    /// | 0–2 | FIXED only | — | — | estimated |
+    /// | 3 | FIXED + LPC | ≤ 6 | 1 | estimated |
+    /// | 4 | FIXED + LPC | ≤ 8 | 1 | estimated |
+    /// | 5 (default) | FIXED + LPC | ≤ 12 | 1 | estimated |
+    /// | 6 | FIXED + LPC | ≤ 12 | 2 | estimated |
+    /// | 7 | FIXED + LPC, 2 precisions | ≤ 12 | 3 | estimated |
+    /// | 8 | FIXED + LPC, 2 precisions | ≤ 12 | 4 | all four searched |
+    ///
+    /// Levels 0–2 differ in the partition-order ceiling (3, 4, 6); 3 and
+    /// up use the subset ceiling of 8. Higher levels also code more of the
+    /// best-estimated LPC orders per window (1, 1, 2, 2, 3, 3 for 3–8).
+    ///
+    /// Ignored when [`exhaustive_search`](Self::exhaustive_search) is set.
+    pub compression_level: Option<u8>,
+
+    /// Score every candidate predictor by its exact encoded size instead of
+    /// by estimate — the encoder's historical search (every window × every
+    /// LPC order × every precision × all four stereo layouts). It is
+    /// typically 0.2–1 % smaller than level 8 at roughly 100× level 8's
+    /// encode time (several hundred times level 5's), so it is meant for
+    /// archival one-offs and for tests of the search's monotonicity, not
+    /// for interactive use.
+    ///
+    /// In this mode `None` knobs keep their historical meaning (five
+    /// windows, LPC order 12, precision span 4, partition order 8), and
+    /// `compression_level` is ignored. See [`FlacEncoderOptions::exhaustive`].
+    pub exhaustive_search: bool,
 }
 
+/// The compression level used when
+/// [`FlacEncoderOptions::compression_level`] is `None`.
+pub const DEFAULT_COMPRESSION_LEVEL: u8 = 5;
+
+/// Highest compression level; larger requests clamp to it.
+pub const MAX_COMPRESSION_LEVEL: u8 = 8;
+
 impl FlacEncoderOptions {
-    /// A speed-biased preset: trades a little compression ratio for a
-    /// markedly faster encode, analogous to a low `flac -N` level.
-    ///
-    /// The default encoder runs a *maximal-effort* per-subframe search —
-    /// five apodization windows × LPC orders 1..=12 × a small precision
-    /// window — which is what makes it thorough but slow (#12). This preset
-    /// trims the two most expensive search axes:
-    ///
-    /// * **One apodization window** (Welch) instead of five — cutting the
-    ///   per-subframe LPC solve + quantise + residual + Rice-partition
-    ///   passes to a fifth.
-    /// * **`max_lpc_order = 8`** instead of 12 — fewer (and cheaper, since
-    ///   residual cost is linear in order) candidate orders per subframe.
-    ///
-    /// Every other field keeps its default, so the output is still a valid
-    /// streamable-subset FLAC stream that any spec-complete decoder
-    /// (including this crate's) recovers bit-exactly. The bytes differ from
-    /// the default encoder's (fewer candidates searched ⇒ a slightly larger
-    /// residual on some subframes), but only in size — never in
-    /// correctness. Use [`FlacEncoderOptions::default`] when ratio matters
-    /// more than speed.
+    /// The default options: compression level 5, streamable subset, no
+    /// padding, no verify. Same as [`Default::default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Options for compression level `level` (`0..=8`, clamped). Lower is
+    /// faster, higher is smaller; see
+    /// [`compression_level`](Self::compression_level).
+    pub fn level(level: u8) -> Self {
+        Self::default().with_compression_level(level)
+    }
+
+    /// The historical exact-cost search (see
+    /// [`exhaustive_search`](Self::exhaustive_search)). Byte-identical to
+    /// this crate's default output before compression levels existed.
+    pub fn exhaustive() -> Self {
+        FlacEncoderOptions {
+            exhaustive_search: true,
+            ..Self::default()
+        }
+    }
+
+    /// Set [`compression_level`](Self::compression_level).
+    pub fn with_compression_level(mut self, level: u8) -> Self {
+        self.compression_level = Some(level.min(MAX_COMPRESSION_LEVEL));
+        self
+    }
+
+    /// Set [`exhaustive_search`](Self::exhaustive_search).
+    pub fn with_exhaustive_search(mut self, on: bool) -> Self {
+        self.exhaustive_search = on;
+        self
+    }
+
+    /// Set [`padding_bytes`](Self::padding_bytes).
+    pub fn with_padding_bytes(mut self, bytes: usize) -> Self {
+        self.padding_bytes = Some(bytes);
+        self
+    }
+
+    /// Set [`block_size`](Self::block_size).
+    pub fn with_block_size(mut self, block_size: u32) -> Self {
+        self.block_size = Some(block_size);
+        self
+    }
+
+    /// Set [`max_lpc_order`](Self::max_lpc_order).
+    pub fn with_max_lpc_order(mut self, order: usize) -> Self {
+        self.max_lpc_order = Some(order);
+        self
+    }
+
+    /// Set [`apodization`](Self::apodization).
+    pub fn with_apodization(mut self, windows: Vec<Apodization>) -> Self {
+        self.apodization = Some(windows);
+        self
+    }
+
+    /// Set [`lpc_precision_search_span`](Self::lpc_precision_search_span).
+    pub fn with_lpc_precision_search_span(mut self, span: u32) -> Self {
+        self.lpc_precision_search_span = Some(span);
+        self
+    }
+
+    /// Set [`max_partition_order`](Self::max_partition_order).
+    pub fn with_max_partition_order(mut self, order: u32) -> Self {
+        self.max_partition_order = Some(order);
+        self
+    }
+
+    /// Set [`verify`](Self::verify).
+    pub fn with_verify(mut self, on: bool) -> Self {
+        self.verify = on;
+        self
+    }
+
+    /// Set [`allow_non_subset_partition_order`](Self::allow_non_subset_partition_order).
+    pub fn with_allow_non_subset_partition_order(mut self, on: bool) -> Self {
+        self.allow_non_subset_partition_order = on;
+        self
+    }
+
+    /// Set [`allow_non_subset_block_size`](Self::allow_non_subset_block_size).
+    pub fn with_allow_non_subset_block_size(mut self, on: bool) -> Self {
+        self.allow_non_subset_block_size = on;
+        self
+    }
+
+    /// A speed-biased preset: compression level 4 (one analysis window,
+    /// LPC order ≤ 8). About 25 % faster than the default level 5 for a
+    /// few percent of ratio on content that benefits from long
+    /// predictors. Output is a valid streamable-subset FLAC stream.
     ///
     /// ```
     /// use oxideav_core::{CodecId, CodecParameters, SampleFormat};
@@ -296,19 +422,15 @@ impl FlacEncoderOptions {
     /// params.sample_rate = Some(48_000);
     /// params.sample_format = Some(SampleFormat::S16);
     ///
-    /// // Default: maximal-effort search (best ratio).
-    /// let _best = make_encoder(&params).expect("default encoder");
+    /// // Default: compression level 5.
+    /// let _default = make_encoder(&params).expect("default encoder");
     ///
-    /// // Fast preset: single window + lower LPC order ceiling (faster).
+    /// // Fast preset: level 4.
     /// let _fast = make_encoder_with_options(&params, FlacEncoderOptions::fast())
     ///     .expect("fast encoder");
     /// ```
     pub fn fast() -> Self {
-        FlacEncoderOptions {
-            apodization: Some(vec![Apodization::Welch]),
-            max_lpc_order: Some(8),
-            ..FlacEncoderOptions::default()
-        }
+        Self::level(4)
     }
 
     /// The default maximal-effort search with the encode-time
@@ -602,6 +724,12 @@ struct SubframeScratch {
     /// block), so a linear scan to find the row is cheaper than the per-
     /// sample transcendental rebuild it replaces.
     window_cache: Vec<WindowWeights>,
+    /// Estimate-driven search configuration; `None` selects the exhaustive
+    /// exact-cost search (what every `SubframeScratch::default()` in the
+    /// unit tests exercises).
+    fast: Option<fast::FastConfig>,
+    /// Reusable buffers of the estimate-driven search.
+    fast_state: fast::FastScratch,
 }
 
 /// One memoised apodization weight row: the `n` per-sample weights for a
@@ -669,6 +797,8 @@ impl Default for SubframeScratch {
             merge_a: MergeLevel::default(),
             merge_b: MergeLevel::default(),
             window_cache: Vec::new(),
+            fast: None,
+            fast_state: fast::FastScratch::default(),
         }
     }
 }
@@ -978,6 +1108,12 @@ pub fn make_encoder_with_options(
 /// [`FlacEncoder`] (e.g. to drive `verify_frame` directly) without
 /// re-implementing the option-to-ceiling mapping.
 fn build_scratch(options: &FlacEncoderOptions) -> SubframeScratch {
+    if !options.exhaustive_search {
+        return SubframeScratch {
+            fast: Some(fast_config(options)),
+            ..SubframeScratch::default()
+        };
+    }
     SubframeScratch {
         // Lift the residual-search partition-order ceiling above the
         // streamable-subset bound (8) only when the caller opted in.
@@ -1036,6 +1172,70 @@ fn build_scratch(options: &FlacEncoderOptions) -> SubframeScratch {
 /// populated from live stats once encoding has finished; the initial
 /// block written at encoder construction fills them with zero, which is
 /// the spec's "unset" sentinel.
+/// Resolve a compression level plus explicit overrides into the
+/// estimate-driven search configuration.
+fn fast_config(options: &FlacEncoderOptions) -> fast::FastConfig {
+    let level = options
+        .compression_level
+        .unwrap_or(DEFAULT_COMPRESSION_LEVEL)
+        .min(MAX_COMPRESSION_LEVEL);
+    // (lpc order, window count, order candidates, precision span,
+    //  partition order, exhaustive stereo)
+    let (lpc, n_windows, cands, span, po, stereo) = match level {
+        0 => (0, 0, 0, 0, 3, false),
+        1 => (0, 0, 0, 0, 4, false),
+        2 => (0, 0, 0, 0, 6, false),
+        3 => (6, 1, 1, 0, 8, false),
+        4 => (8, 1, 1, 0, 8, false),
+        5 => (12, 1, 2, 0, 8, false),
+        6 => (12, 2, 2, 0, 8, false),
+        7 => (12, 2, 2, 1, 8, false),
+        _ => (12, 3, 2, 1, 8, true),
+    };
+    let ceiling = if options.allow_non_subset_partition_order {
+        MAX_PARTITION_ORDER
+    } else {
+        SUBSET_MAX_PARTITION_ORDER
+    };
+    let default_po = if options.allow_non_subset_partition_order {
+        MAX_PARTITION_ORDER
+    } else {
+        po
+    };
+    // Window preference order for the fast levels: the first `n_windows`
+    // of this list (a level-specific count, unless overridden).
+    const LEVEL_WINDOWS: [ApodizationWindow; 5] = [
+        ApodizationWindow::Tukey {
+            alpha_num: 1,
+            alpha_den: 2,
+        },
+        ApodizationWindow::Welch,
+        ApodizationWindow::BlackmanHarris,
+        ApodizationWindow::Hann,
+        ApodizationWindow::Bartlett,
+    ];
+    let windows = match &options.apodization {
+        Some(set) if !set.is_empty() => set.iter().map(|w| w.to_internal()).collect(),
+        _ => LEVEL_WINDOWS[..n_windows.max(1)].to_vec(),
+    };
+    fast::FastConfig {
+        max_lpc_order: match options.max_lpc_order {
+            Some(k) => k.clamp(1, SPEC_MAX_LPC_ORDER),
+            None => lpc,
+        },
+        windows,
+        order_candidates: cands.max(1),
+        precision_span: options
+            .lpc_precision_search_span
+            .map_or(span, |v| v.min(MAX_LPC_QLP_PRECISION)),
+        max_partition_order: options
+            .max_partition_order
+            .unwrap_or(default_po)
+            .min(ceiling),
+        exhaustive_stereo: stereo,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_streaminfo_metadata_block(
     block_size: u32,
@@ -1214,8 +1414,25 @@ impl FlacEncoder {
     fn encode_ready_frames(&mut self, drain_all: bool) -> Result<()> {
         let n_ch = self.channels as usize;
         let block = self.block_size as usize;
+        // Consume whole blocks from a read cursor and drop them from the
+        // queue once at the end: draining the front of `interleaved` per
+        // block would memmove the whole remaining input every block, which
+        // is quadratic when a caller sends a long recording in one frame.
+        let mut start = 0usize;
+        let result = self.encode_blocks_from(&mut start, n_ch, block, drain_all);
+        self.interleaved.drain(..start);
+        result
+    }
+
+    fn encode_blocks_from(
+        &mut self,
+        start: &mut usize,
+        n_ch: usize,
+        block: usize,
+        drain_all: bool,
+    ) -> Result<()> {
         loop {
-            let frames_avail = self.interleaved.len() / n_ch;
+            let frames_avail = (self.interleaved.len() - *start) / n_ch;
             let take = if drain_all {
                 frames_avail
             } else if frames_avail >= block {
@@ -1228,12 +1445,18 @@ impl FlacEncoder {
             }
             let mut per_channel: Vec<Vec<i32>> =
                 (0..n_ch).map(|_| Vec::with_capacity(take)).collect();
-            for i in 0..take {
-                for c in 0..n_ch {
-                    per_channel[c].push(self.interleaved[i * n_ch + c]);
+            let src = &self.interleaved[*start..*start + take * n_ch];
+            if let [l, r] = &mut per_channel[..] {
+                for pair in src.as_chunks::<2>().0 {
+                    l.push(pair[0]);
+                    r.push(pair[1]);
+                }
+            } else {
+                for (c, plane) in per_channel.iter_mut().enumerate() {
+                    plane.extend(src.iter().skip(c).step_by(n_ch));
                 }
             }
-            self.interleaved.drain(..take * n_ch);
+            *start += take * n_ch;
 
             self.feed_md5(&per_channel, take);
 
@@ -1440,7 +1663,20 @@ fn encode_frame(
         return Err(Error::invalid("FLAC encoder: channel count out of range"));
     }
 
-    let (channel_code, subframe_plan) = choose_channel_assignment(channels, bps as u32, scratch)?;
+    // The estimate-driven search writes its subframes itself; the
+    // exhaustive search hands back pre-encoded plans.
+    let fast_cfg = scratch.fast.take();
+    let (channel_code, subframe_plan, fast_slots) = match &fast_cfg {
+        Some(cfg) => {
+            let (code, slots) = fast::search_frame(channels, bps as u32, cfg, scratch);
+            (code, Vec::new(), slots)
+        }
+        None => {
+            let (code, plans) = choose_channel_assignment(channels, bps as u32, scratch)?;
+            (code, plans, Vec::new())
+        }
+    };
+    scratch.fast = fast_cfg;
 
     let mut w = BitWriter::with_capacity(block_size as usize * 2 * n_ch);
 
@@ -1471,6 +1707,17 @@ fn encode_frame(
     let hdr_bytes_so_far = w.bytes().to_vec();
     let hdr_crc8 = crc::crc8(&hdr_bytes_so_far);
     w.write_u32(hdr_crc8 as u32, 8);
+
+    if scratch.fast.is_some() {
+        let mut fw = fast::Bits::after(w.into_bytes());
+        for &slot in &fast_slots {
+            fast::emit(&scratch.fast_state.choices[slot], &mut fw);
+        }
+        let mut frame = fw.finish();
+        let frame_crc16 = crc::crc16(&frame);
+        frame.extend_from_slice(&frame_crc16.to_be_bytes());
+        return Ok(frame);
+    }
 
     for plan in &subframe_plan {
         plan.emit(&mut w);
@@ -1882,7 +2129,8 @@ fn encode_fixed_plan_s(
             pred += cj * samples[i - 1 - j] as i64;
         }
         let r = samples[i] as i64 - pred;
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&r) {
+        // RFC 9639 §9.2.7.3: |residual| < 2^31, so -2^31 is excluded too.
+        if !(i32::MIN as i64 + 1..=i32::MAX as i64).contains(&r) {
             return None;
         }
         scratch.residuals.push(r as i32);
@@ -2049,7 +2297,8 @@ fn encode_lpc_plan_at_s(
         }
         let predicted = pred >> qlp_shift;
         let r = samples[i] as i64 - predicted;
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&r) {
+        // RFC 9639 §9.2.7.3: |residual| < 2^31, so -2^31 is excluded too.
+        if !(i32::MIN as i64 + 1..=i32::MAX as i64).contains(&r) {
             return None;
         }
         scratch.residuals.push(r as i32);
@@ -4615,10 +4864,23 @@ mod tests {
     /// speed knobs (single Welch window + LPC ceiling 8) and leave every
     /// other field at its default, so it stays a streamable-subset config.
     #[test]
+    fn exhaustive_search_rejects_an_i32_min_residual() {
+        // RFC 9639 §9.2.7.3: a residual of exactly -2^31 is not allowed.
+        // FIXED order 0 on [0, i32::MIN] would emit it as a residual, so the
+        // candidate must be refused (VERBATIM / another order wins instead).
+        let s = [0, i32::MIN];
+        let mut scratch = SubframeScratch::default();
+        assert!(encode_fixed_plan_s(&s, 32, 0, 0, &mut scratch).is_none());
+        assert!(encode_fixed_plan_s(&[0, i32::MIN + 1], 32, 0, 0, &mut scratch).is_some());
+    }
+
+    #[test]
     fn fast_preset_sets_expected_knobs() {
         let fast = FlacEncoderOptions::fast();
-        assert_eq!(fast.apodization.as_deref(), Some(&[Apodization::Welch][..]));
-        assert_eq!(fast.max_lpc_order, Some(8));
+        assert_eq!(fast.compression_level, Some(4));
+        assert!(!fast.exhaustive_search);
+        assert_eq!(fast.apodization, None);
+        assert_eq!(fast.max_lpc_order, None);
         // Untouched defaults — fast must not silently leave the subset.
         assert!(!fast.allow_non_subset_partition_order);
         assert!(!fast.allow_non_subset_block_size);

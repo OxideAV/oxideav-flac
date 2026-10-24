@@ -736,7 +736,7 @@ impl Demuxer for FlacDemuxer {
 /// Configuration for the FLAC muxer's SEEKTABLE generation (RFC 9639
 /// §8.5).
 ///
-/// The registry-path muxer ([`open_muxer`]) uses [`FlacMuxerOptions::default`];
+/// The registry-path muxer (`open_muxer`) uses [`FlacMuxerOptions::default`];
 /// callers wanting different behaviour construct the muxer through
 /// [`open_muxer_with_options`].
 ///
