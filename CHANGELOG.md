@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Output is written through a 64-bit-accumulator bit writer. The default level encodes a 3-minute 44.1 kHz stereo file in about 0.4 s of CPU (was ~150 s), at 1.7–1.9× the `flac -5` CPU time and 0.15–9.6 % smaller files on the measured inputs.
 - `FlacEncoderOptions::exhaustive()` / `exhaustive_search`: the historical exact-cost search, byte-identical to the previous default output (pinned by test).
 - `FlacEncoderOptions::new()` and `with_*` builders for every option (`with_compression_level`, `with_max_lpc_order`, `with_apodization`, `with_block_size`, `with_verify`, …).
+- `examples/encode_wav.rs`: a complete WAV → FLAC converter through the public API (chunked `send_frame`, `flush`, draining, muxing with the final STREAMINFO, level and knob flags), plus a README section on choosing a compression level with measured speed/size against `flac` and ffmpeg (#12).
 - `FlacEncoderOptions::lpc_precision_search_span` and `FlacEncoderOptions::max_partition_order` — the two remaining search-narrowing knobs (coefficient-precision sweep width, partition-order ceiling); `None` keeps the level's value (#13, follow-up to #12).
 
 ### Changed

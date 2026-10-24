@@ -83,6 +83,86 @@ while let Ok(pkt) = enc.receive_packet() {
 The encoder emits a STREAMINFO metadata block into
 `enc.output_params().extradata`, so you can feed that straight into the
 FLAC muxer (or any other FLAC-aware muxer) for a complete `.flac` file.
+STREAMINFO's total-sample count and MD5 are final only after `flush()`,
+so open the muxer after flushing (or rewrite the header) if you want
+`flac -t` to verify the MD5.
+
+A complete WAV → FLAC converter showing the intended API (chunked
+`send_frame`, `flush`, draining packets, muxing with the final
+STREAMINFO, choosing a level) is in
+[`examples/encode_wav.rs`](examples/encode_wav.rs):
+
+```sh
+cargo run --release --example encode_wav -- input.wav output.flac --level 5
+```
+
+## Choosing a compression level
+
+`FlacEncoderOptions::level(n)` picks one of nine presets, `0..=8`;
+`make_encoder` and `FlacEncoderOptions::default()` use level **5**.
+Every level produces a valid streamable-subset FLAC stream that decodes
+bit-exactly in any decoder; the levels differ only in how hard the
+encoder searches.
+
+```rust
+use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+use oxideav_flac::encoder::{make_encoder_with_options, FlacEncoderOptions};
+
+let mut params = CodecParameters::audio(CodecId::new("flac"));
+params.channels = Some(2);
+params.sample_rate = Some(44_100);
+params.sample_format = Some(SampleFormat::S16);
+let _enc = make_encoder_with_options(&params, FlacEncoderOptions::level(8))?;
+# Ok::<(), oxideav_core::Error>(())
+```
+
+Measured on a 3-minute 44.1 kHz 16-bit stereo test signal (tone sweeps,
+tremolo, echoes and gated noise bursts; `examples/encode_wav.rs`,
+`--release`, Apple Silicon, single thread, CPU time including WAV
+parsing, min of 3 runs), next to the `flac` 1.5 command-line encoder and
+ffmpeg's FLAC encoder run as black boxes on the same file:
+
+| encoder | CPU time | file size | vs. `flac -5` |
+|---|---:|---:|---:|
+| level 0 | 0.17 s | 19.89 MB | +24.2 % |
+| level 2 | 0.16 s | 19.88 MB | +24.1 % |
+| level 3 | 0.29 s | 16.44 MB | +2.6 % |
+| level 4 (`fast()`) | 0.32 s | 16.02 MB | +0.03 % |
+| **level 5 (default)** | **0.41 s** | **15.57 MB** | **−2.8 %** |
+| level 6 | 0.59 s | 15.57 MB | −2.8 % |
+| level 7 | 0.75 s | 15.56 MB | −2.8 % |
+| level 8 | 1.75 s | 15.54 MB | −3.0 % |
+| `flac -0` | 0.13 s | 20.42 MB | +27.4 % |
+| `flac -5` | 0.21 s | 16.02 MB | — |
+| `flac -8` | 0.47 s | 15.50 MB | −3.3 % |
+| `ffmpeg -compression_level 5` | 0.33 s | 16.26 MB | +1.5 % |
+| `ffmpeg -compression_level 8` | 0.49 s | 15.85 MB | −1.1 % |
+
+On a steady two-tone signal level 5 came out 9.6 % smaller than
+`flac -5`, and on pink/brown-noise-heavy content 0.15 % smaller, at
+1.7–1.9× its CPU time.
+
+- **Level 5** is the right choice almost everywhere.
+- **Levels 0–2** use only the fixed predictors. Pick them when CPU
+  matters more than about 25 % of file size, such as live capture on
+  small devices.
+- **Levels 3–4** add a single, shorter linear predictor. They are about
+  25 % faster than level 5.
+- **Levels 6–8** search more analysis windows, coefficient precisions
+  and (at 8) all four stereo layouts in full. They gain a few tenths of
+  a percent on real program material, and more on synthetic pure tones.
+- **`FlacEncoderOptions::exhaustive()`** is the encoder's historical
+  exact-cost search. It writes out every candidate and keeps the
+  smallest: typically 0.2–1 % below level 8, at roughly 100× its time.
+  It is meant for archival one-offs.
+
+Individual axes can be overridden on top of any level:
+`with_max_lpc_order`, `with_apodization`,
+`with_lpc_precision_search_span`, `with_max_partition_order`,
+`with_block_size`.
+
+If encoding seems slow, check that you are building with `--release`.
+A debug build of the encoder is about 20× slower.
 
 ## Decode support
 
@@ -145,91 +225,70 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   independent L/R only (the decorrelated layouts would need a 33-bit
   side subframe, which the subframe encoder does not yet write — the
   *decoder* reads such frames from other encoders; see Decode support).
-- **Predictors**: per subframe the encoder tries CONSTANT, FIXED
-  orders 0..=4, LPC orders 1..=12 and VERBATIM, and keeps the
-  smallest. The default LPC ceiling is 12 — which is also the
-  streamable-subset boundary for sample rates ≤ 48 kHz (RFC 9639 §7)
-  and the point past which the gain curve flattens while per-frame
-  cost grows quadratically. For each LPC order the encoder searches
-  five analysis windows (Welch, Hann, shallow Tukey, Bartlett,
-  Blackman-Harris) before Levinson-Durbin and keeps the smallest; the
-  window choice has no on-wire footprint, so the wider default set is
-  subset-neutral and recovers a few percent on real multichannel /
-  wideband content that the leaner three-window set left on the table.
-  LPC coefficient precision is also searched per
-  subframe within the legal `[5, 15]` range. Output is always fully
-  valid and lossless — any compliant decoder recovers the original
-  PCM bit-exactly.
-- **Higher LPC orders (opt-in)**:
-  `encoder::make_encoder_with_options(params, FlacEncoderOptions {
-  max_lpc_order: Some(k), .. })` lifts the per-subframe LPC search
-  ceiling above the default 12 up to the §9.2.6 maximum of 32
-  (requests are clamped into `1..=32`). Content with a long impulse
-  response — strong echoes, AR processes whose autocorrelation does
-  not decay before lag 12 — can pick an order the default search never
-  reaches. The `best_subframe` driver always keeps the minimum-bit
-  plan, so a higher ceiling can only shrink or tie the output; the
-  trade is encode cost (Levinson-Durbin is O(order²)) and, for ≤ 48
-  kHz audio that actually selects an order above 12, **subset
-  membership** (RFC 9639 §7). The default `None` is byte-for-byte
-  identical to the historical encoder and stays subset-compliant.
-- **Custom apodization windows (opt-in)**:
-  `encoder::make_encoder_with_options(params, FlacEncoderOptions {
-  apodization: Some(vec![Apodization::Hann, Apodization::Tukey {
-  alpha_num: 1, alpha_den: 8 }, ..]), .. })` replaces the default
-  five-window analysis set (Welch, Hann, Tukey(1/4), Bartlett,
-  Blackman-Harris) with a caller-chosen set — useful both to add a window
-  the default omits and to trim to a leaner set (e.g. Welch-only) when
-  encode speed matters more than the last few percent. An apodization
-  window only tapers a block before the autocorrelation that feeds
-  Levinson-Durbin — it has **no** on-wire footprint (RFC 9639 §9.2.6
-  fixes only the quantised coefficients, precision, and shift that reach
-  the bitstream), so the decoder never observes it and output stays a
-  valid streamable-subset stream regardless of the set. The encoder
-  solves under every window in the set and the minimum-bit driver keeps
-  the smallest plan, so more windows can only shrink or tie the output at
-  the cost of one extra Levinson-Durbin solve per window per order. The
-  public `Apodization` enum offers five window shapes — `Welch`, `Hann`,
-  `Tukey { alpha_num, alpha_den }`, `Bartlett` (triangular, the cheapest
-  non-rectangular taper), and `BlackmanHarris` (4-term cosine-sum with
-  the lowest side lobes / strongest leakage suppression in the set).
-  `Apodization::Tukey` takes an `alpha = num/den` taper fraction (clamped
-  to `[0, 1]`; a zero denominator is treated as `0`). An empty set or the
-  default `None` uses the five-window default set.
-- **Fast preset (opt-in)**: `encoder::make_encoder_with_options(params,
-  FlacEncoderOptions::fast())` selects a speed-biased configuration —
-  a single Welch analysis window and `max_lpc_order = 8` — analogous to a
-  low `flac -N` level for callers who want a markedly faster encode over
-  the last few percent of ratio. On a 1 s stereo S16/44.1 kHz buffer it
-  encodes roughly **6.8× faster** than the default maximal-effort search
-  (five windows × LPC 1..=12). The output bytes differ from the default
-  encoder's (fewer search candidates) but stay a valid streamable-subset
-  FLAC stream that decodes bit-exactly; `FlacEncoderOptions::default()` is
-  unchanged and still byte-stable. Note that the default search itself was
-  also made faster (#12): the per-subframe LPC analysis now windows +
-  autocorrelates + runs Levinson-Durbin once **per analysis window**
-  (snapshotting every order's coefficients) instead of once per
-  `(window, order)` pair — a byte-identical restructure.
+- **Predictors**: CONSTANT, VERBATIM, FIXED orders 0..=4 and LPC orders
+  up to 12 (the streamable-subset ceiling for ≤ 48 kHz, RFC 9639 §7).
+  At every compression level the encoder ranks candidates by estimate
+  and encodes only the winners:
+  - **FIXED**: one pass measures the residual magnitude of all five
+    fixed predictors, and only the cheapest is coded.
+  - **LPC**: per analysis window, one autocorrelation and one
+    Levinson-Durbin recursion yield every order's coefficients and
+    prediction error. That error, plus a coefficient-quantisation noise
+    term, ranks the orders, and the best one or two per window are
+    quantised and coded.
+
+  `FlacEncoderOptions::exhaustive()` instead writes out every candidate
+  and keeps the smallest: five windows × every order × five
+  coefficient precisions. Output is always fully valid and lossless;
+  any compliant decoder recovers the original PCM bit-exactly.
+- **Stereo decorrelation**: for stereo input the encoder chooses among
+  independent L/R, left-side, side-right and mid-side (RFC 9639 §4.2)
+  from per-channel size estimates. It then searches only the two
+  channels the chosen layout codes; level 8 and the exhaustive search
+  code all four and compare. At the 32-bit depth ceiling the encoder
+  emits independent L/R only, since the decorrelated layouts would need
+  a 33-bit side subframe that the subframe encoder does not yet write.
+  The *decoder* reads such frames from other encoders; see Decode
+  support.
+- **Higher LPC orders (opt-in)**: `FlacEncoderOptions::default()
+  .with_max_lpc_order(k)` lifts the LPC ceiling above 12, up to the
+  §9.2.6 maximum of 32 (requests clamp into `1..=32`). That helps content
+  with a long impulse response. For ≤ 48 kHz audio that actually selects
+  an order above 12, the stream is no longer **streamable-subset**
+  (RFC 9639 §7).
+- **Custom apodization windows (opt-in)**: `.with_apodization(vec![
+  Apodization::Hann, Apodization::Tukey { alpha_num: 1, alpha_den: 8 },
+  ..])` replaces the level's analysis windows. The public `Apodization`
+  enum offers `Welch`, `Hann`, `Tukey { alpha_num, alpha_den }`,
+  `Bartlett` and `BlackmanHarris`. A window only tapers the block
+  before the autocorrelation; it has **no** on-wire footprint (RFC 9639
+  §9.2.6 fixes only the quantised coefficients, precision and shift), so
+  output stays a valid streamable-subset stream regardless of the set.
+  Each extra window costs one more analysis plus its candidates' residual
+  passes. `Apodization::Tukey` takes an `alpha = num/den` taper fraction,
+  clamped to `[0, 1]`; a zero denominator is treated as `0`.
+- **Fast preset**: `FlacEncoderOptions::fast()` is level 4.
 - **Wasted bits per sample**: detected per subframe (largest `k` such
   that every sample is divisible by `2^k`) and folded into the spec's
   wasted-bits unary header.
-- **Residual coding**: partitioned Rice with a full search over
-  partition orders 0..=8 under both Rice methods (4-bit and 5-bit
-  parameters); the cheapest layout wins, and each partition
-  independently falls back to escape (raw fixed-width) coding when
-  that beats Rice. The default ceiling of 8 keeps every emitted
-  stream inside the FLAC streamable subset (RFC 9639 §7).
+- **Residual coding**: partitioned Rice (RFC 9639 §9.2.7) under both Rice
+  methods (4-bit and 5-bit parameters).
+  - Every legal partition order up to the level's ceiling is scored from
+    per-partition sums: 8 (the subset bound) from level 3 up, and 3/4/6
+    at levels 0/1/2.
+  - The winning layout's Rice parameters are then chosen exactly, and
+    each partition independently falls back to escape (raw fixed-width)
+    coding when that is cheaper.
+  - Residuals are kept strictly inside the §9.2.7.3 range (|r| < 2³¹,
+    so −2³¹ itself is excluded); a predictor that would leave it is
+    dropped, falling back to VERBATIM.
+  - `.with_max_partition_order(p)` narrows the ceiling.
 - **Non-subset partition orders**:
-  `encoder::make_encoder_with_options(params, FlacEncoderOptions {
-  allow_non_subset_partition_order: true, .. })` lifts the
-  residual-search ceiling to the full §9.2.7 field range (0..=15) for
-  content whose residual statistics vary finer than the order-8
-  partition size. The default factory keeps the subset-compliant
-  ceiling of 8 and is byte-for-byte unaffected. Output stays a valid
+  `.with_allow_non_subset_partition_order(true)` lifts the residual
+  search ceiling to the full field range (0..=15). Output stays a valid
   (non-subset) FLAC stream.
 - **Block size**: 4096 samples per frame (fixed-blocking strategy) by
-  default. `make_encoder_with_options(params, FlacEncoderOptions {
-  block_size: Some(n), .. })` sets the per-frame block size to any `n` in
+  default. `.with_block_size(n)` sets the per-frame block size to any `n` in
   the STREAMINFO range `16..=65535` (RFC 9639 §8.2); every frame but the
   last carries exactly `n` interchannel samples and the last carries the
   remainder (the §8.2 minimum-block floor exempts the last frame). A
@@ -247,14 +306,12 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   signature of the PCM input is computed during encode and written
   into the block at `flush()` time, along with the observed
   min/max frame size and total sample count.
-- **PADDING reservation**: `make_encoder_with_options(params,
-  FlacEncoderOptions { padding_bytes: Some(n), .. })` chains an
+- **PADDING reservation**: `.with_padding_bytes(n)` chains an
   `n`-byte all-zero PADDING block after STREAMINFO so downstream
   tools can rewrite metadata in place. Requesting more than
   `BlockHeader::MAX_LENGTH` (2²⁴ − 1) returns `Error::invalid`.
-- **Encode-time verify (opt-in)**:
-  `make_encoder_with_options(params, FlacEncoderOptions { verify: true,
-  .. })` — or the `FlacEncoderOptions::verifying()` preset — turns on
+- **Encode-time verify (opt-in)**: `.with_verify(true)`, or the
+  `FlacEncoderOptions::verifying()` preset, turns on
   FLAC's `--verify` self-check. As each frame is produced the encoder
   runs its own decoder over the freshly-emitted bytes (through the very
   same `decoder::decode_frame_channels` core the streaming decoder uses,
@@ -284,16 +341,19 @@ the `compression_quality` test suite:
   `docs/audio/flac/fixtures/` (mono/stereo/7.1, 8/16/24-bit) is
   re-encoded and decoded back through this crate's own decoder, asserting
   byte-exact recovery — no external tool in the loop.
-- **Monotone search.** Widening the search space — adding apodization
-  windows, raising the LPC-order ceiling to 32, raising the
-  partition-order ceiling to 15 — can only ever *shrink or tie* the
-  encoded size, never inflate it, because the extra candidates are
+- **Monotone search (exhaustive mode).** Under
+  `FlacEncoderOptions::exhaustive()`, widening the search space can only
+  ever *shrink or tie* the encoded size, never inflate it. Widening means
+  adding apodization windows, raising the LPC-order ceiling to 32, or
+  raising the partition-order ceiling to 15. The extra candidates are
   compared on actual bit cost and discarded when they don't win. The
-  property battery checks this across tonal, transient, near-white-noise,
-  and autoregressive signal classes.
+  property battery checks this across tonal, transient, near-white-noise
+  and autoregressive signal classes. The estimate-driven levels rank
+  candidates by estimate, so there the guarantee is validity and
+  losslessness, not monotonicity.
 - **Compression-ratio ceilings.** Each fixture carries a locked
-  compressed/PCM ratio ceiling, so a change that quietly de-tuned the RDO
-  search (e.g. dropping a default window or narrowing a search range)
+  compressed/PCM ratio ceiling, once for the exhaustive search and once
+  for the default level. A change that quietly de-tuned either search
   trips a size regression rather than passing silently.
 - **Independent-decoder oracle.** The `reference_decode_oracle` suite
   assembles a complete `.flac` stream from the encoder's output and decodes
