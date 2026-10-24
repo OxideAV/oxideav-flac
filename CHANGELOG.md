@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-flac/compare/v0.0.12...v0.0.13) - 2026-10-24
+
+### Fixed
+
+- fixup for #13: CHANGELOG entry for the two search-narrowing knobs
+
+### Other
+
+- examples/encode_wav.rs + README section on choosing a level ([#12](https://github.com/OxideAV/oxideav-flac/pull/12))
+- compression levels 0-8 on an estimate-driven search ([#12](https://github.com/OxideAV/oxideav-flac/pull/12))
+- slice-by-8 CRC-16
+- expose the two remaining search-narrowing knobs ([#12](https://github.com/OxideAV/oxideav-flac/pull/12))
+- fuzz targets walk channel planes when de-interleaving
+- fuzz roundtrip target iterates channel planes instead of indexing
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - Compression levels 0–8 (`FlacEncoderOptions::level(n)`, `compression_level`, `DEFAULT_COMPRESSION_LEVEL` = 5) driving a new estimate-driven encoder search (#12). Candidates are ranked by cheap statistics and only the winners are encoded:
