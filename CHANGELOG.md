@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CRC-16 runs slice-by-8 (eight table lookups per eight bytes instead of a serial byte chain); tables derived at compile time and cross-checked against `docs/audio/flac/tables/crc16-table-sliced.csv`. Same values, faster frame encode and decode.
 - edition 2024, MSRV 1.95; fuzz harness loads its libavcodec reference through dlsym instead of libloading.
 
 ## [0.0.12](https://github.com/OxideAV/oxideav-flac/compare/v0.0.11...v0.0.12) - 2026-10-04

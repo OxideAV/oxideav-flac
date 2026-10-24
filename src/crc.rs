@@ -98,6 +98,27 @@ const CRC16_TABLE: [u16; 256] = {
     t
 };
 
+/// Slice-by-8 extension of [`CRC16_TABLE`]: `CRC16_SLICES[k][x]` is the
+/// CRC contribution of byte `x` followed by `k` zero bytes, so eight input
+/// bytes fold into the register with eight independent lookups instead of
+/// a serial chain of eight. Row 0 is `CRC16_TABLE`; row `k` advances row
+/// `k-1` by one zero byte.
+const CRC16_SLICES: [[u16; 256]; 8] = {
+    let mut t = [[0u16; 256]; 8];
+    t[0] = CRC16_TABLE;
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev << 8) ^ CRC16_TABLE[(prev >> 8) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
 /// Streaming CRC-16 (polynomial `0x8005`, init 0, no input reflection).
 ///
 /// The FLAC frame footer carries this checksum over the whole frame —
@@ -127,13 +148,28 @@ impl Crc16 {
         self.state = (self.state << 8) ^ CRC16_TABLE[idx];
     }
 
-    /// Feed a contiguous slice of bytes into the running CRC.
+    /// Feed a contiguous slice of bytes into the running CRC (eight bytes
+    /// per step through the slice-by-8 tables, then byte-wise for the
+    /// tail).
     #[inline]
     pub fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            let idx = ((self.state >> 8) as u8 ^ b) as usize;
-            self.state = (self.state << 8) ^ CRC16_TABLE[idx];
+        let t = &CRC16_SLICES;
+        let (blocks, tail) = bytes.as_chunks::<8>();
+        let mut c = self.state;
+        for b in blocks {
+            c = t[7][((c >> 8) as u8 ^ b[0]) as usize]
+                ^ t[6][(c as u8 ^ b[1]) as usize]
+                ^ t[5][b[2] as usize]
+                ^ t[4][b[3] as usize]
+                ^ t[3][b[4] as usize]
+                ^ t[2][b[5] as usize]
+                ^ t[1][b[6] as usize]
+                ^ t[0][b[7] as usize];
         }
+        for &b in tail {
+            c = (c << 8) ^ CRC16_TABLE[((c >> 8) as u8 ^ b) as usize];
+        }
+        self.state = c;
     }
 
     /// Current running value. Reading does not consume the validator.
@@ -152,6 +188,44 @@ pub fn crc16(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The derived slice-by-8 rows equal the staged reference table
+    /// (`docs/audio/flac/tables/crc16-table-sliced.csv`, 8 rows × 256).
+    /// Spot-checks the first and last entries of every row, plus a mid
+    /// entry, transcribed from that file.
+    #[test]
+    fn crc16_slices_match_staged_table() {
+        let expect: [[(usize, u16); 3]; 3] = [
+            [(1, 0x8005), (128, 0x8303), (255, 0x0202)],
+            [(1, 0x8603), (128, 0x8009), (255, 0x820f)],
+            [(1, 0x8017), (128, 0x8a03), (255, 0x0c0c)],
+        ];
+        for (row, entries) in expect.iter().enumerate() {
+            for &(i, v) in entries {
+                assert_eq!(CRC16_SLICES[row][i], v, "row {row} index {i}");
+            }
+        }
+    }
+
+    /// Slice-by-8 agrees with the byte-at-a-time recurrence at every
+    /// length and split point (covers the 8-byte blocks and the tail).
+    #[test]
+    fn crc16_sliced_matches_bytewise() {
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for len in 0..64 {
+            let mut bytewise = Crc16::new();
+            for &b in &data[..len] {
+                bytewise.update_byte(b);
+            }
+            assert_eq!(crc16(&data[..len]), bytewise.value(), "len {len}");
+        }
+        let mut split = Crc16::new();
+        split.update(&data[..13]);
+        split.update(&data[13..]);
+        assert_eq!(split.value(), crc16(&data));
+    }
 
     #[test]
     fn crc8_zero_for_empty() {
