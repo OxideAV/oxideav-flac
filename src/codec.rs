@@ -136,7 +136,8 @@ mod tests {
                 "exhaustive",
                 "verify",
                 "block_size",
-                "padding"
+                "padding",
+                "md5"
             ]
         );
     }

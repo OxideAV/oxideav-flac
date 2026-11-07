@@ -119,7 +119,7 @@ let _enc = make_encoder_with_options(&params, FlacEncoderOptions::level(8))?;
 Registry callers (anything that only holds the codec id, such as a
 pipeline or a command-line tool) pick the same presets through
 `CodecParameters::options`: `compression_level` (0–8), `exhaustive`,
-`verify`, `block_size` and `padding`. For example,
+`verify`, `block_size`, `padding` and `md5`. For example,
 `params.options.insert("compression_level", "8")` before `make_encoder`.
 Unknown keys are rejected.
 
@@ -212,6 +212,37 @@ alongside the workers. From 4 threads up, levels 0–5 approach the
 limit set by the MD5. The digest covers all 254 MB of PCM in order and
 takes about 0.36 s on its own here, which caps encoding near 4000× real
 time. Level 8 keeps scaling, since its frame search dominates.
+
+`with_md5(false)` (registry key `md5=false`, `encode_wav --no-md5`)
+removes that limit. It stores the all-zero "not computed" signature
+(RFC 9639 §8.2) and hashes nothing on any path. The frames are
+byte-identical either way; only the 16 signature bytes change. The
+table below compares the two on a third 24-minute 44.1 kHz 16-bit
+stereo file (pink noise plus tones, generated with ffmpeg), measured
+the same way:
+
+| level | threads | MD5 on wall | MD5 on ×RT | MD5 off wall | MD5 off ×RT |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1 | 1.04 s | 1390× | 0.68 s | 2110× |
+| 0 | 2 | 0.44 s | 3240× | 0.31 s | 4690× |
+| 0 | 4 | 0.39 s | 3680× | 0.16 s | 9110× |
+| 0 | 8 | 0.36 s | 4010× | 0.12 s | 12300× |
+| **5** | 1 | 1.53 s | 940× | 1.23 s | 1170× |
+| **5** | 2 | 0.59 s | 2440× | 0.59 s | 2420× |
+| **5** | 4 | 0.42 s | 3460× | 0.34 s | 4270× |
+| **5** | 8 | 0.39 s | 3730× | 0.19 s | 7660× |
+| 8 | 1 | 4.10 s | 350× | 3.79 s | 380× |
+| 8 | 2 | 1.90 s | 760× | 1.89 s | 760× |
+| 8 | 4 | 1.03 s | 1400× | 1.00 s | 1440× |
+| 8 | 8 | 0.61 s | 2360× | 0.57 s | 2540× |
+
+Without the digest, levels 0 and 5 keep scaling past 4 threads: level
+0 reaches about 12 000× real time at 8 threads, three times the MD5-on
+ceiling. At 2 threads the calling thread hashes while the workers
+code, so the digest costs almost nothing there. Level 8 gains only a few
+percent, because its frame search dominates. Decoders cannot check a
+decode against the original PCM without the signature, although each
+frame's CRC-16 still protects its bytes.
 
 Individual axes can be overridden on top of any level:
 `with_max_lpc_order`, `with_apodization`,
@@ -362,7 +393,12 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Metadata**: emits a STREAMINFO header in `extradata`. An MD5
   signature of the PCM input is computed during encode and written
   into the block at `flush()` time, along with the observed
-  min/max frame size and total sample count.
+  min/max frame size and total sample count. `.with_md5(false)` (or
+  the registry key `md5=false`) skips the digest and stores the
+  all-zero signature that RFC 9639 §8.2 defines as "not computed";
+  the frames are byte-identical, only those 16 bytes change. `flac -t`
+  accepts such a file, and `verify::verify_stream` reports
+  `NoSignature` instead of a mismatch.
 - **PADDING reservation**: `.with_padding_bytes(n)` chains an
   `n`-byte all-zero PADDING block after STREAMINFO so downstream
   tools can rewrite metadata in place. Requesting more than

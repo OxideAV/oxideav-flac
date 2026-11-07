@@ -27,6 +27,10 @@
 //! per worker): at most that many blocks are with the workers, and at
 //! most that many are submitted but not yet hashed. A submit that would
 //! exceed either bound first waits (hashing in the meantime when it can).
+//!
+//! When the MD5 is switched off ([`FlacEncoderOptions::skip_md5`]) the pool
+//! has no [`Md5Stage`] at all: workers serialise and deposit nothing, and
+//! the only bound is the blocks with the workers.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -212,8 +216,9 @@ pub(super) struct FramePool {
     window: usize,
     /// Recycled sample planes from handed-back blocks.
     spare: Vec<Vec<Vec<i32>>>,
-    /// The digest over every block submitted to this pool.
-    md5: Arc<Md5Stage>,
+    /// The digest over every block submitted to this pool; `None` when
+    /// the MD5 is not computed.
+    md5: Option<Arc<Md5Stage>>,
     /// Set when the pool is dropped with blocks still queued: workers skip
     /// the rest instead of coding frames nobody will read.
     cancel: Arc<AtomicBool>,
@@ -223,17 +228,18 @@ impl FramePool {
     /// Start `threads` workers coding frames of `shape` with the search
     /// that `options` selects; the first block submitted must be frame
     /// number `first_frame`, and `md5` is the digest of every sample
-    /// before it. [`finish`](Self::finish) hands the digest back.
+    /// before it, or `None` to compute no digest.
+    /// [`finish`](Self::finish) hands the digest back.
     pub(super) fn new(
         threads: usize,
         options: &FlacEncoderOptions,
         shape: FrameShape,
         verify: bool,
         first_frame: u64,
-        md5: Md5,
+        md5: Option<Md5>,
     ) -> Self {
         let threads = threads.max(1);
-        let md5 = Arc::new(Md5Stage::new(md5, first_frame, WORKER_HASH_BACKLOG));
+        let md5 = md5.map(|m| Arc::new(Md5Stage::new(m, first_frame, WORKER_HASH_BACKLOG)));
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (done_tx, done_rx) = mpsc::channel::<Done>();
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -243,12 +249,20 @@ impl FramePool {
                 let job_rx = Arc::clone(&job_rx);
                 let done_tx = done_tx.clone();
                 let options = options.clone();
-                let md5 = Arc::clone(&md5);
+                let md5 = md5.clone();
                 let cancel = Arc::clone(&cancel);
                 std::thread::Builder::new()
                     .name(format!("flac-enc-{i}"))
                     .spawn(move || {
-                        worker(&job_rx, &done_tx, &md5, &cancel, &options, shape, verify)
+                        worker(
+                            &job_rx,
+                            &done_tx,
+                            md5.as_deref(),
+                            &cancel,
+                            &options,
+                            shape,
+                            verify,
+                        )
                     })
                     .expect("spawn FLAC encoder worker")
             })
@@ -320,7 +334,9 @@ impl FramePool {
             .and_then(|tx| tx.send(job).ok())
             .ok_or_else(worker_gone)?;
         self.in_flight += 1;
-        self.md5.hash_ready(1);
+        if let Some(md5) = &self.md5 {
+            md5.hash_ready(1);
+        }
         self.poll(sink)
     }
 
@@ -350,13 +366,21 @@ impl FramePool {
     /// still queued. Every submitted block must have been handed back
     /// ([`drain`](Self::drain)): a worker deposits its block with the
     /// digest before handing it back, so all of them are deposited by then.
-    pub(super) fn finish(mut self) -> Md5 {
+    /// `None` when the pool computes no digest.
+    pub(super) fn finish(mut self) -> Option<Md5> {
         debug_assert_eq!(self.in_flight, 0);
         self.stop();
-        self.md5.hash_ready(usize::MAX);
-        debug_assert_eq!(self.md5.next(), self.end());
-        let mut md5 = self.md5.md5.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *md5)
+        let stage = self.md5.as_ref()?;
+        stage.hash_ready(usize::MAX);
+        debug_assert_eq!(stage.next(), self.end());
+        let mut md5 = stage.md5.lock().unwrap_or_else(|e| e.into_inner());
+        Some(std::mem::take(&mut *md5))
+    }
+
+    /// Frame number of the next block the digest needs (the end of the
+    /// submitted range when no digest is computed: nothing is unhashed).
+    fn hashed_to(&self) -> u64 {
+        self.md5.as_ref().map_or_else(|| self.end(), |m| m.next())
     }
 
     /// Wait until another block may be submitted: fewer than `window`
@@ -364,11 +388,15 @@ impl FramePool {
     fn make_room(&mut self, sink: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
         loop {
             self.poll(sink)?;
-            let unhashed = self.end() - self.md5.next();
+            let unhashed = self.end() - self.hashed_to();
             if self.in_flight < self.window && unhashed < self.window as u64 {
                 return Ok(());
             }
-            if self.md5.hash_ready(usize::MAX) > 0 {
+            if self
+                .md5
+                .as_ref()
+                .is_some_and(|m| m.hash_ready(usize::MAX) > 0)
+            {
                 continue;
             }
             if self.in_flight >= self.window {
@@ -377,10 +405,10 @@ impl FramePool {
                 if let Some(done) = self.next_done(true)? {
                     sink(done)?;
                 }
-            } else {
+            } else if let Some(md5) = &self.md5 {
                 // The digest is behind: another thread is hashing, or the
                 // block it needs is still being coded.
-                self.md5.wait_progress(self.md5.next());
+                md5.wait_progress(md5.next());
             }
         }
     }
@@ -447,7 +475,7 @@ fn worker_gone() -> Error {
 fn worker(
     jobs: &Mutex<Receiver<Job>>,
     done: &Sender<Done>,
-    md5: &Md5Stage,
+    md5: Option<&Md5Stage>,
     cancel: &AtomicBool,
     options: &FlacEncoderOptions,
     shape: FrameShape,
@@ -490,9 +518,11 @@ fn worker(
         });
         // Deposit before handing the block back: once the caller holds
         // every block, the digest has every block too.
-        let mut bytes = md5.buffer();
-        md5_bytes(&job.channels, shape.bps, &mut bytes);
-        md5.deposit(job.frame_number, bytes);
+        if let Some(md5) = md5 {
+            let mut bytes = md5.buffer();
+            md5_bytes(&job.channels, shape.bps, &mut bytes);
+            md5.deposit(job.frame_number, bytes);
+        }
         let out = Done {
             frame_number: job.frame_number,
             samples: job.samples,

@@ -19,6 +19,8 @@
 //!     --chunk SECONDS   PCM per send_frame call (default 1; 0 = whole file)
 //!     --threads N       encode frames on N worker threads (default 1);
 //!                       the output is byte-identical for every N
+//!     --no-md5          store the all-zero "not computed" STREAMINFO MD5
+//!                       (RFC 9639 §8.2) instead of hashing the input
 //!
 //! The encoder is pull-based: push `AudioFrame`s of any size (it re-blocks
 //! them), `flush()`, then drain `receive_packet()`. The final STREAMINFO
@@ -166,6 +168,7 @@ fn parse_options(args: &[String]) -> Result<(FlacEncoderOptions, u32), String> {
             "--block" => opts.block_size = Some(num(&mut i, "--block")?),
             "--chunk" => chunk_seconds = num(&mut i, "--chunk")?,
             "--threads" => opts = opts.with_threads(num(&mut i, "--threads")? as usize),
+            "--no-md5" => opts = opts.with_md5(false),
             other => return Err(format!("unknown option {other}")),
         }
         i += 1;

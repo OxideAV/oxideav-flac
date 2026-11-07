@@ -337,6 +337,20 @@ pub struct FlacEncoderOptions {
     /// frames still in flight become available from `receive_packet` as
     /// they complete; `flush` waits for all of them.
     pub threads: Option<usize>,
+
+    /// Leave the STREAMINFO MD5 signature (RFC 9639 §8.2) uncomputed and
+    /// store all zeros, which the spec defines as "not computed". `false`
+    /// (the default) computes it. Set it through
+    /// [`with_md5(false)`](Self::with_md5) or the registry key `md5`.
+    ///
+    /// The digest is one sequential pass over the whole input in stream
+    /// order, so with many threads it is the remaining serial cost of the
+    /// frame-parallel encoder. Skipping it changes nothing but those 16
+    /// bytes: every frame is byte-identical. Decoders then cannot check a
+    /// decode against the original PCM (each frame's CRC-16 still guards
+    /// its bytes); this crate's [`crate::verify`] reports
+    /// `VerifyOutcome::NoSignature` for such a stream.
+    pub skip_md5: bool,
 }
 
 /// Registry options (`CodecParameters::options`), so callers that only
@@ -374,6 +388,12 @@ impl CodecOptionsStruct for FlacEncoderOptions {
             default: OptionValue::U32(0),
             help: "bytes of PADDING to reserve after STREAMINFO (0 = none)",
         },
+        OptionField {
+            name: "md5",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "compute the STREAMINFO MD5 of the input (false stores all zeros: not computed)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -384,6 +404,7 @@ impl CodecOptionsStruct for FlacEncoderOptions {
             }
             "exhaustive" => self.exhaustive_search = value.as_bool()?,
             "verify" => self.verify = value.as_bool()?,
+            "md5" => self.skip_md5 = !value.as_bool()?,
             "block_size" => self.block_size = Some(value.as_u32()?),
             "padding" => {
                 let n = value.as_u32()? as usize;
@@ -477,6 +498,15 @@ impl FlacEncoderOptions {
     /// Set [`verify`](Self::verify).
     pub fn with_verify(mut self, on: bool) -> Self {
         self.verify = on;
+        self
+    }
+
+    /// Compute the STREAMINFO MD5 (`true`, the default) or store the
+    /// all-zero "not computed" signature (`false`); sets
+    /// [`skip_md5`](Self::skip_md5) to `!on`. Frames are byte-identical
+    /// either way.
+    pub fn with_md5(mut self, on: bool) -> Self {
+        self.skip_md5 = !on;
         self
     }
 
@@ -1058,7 +1088,8 @@ fn lpc_precision_for(block_len: usize) -> u32 {
 
 /// Build an encoder for `params`. Options come from `params.options`
 /// (keys in [`FlacEncoderOptions`]'s [`CodecOptionsStruct::SCHEMA`]:
-/// `compression_level`, `exhaustive`, `verify`, `block_size`, `padding`);
+/// `compression_level`, `exhaustive`, `verify`, `block_size`, `padding`,
+/// `md5`);
 /// an empty bag means the defaults (compression level 5). Unknown keys
 /// and malformed values are rejected.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -1191,6 +1222,7 @@ pub fn make_encoder_with_options(
         frame_number: 0,
         md5: Md5::new(),
         md5_buf: Vec::new(),
+        compute_md5: !options.skip_md5,
         total_samples: 0,
         min_frame_size: u32::MAX,
         max_frame_size: 0,
@@ -1449,6 +1481,9 @@ struct FlacEncoder {
     md5: Md5,
     /// Reused byte buffer for the MD5 input of each block.
     md5_buf: Vec<u8>,
+    /// Feed `md5` at all; when `false` STREAMINFO stores the all-zero
+    /// "not computed" signature. See [`FlacEncoderOptions::skip_md5`].
+    compute_md5: bool,
     total_samples: u64,
     min_frame_size: u32,
     max_frame_size: u32,
@@ -1679,8 +1714,10 @@ impl FlacEncoder {
             done.push(d);
             Ok(())
         });
-        if drained.is_ok() {
-            self.md5 = pool.finish();
+        if drained.is_ok()
+            && let Some(md5) = pool.finish()
+        {
+            self.md5 = md5;
         }
         let queued = self.queue_all_done(&mut done);
         drained.and(queued)
@@ -1718,7 +1755,7 @@ impl FlacEncoder {
                 self.frame_shape(),
                 self.verify,
                 self.frame_number,
-                std::mem::take(&mut self.md5),
+                self.compute_md5.then(|| std::mem::take(&mut self.md5)),
             ),
         };
         let mut done = Vec::new();
@@ -1758,7 +1795,9 @@ impl FlacEncoder {
                 (0..n_ch).map(|_| Vec::with_capacity(take)).collect();
             let src = &self.interleaved[*start..*start + take * n_ch];
             deinterleave(src, &mut per_channel);
-            feed_md5(&mut self.md5, &mut self.md5_buf, self.bps, src);
+            if self.compute_md5 {
+                feed_md5(&mut self.md5, &mut self.md5_buf, self.bps, src);
+            }
             *start += take * n_ch;
 
             let data = encode_frame(
@@ -1813,7 +1852,12 @@ impl FlacEncoder {
     /// preserves the trailing PADDING block — the bound check happened
     /// at construction time, so the rebuild is infallible here.
     fn finalize_streaminfo(&mut self) {
-        let md5_bytes = std::mem::take(&mut self.md5).finalize();
+        // RFC 9639 §8.2: all zeros means the signature was not computed.
+        let md5_bytes = if self.compute_md5 {
+            std::mem::take(&mut self.md5).finalize()
+        } else {
+            [0u8; 16]
+        };
         let min_frame_size = if self.min_frame_size == u32::MAX {
             0
         } else {
@@ -6161,6 +6205,7 @@ mod tests {
             frame_number: 0,
             md5: Md5::new(),
             md5_buf: Vec::new(),
+            compute_md5: true,
             total_samples: 0,
             min_frame_size: u32::MAX,
             max_frame_size: 0,
