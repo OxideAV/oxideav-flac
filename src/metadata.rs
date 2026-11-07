@@ -6,6 +6,7 @@ pub const FLAC_MAGIC: [u8; 4] = *b"fLaC";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum BlockType {
     StreamInfo = 0,
     Padding = 1,
@@ -1817,6 +1818,7 @@ pub fn write_streaminfo(info: &StreamInfo) -> Result<Vec<u8>> {
 /// [`MetadataChain::parse`] rejects it and the writer cannot be
 /// asked to produce it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MetadataBlock {
     /// STREAMINFO (§8.2) — the mandatory first block.
     StreamInfo(StreamInfo),

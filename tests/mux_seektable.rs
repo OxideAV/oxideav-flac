@@ -170,11 +170,10 @@ fn muxer_generates_seektable_and_seeks_land() {
         packets.len()
     );
 
-    let opts = FlacMuxerOptions {
-        generate_seektable: true,
-        seek_point_interval: 2048, // one point per ~4 frames
-        max_seek_points: 0,
-    };
+    let opts = FlacMuxerOptions::default()
+        .with_generate_seektable(true)
+        .with_seek_point_interval(2048)
+        .with_max_seek_points(0);
     let bytes = mux_into_vec(&params, &packets, opts);
 
     // Re-open and confirm a SEEKTABLE was parsed.
@@ -206,11 +205,10 @@ fn generated_seektable_offsets_are_first_frame_relative() {
     let pcm = stereo_sine(n, sr);
     let (packets, params) = encode_small_blocks(2, sr, 512, pcm);
 
-    let opts = FlacMuxerOptions {
-        generate_seektable: true,
-        seek_point_interval: 1024,
-        max_seek_points: 0,
-    };
+    let opts = FlacMuxerOptions::default()
+        .with_generate_seektable(true)
+        .with_seek_point_interval(1024)
+        .with_max_seek_points(0);
     let bytes = mux_into_vec(&params, &packets, opts);
 
     // Independently walk the metadata chain to extract the SEEKTABLE and
@@ -405,11 +403,10 @@ fn seektable_coexists_with_reserved_padding() {
     }
     let out_params = enc.output_params().clone();
 
-    let opts = FlacMuxerOptions {
-        generate_seektable: true,
-        seek_point_interval: 1024,
-        max_seek_points: 0,
-    };
+    let opts = FlacMuxerOptions::default()
+        .with_generate_seektable(true)
+        .with_seek_point_interval(1024)
+        .with_max_seek_points(0);
     let bytes = mux_into_vec(&out_params, &packets, opts);
     let (chain, _) = MetadataChain::parse(&bytes[4..]).expect("parse chain");
 

@@ -74,6 +74,7 @@ fn reference_corpus_verifies_md5() {
                 no_sig += 1;
                 eprintln!("note {name}: STREAMINFO has no MD5 signature (unverifiable)");
             }
+            Ok(other) => panic!("{name}: unexpected outcome {other:?}"),
             Err(e) => panic!("{name}: verify_stream failed: {e}"),
         }
     }
@@ -123,6 +124,7 @@ fn corrupted_sample_fails_verification() {
             eprintln!("skip corrupted_sample_fails_verification: fixture has no MD5");
             return;
         }
+        Ok(other) => panic!("unexpected pristine outcome {other:?}"),
         Err(e) => panic!("pristine fixture failed to verify: {e}"),
     }
 
@@ -142,6 +144,7 @@ fn corrupted_sample_fails_verification() {
         Ok(VerifyOutcome::NoSignature) => {
             panic!("corrupted stream unexpectedly reported NoSignature");
         }
+        Ok(other) => panic!("corrupted stream: unexpected outcome {other:?}"),
         Err(_) => {}
     }
 }

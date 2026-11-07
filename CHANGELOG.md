@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FlacMuxerOptions::with_generate_seektable` / `with_seek_point_interval`
+  / `with_max_seek_points` builder setters.
 - Compression levels 0–8 (`FlacEncoderOptions::level(n)`, `compression_level`, `DEFAULT_COMPRESSION_LEVEL` = 5) driving a new estimate-driven encoder search (#12). Candidates are ranked by cheap statistics and only the winners are encoded:
   - stereo layout from per-channel FIXED/LPC estimates;
   - FIXED order from one multi-order magnitude pass;
@@ -23,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `#[non_exhaustive]` on `FlacMuxerOptions`, `DecodedFrame`,
+  `frame::FrameHeader` and on the enums `BlockType`, `MetadataBlock`,
+  `VerifyOutcome`. Left exhaustive (fixed by RFC 9639): the metadata
+  block records `StreamInfo`, `SeekPoint`, `Application`,
+  `VorbisComment`, `CueSheet*`, `Picture`, and the enums
+  `ChannelAssignment`, `BlockingStrategy`, `PictureType`.
+- `#[doc(hidden)]` on the internal modules `bits_ext`, `crc`,
+  `subframe`.
 - **Default encoder output changed**: `make_encoder` / `FlacEncoderOptions::default()` now mean compression level 5 instead of the exhaustive search. Streams stay valid streamable-subset FLAC and decode bit-exactly; use `FlacEncoderOptions::exhaustive()` for the old bytes. `None` for `apodization`, `max_lpc_order`, `lpc_precision_search_span` and `max_partition_order` now means "the level's value"; under `exhaustive_search` it keeps the historical meaning.
 - `FlacEncoderOptions::fast()` is now `level(4)`.
 - Feeding a long recording in one `send_frame` no longer memmoves the remaining input once per block (quadratic in input length): blocks are consumed from a cursor and the queue is compacted once per call.

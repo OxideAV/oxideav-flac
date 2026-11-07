@@ -153,6 +153,7 @@ fn hex16(d: &[u8; 16]) -> String {
 
 /// Outcome of a whole-stream MD5 verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VerifyOutcome {
     /// Recomputed MD5 matched the STREAMINFO signature: decode was lossless.
     Match,

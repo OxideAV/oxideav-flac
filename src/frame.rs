@@ -37,6 +37,7 @@ pub enum BlockingStrategy {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FrameHeader {
     pub blocking_strategy: BlockingStrategy,
     pub block_size: u32,

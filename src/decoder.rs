@@ -110,6 +110,7 @@ fn find_streaminfo(extradata: &[u8]) -> Result<StreamInfo> {
 /// trailing CRC-16). Returned by [`decode_frame_channels`] so callers that
 /// need the raw `i32` sample planes — PCM packing, MD5 verification
 /// (RFC 9639 §9.2.1) — share one decode + CRC path.
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// One `Vec<i32>` per output channel, after stereo decorrelation.
     pub channels: Vec<Vec<i32>>,

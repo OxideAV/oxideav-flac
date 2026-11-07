@@ -763,6 +763,7 @@ impl Demuxer for FlacDemuxer {
 /// invalidate the offsets, which are relative to the first frame, not
 /// the file start.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FlacMuxerOptions {
     /// Generate a SEEKTABLE block at [`Muxer::write_trailer`] time.
     ///
@@ -796,6 +797,24 @@ pub struct FlacMuxerOptions {
     /// interval is widened so the points spread evenly across the whole
     /// stream rather than clustering at the start.
     pub max_seek_points: usize,
+}
+
+impl FlacMuxerOptions {
+    /// Builder-style setter for [`generate_seektable`](Self::generate_seektable).
+    pub fn with_generate_seektable(mut self, generate_seektable: bool) -> Self {
+        self.generate_seektable = generate_seektable;
+        self
+    }
+    /// Builder-style setter for [`seek_point_interval`](Self::seek_point_interval).
+    pub fn with_seek_point_interval(mut self, seek_point_interval: u64) -> Self {
+        self.seek_point_interval = seek_point_interval;
+        self
+    }
+    /// Builder-style setter for [`max_seek_points`](Self::max_seek_points).
+    pub fn with_max_seek_points(mut self, max_seek_points: usize) -> Self {
+        self.max_seek_points = max_seek_points;
+        self
+    }
 }
 
 impl Default for FlacMuxerOptions {

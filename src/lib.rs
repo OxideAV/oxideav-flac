@@ -19,9 +19,11 @@
 //!   for 2-channel input, and writes a full STREAMINFO (including MD5
 //!   signature and frame-size/sample-count bookkeeping) at flush time.
 
+#[doc(hidden)]
 pub mod bits_ext;
 pub mod codec;
 pub mod container;
+#[doc(hidden)]
 pub mod crc;
 pub mod decoder;
 pub mod encoder;
@@ -29,6 +31,7 @@ pub mod frame;
 #[doc(hidden)]
 pub mod md5;
 pub mod metadata;
+#[doc(hidden)]
 pub mod subframe;
 pub mod verify;
 
