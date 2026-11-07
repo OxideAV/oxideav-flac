@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - autocorrelation evaluates four lags per pass (sixteen independent accumulators, same per-lag summation order);
   - order-1..12 LPC residual kernels run in exact 32-bit arithmetic whenever `max|s|·(1+Σ|q|) < 2^31`, and with 32×32→64 products otherwise;
   - FIXED magnitudes and residuals run in 32-bit lanes for depths up to 27 bits;
-  - the Rice planner computes the closed-form parameter without a division and skips the 5-bit method when no partition could use it;
+  - the Rice planner computes the closed-form parameter without a division, scores each partition level from per-level tables over whole-run partition statistics, and skips the 5-bit method when no partition could use it;
   - branchless bit writer for residual codewords;
   - MD5 input built straight from the interleaved block into a reused buffer.
 

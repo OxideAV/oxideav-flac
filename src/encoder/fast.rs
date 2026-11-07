@@ -197,6 +197,15 @@ fn fold(r: i32) -> u32 {
     ((r << 1) ^ (r >> 31)) as u32
 }
 
+/// Sum and bit-OR of the folded residuals of one partition.
+#[inline(always)]
+fn fold_stats(run: &[i32]) -> (u64, u32) {
+    run.iter().fold((0u64, 0u32), |(s, o), &r| {
+        let u = fold(r);
+        (s + u as u64, o | u)
+    })
+}
+
 /// Choose the partitioned-Rice method and partition order for `residual`
 /// (block of `block_size` samples, `order` warm-up samples) from
 /// estimates. Returns `(estimated bits incl. the 6-bit header, method,
@@ -216,19 +225,20 @@ fn plan_partitions(
     fs.sums.resize(n_fin, 0);
     fs.ors.clear();
     fs.ors.resize(n_fin, 0);
-    let mut idx = 0usize;
-    for p in 0..n_fin {
-        let end = (p + 1) * per - order;
-        let mut s = 0u64;
-        let mut o = 0u32;
-        for &r in &residual[idx..end] {
-            let u = fold(r);
-            s += u as u64;
-            o |= u;
+    // Partition 0 is short by the `order` warm-up samples; the rest are
+    // whole `per`-sample runs of the residual.
+    let (first, rest) = residual[..n_fin * per - order].split_at(per - order);
+    (fs.sums[0], fs.ors[0]) = fold_stats(first);
+    let stats = fs.sums[1..].iter_mut().zip(&mut fs.ors[1..]);
+    if per == 16 {
+        // The 4096-sample block at the subset's finest order 8.
+        for ((s, o), run) in stats.zip(rest.as_chunks::<16>().0) {
+            (*s, *o) = fold_stats(run);
         }
-        fs.sums[p] = s;
-        fs.ors[p] = o;
-        idx = end;
+    } else {
+        for ((s, o), run) in stats.zip(rest.chunks_exact(per)) {
+            (*s, *o) = fold_stats(run);
+        }
     }
     // The 5-bit method (parameters up to 30) can only win where some
     // partition wants a parameter above 14. Every partition's closed-form
@@ -257,15 +267,14 @@ fn plan_partitions(
             &[(4, 14)]
         };
         for (m, &(pb, kmax)) in methods.iter().enumerate() {
-            let mut total = 0u64;
-            for p in 0..n_parts {
-                let n = if p == 0 { psize - order as u64 } else { psize };
-                let (rice, _) = rice_estimate(fs.sums[p], n, kmax);
-                let w = escape_width(fs.ors[p]) as u64;
-                let esc = if w <= 31 { 5 + n * w } else { u64::MAX };
-                total += pb + rice.min(esc);
-            }
-            totals[m][level as usize] = total;
+            totals[m][level as usize] = level_estimate(
+                &fs.sums[..n_parts],
+                &fs.ors[..n_parts],
+                psize,
+                order as u64,
+                pb,
+                kmax,
+            );
         }
         if level == 0 {
             break;
@@ -288,6 +297,44 @@ fn plan_partitions(
         }
     }
     (best.0 + 6, best.1, best.2)
+}
+
+/// Estimated size of one partition level: per partition the cheaper of
+/// [`rice_estimate`]'s cost and the escape coding, plus the `pb`-bit
+/// parameter field. Partition 0 holds `psize - order` residuals, the
+/// others `psize`.
+///
+/// Same totals as calling [`rice_estimate`] per partition: the shared
+/// partition length lets the per-parameter terms `n·(k+1)` and
+/// `n·(2^k−1)/2` come from a table, and only the minimum cost over the
+/// candidate parameters matters here (not which one attains it).
+fn level_estimate(sums: &[u64], ors: &[u32], psize: u64, order: u64, pb: u64, kmax: u32) -> u64 {
+    let part = |sum: u64, or: u32, n: u64| -> u64 {
+        let (rice, _) = rice_estimate(sum, n, kmax);
+        let w = escape_width(or) as u64;
+        let esc = if w <= 31 { 5 + n * w } else { u64::MAX };
+        pb + rice.min(esc)
+    };
+    let mut total = part(sums[0], ors[0], psize - order);
+    let n = psize;
+    let mut fixed = [0u64; 32];
+    let mut low = [0u64; 32];
+    for k in 0..=kmax as usize {
+        fixed[k] = n * (k as u64 + 1);
+        low[k] = n * ((1u64 << k) - 1) / 2;
+    }
+    let kmax = kmax as usize;
+    for (&sum, &or) in sums[1..].iter().zip(&ors[1..]) {
+        let k0 = (floor_log2_mean(sum, n) as usize).min(kmax);
+        let cost = |k: usize| fixed[k] + (sum.saturating_sub(low[k]) >> k);
+        let rice = cost(k0.saturating_sub(1))
+            .min(cost(k0))
+            .min(cost((k0 + 1).min(kmax)));
+        let w = escape_width(or) as u64;
+        let esc = if w <= 31 { 5 + n * w } else { u64::MAX };
+        total += pb + rice.min(esc);
+    }
+    total
 }
 
 /// Exact per-partition parameters for the emitted layout: the true cost of
@@ -1370,6 +1417,38 @@ mod tests {
             fixed_residual_narrow(&s, order, &mut a);
             assert!(fixed_residual(&s, order, &mut b));
             assert_eq!(a, b, "order {order}");
+        }
+    }
+
+    #[test]
+    fn level_estimate_matches_per_partition_estimates() {
+        let mut st = 4242u32;
+        for (psize, order) in [(16u64, 0u64), (16, 12), (512, 4), (4096, 1), (1, 0)] {
+            for (pb, kmax) in [(4u64, 14u32), (5, 30)] {
+                let mut sums = Vec::new();
+                let mut ors = Vec::new();
+                for p in 0..64u64 {
+                    st ^= st << 13;
+                    st ^= st >> 17;
+                    st ^= st << 5;
+                    let n = if p == 0 { psize - order } else { psize };
+                    sums.push(n * (st as u64 >> (st % 32)));
+                    ors.push(st >> (st % 29));
+                }
+                let mut want = 0u64;
+                for p in 0..sums.len() {
+                    let n = if p == 0 { psize - order } else { psize };
+                    let (rice, _) = rice_estimate(sums[p], n, kmax);
+                    let w = escape_width(ors[p]) as u64;
+                    let esc = if w <= 31 { 5 + n * w } else { u64::MAX };
+                    want += pb + rice.min(esc);
+                }
+                assert_eq!(
+                    level_estimate(&sums, &ors, psize, order, pb, kmax),
+                    want,
+                    "psize {psize} order {order} kmax {kmax}"
+                );
+            }
         }
     }
 
