@@ -1638,13 +1638,15 @@ impl FlacEncoder {
         Ok(())
     }
 
-    /// Queue the blocks a pool call handed back, in order, stopping at the
-    /// first that failed to code.
+    /// Queue the blocks a pool call handed back, in order. A block that
+    /// failed to code (or verify) is left out and its error returned —
+    /// the first one, if several failed — which is what the serial path
+    /// does: the failing frame is dropped, the stream carries on.
     fn queue_all_done(&mut self, done: &mut Vec<parallel::Done>) -> Result<()> {
         let mut result = Ok(());
         for d in done.drain(..) {
-            if result.is_ok() {
-                result = self.queue_done(d);
+            if let Err(e) = self.queue_done(d) {
+                result = result.and(Err(e));
             }
         }
         result
@@ -1666,8 +1668,8 @@ impl FlacEncoder {
     }
 
     /// Wait for every in-flight block, stop the workers and take the
-    /// digest back. Blocks after a failed one are still waited for (and
-    /// dropped), so the digest stays whole; the first error is returned.
+    /// digest back. Blocks after a failed one are still waited for and
+    /// queued, so the digest stays whole; the first error is returned.
     fn retire_pool(&mut self) -> Result<()> {
         let Some(mut pool) = self.pool.take() else {
             return Ok(());

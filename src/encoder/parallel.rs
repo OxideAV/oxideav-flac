@@ -334,24 +334,16 @@ impl FramePool {
     }
 
     /// Wait for every submitted block, handing each to `sink` in order.
-    /// Blocks after one `sink` rejects are still waited for (and dropped),
-    /// so the digest stays whole; the first error is returned.
+    /// Every block is handed on even after `sink` rejects one, so nothing
+    /// stays in flight; the first error is returned.
     pub(super) fn drain(&mut self, sink: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
-        let mut first_err = None;
-        while self.in_flight > 0 {
-            match self.next_done(true) {
-                Ok(Some(done)) => {
-                    if first_err.is_none()
-                        && let Err(e) = sink(done)
-                    {
-                        first_err = Some(e);
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => return Err(e),
+        let mut result = Ok(());
+        while let Some(done) = self.next_done(true)? {
+            if let Err(e) = sink(done) {
+                result = result.and(Err(e));
             }
         }
-        first_err.map_or(Ok(()), Err)
+        result
     }
 
     /// Stop the workers and return the digest, after hashing whatever is
