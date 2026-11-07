@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CRC-16 runs slice-by-8 (eight table lookups per eight bytes instead of a serial byte chain); tables derived at compile time and cross-checked against `docs/audio/flac/tables/crc16-table-sliced.csv`. Same values, faster frame encode and decode.
 - edition 2024, MSRV 1.95; fuzz harness loads its libavcodec reference through dlsym instead of libloading.
 
+- Faster encoding at every level, byte-identical output (pinned per level by a new test) (#12):
+  - autocorrelation evaluates four lags per pass (sixteen independent accumulators, same per-lag summation order);
+  - order-1..12 LPC residual kernels run in exact 32-bit arithmetic whenever `max|s|·(1+Σ|q|) < 2^31`, and with 32×32→64 products otherwise;
+  - FIXED magnitudes and residuals run in 32-bit lanes for depths up to 27 bits;
+  - the Rice planner computes the closed-form parameter without a division and skips the 5-bit method when no partition could use it;
+  - branchless bit writer for residual codewords;
+  - MD5 input built straight from the interleaved block into a reused buffer.
+
+  3-minute 44.1 kHz stereo: level 5 0.37 s → 0.21 s, level 0 0.15 s → 0.11 s of encoder CPU.
+
 ### Fixed
 
 - Residuals equal to −2³¹ are now rejected in both searches (RFC 9639 §9.2.7.3 requires |residual| < 2³¹); the subframe falls back to another predictor or VERBATIM.

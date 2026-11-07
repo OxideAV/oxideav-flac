@@ -1093,6 +1093,7 @@ pub fn make_encoder_with_options(
         pending: std::collections::VecDeque::new(),
         frame_number: 0,
         md5: Md5::new(),
+        md5_buf: Vec::new(),
         total_samples: 0,
         min_frame_size: u32::MAX,
         max_frame_size: 0,
@@ -1346,6 +1347,8 @@ struct FlacEncoder {
     pending: std::collections::VecDeque<Packet>,
     frame_number: u64,
     md5: Md5,
+    /// Reused byte buffer for the MD5 input of each block.
+    md5_buf: Vec<u8>,
     total_samples: u64,
     min_frame_size: u32,
     max_frame_size: u32,
@@ -1363,6 +1366,38 @@ struct FlacEncoder {
     /// subsequent frames reuse the capacity in place. See
     /// [`SubframeScratch`] for details.
     scratch: SubframeScratch,
+}
+
+/// Feed interleaved PCM into the MD5 digest in FLAC's canonical byte
+/// order (RFC 9639 §8.2): interleaved samples, each stored little-endian
+/// in the sample width rounded up to whole bytes (1 byte for 8 bps, 2 for
+/// 16, 3 for 24, 4 for 32), signed two's complement. `buf` is reused
+/// between calls.
+fn feed_md5(md5: &mut Md5, buf: &mut Vec<u8>, bps: u8, interleaved: &[i32]) {
+    buf.clear();
+    match bps {
+        8 => buf.extend(interleaved.iter().map(|&s| s as u8)),
+        9..=16 => {
+            buf.resize(interleaved.len() * 2, 0);
+            for (o, &s) in buf.as_chunks_mut::<2>().0.iter_mut().zip(interleaved) {
+                *o = (s as i16).to_le_bytes();
+            }
+        }
+        17..=24 => {
+            buf.resize(interleaved.len() * 3, 0);
+            for (o, &s) in buf.as_chunks_mut::<3>().0.iter_mut().zip(interleaved) {
+                let b = s.to_le_bytes();
+                *o = [b[0], b[1], b[2]];
+            }
+        }
+        _ => {
+            buf.resize(interleaved.len() * 4, 0);
+            for (o, &s) in buf.as_chunks_mut::<4>().0.iter_mut().zip(interleaved) {
+                *o = s.to_le_bytes();
+            }
+        }
+    }
+    md5.update(buf);
 }
 
 impl FlacEncoder {
@@ -1456,9 +1491,8 @@ impl FlacEncoder {
                     plane.extend(src.iter().skip(c).step_by(n_ch));
                 }
             }
+            feed_md5(&mut self.md5, &mut self.md5_buf, self.bps, src);
             *start += take * n_ch;
-
-            self.feed_md5(&per_channel, take);
 
             let data = encode_frame(
                 self.frame_number,
@@ -1495,37 +1529,6 @@ impl FlacEncoder {
             self.pending.push_back(pkt);
             self.frame_number += 1;
         }
-    }
-
-    /// Feed this block's PCM into the MD5 digest in FLAC's canonical
-    /// byte order: interleaved samples, each stored little-endian in the
-    /// sample-width-rounded-up-to-byte (1 byte for 8 bps, 2 for 16, 3
-    /// for 24, 4 for 32). 8-bit samples are signed two's complement.
-    fn feed_md5(&mut self, per_channel: &[Vec<i32>], n: usize) {
-        let bytes_per_sample = match self.bps {
-            8 => 1,
-            9..=16 => 2,
-            17..=24 => 3,
-            _ => 4,
-        };
-        let n_ch = per_channel.len();
-        let mut buf = Vec::with_capacity(n * n_ch * bytes_per_sample);
-        for i in 0..n {
-            for c in 0..n_ch {
-                let s = per_channel[c][i];
-                match bytes_per_sample {
-                    1 => buf.push((s & 0xFF) as u8),
-                    2 => buf.extend_from_slice(&(s as i16).to_le_bytes()),
-                    3 => {
-                        buf.push((s & 0xFF) as u8);
-                        buf.push(((s >> 8) & 0xFF) as u8);
-                        buf.push(((s >> 16) & 0xFF) as u8);
-                    }
-                    _ => buf.extend_from_slice(&s.to_le_bytes()),
-                }
-            }
-        }
-        self.md5.update(&buf);
     }
 
     /// Decode `frame` (the freshly-encoded frame bytes) back to PCM and
@@ -5857,6 +5860,7 @@ mod tests {
             pending: std::collections::VecDeque::new(),
             frame_number: 0,
             md5: Md5::new(),
+            md5_buf: Vec::new(),
             total_samples: 0,
             min_frame_size: u32::MAX,
             max_frame_size: 0,

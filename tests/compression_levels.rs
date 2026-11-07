@@ -276,3 +276,70 @@ fn explicit_knobs_override_the_level() {
     let (_, packets, out) = encode(&pcm, &p, welch, 4096);
     assert_eq!(decode(&packets, &out), pcm);
 }
+
+#[test]
+fn level_outputs_are_pinned() {
+    // Frame-byte digests of every level, computed before the encoder's
+    // speed work (#12 follow-up: multi-lag autocorrelation, exact i32 LPC
+    // kernels, single-method partition planning). Those changes are pure
+    // speed; any difference here means the bitstream changed.
+    let cases: [(u16, u32, SampleFormat, &[&str; 9]); 3] = [
+        (2, 44_100, SampleFormat::S16, &PIN_S16),
+        (2, 96_000, SampleFormat::S24, &PIN_S24),
+        (1, 22_050, SampleFormat::U8, &PIN_U8),
+    ];
+    let mut report = String::new();
+    let mut ok = true;
+    for (ch, rate, fmt, pins) in cases {
+        let pcm = if fmt == SampleFormat::S16 {
+            pin_signal(13_000)
+        } else {
+            layout_signal(9_000, ch as usize, fmt)
+        };
+        let p = params(ch, rate, fmt);
+        for level in 0..=8u8 {
+            let bytes = encode(&pcm, &p, FlacEncoderOptions::level(level), 4096).0;
+            let digest: String = oxideav_flac::md5::compute(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            report.push_str(&format!("{fmt:?} level {level}: \"{digest}\"\n"));
+            ok &= digest == pins[level as usize];
+        }
+    }
+    assert!(ok, "level output digests changed:\n{report}");
+}
+
+const PIN_S16: [&str; 9] = [
+    "deb16a3acac86d3cb4a7d53f335ca51c",
+    "deb16a3acac86d3cb4a7d53f335ca51c",
+    "deb16a3acac86d3cb4a7d53f335ca51c",
+    "deb16a3acac86d3cb4a7d53f335ca51c",
+    "84991bdc63aa589e56386278cdada023",
+    "238049e1c46319cfc8c390ce06925cbd",
+    "07dff874d08dd5a6618b47aec92c4bbf",
+    "b43352e8d34775cd567ed9ffd2c14162",
+    "7045646044814e051688c616140b0e24",
+];
+const PIN_S24: [&str; 9] = [
+    "9d9fc9e36155133924063c0d8e0218f7",
+    "9d9fc9e36155133924063c0d8e0218f7",
+    "9d9fc9e36155133924063c0d8e0218f7",
+    "90045db546a15f3ddfb1c0c72711003b",
+    "2d61cfa520fe620cc18b06c72f7dbd27",
+    "3f051b0aa9a2ca7abe3868bfa7b176d7",
+    "21188c3849e2982862c1b84c3bde3a00",
+    "8ab05904996bc66aca5a798bbadeb6be",
+    "8ab05904996bc66aca5a798bbadeb6be",
+];
+const PIN_U8: [&str; 9] = [
+    "19f88818ea49bcb7066b8d68455e0e9f",
+    "19f88818ea49bcb7066b8d68455e0e9f",
+    "19f88818ea49bcb7066b8d68455e0e9f",
+    "413f9f86457f6819504bd285886e62b8",
+    "ddfb11dadafda3eaba60aede6250b32e",
+    "0590c2b1be42da5fd34750d94c56098d",
+    "b8695632c7ce05e69986994b9f1c83e6",
+    "17ca6bf5451a569fc7725502e1e6ad2c",
+    "17ca6bf5451a569fc7725502e1e6ad2c",
+];

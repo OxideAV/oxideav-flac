@@ -153,12 +153,7 @@ fn rice_estimate(sum: u64, n: u64, k_max: u32) -> (u64, u32) {
     if n == 0 {
         return (0, 0);
     }
-    let mean = sum / n;
-    let k0 = if mean == 0 {
-        0
-    } else {
-        (63 - mean.leading_zeros()).min(k_max)
-    };
+    let k0 = floor_log2_mean(sum, n).min(k_max);
     let mut best = (u64::MAX, 0);
     for k in k0.saturating_sub(1)..=(k0 + 1).min(k_max) {
         let shifted = if k == 0 {
@@ -173,6 +168,20 @@ fn rice_estimate(sum: u64, n: u64, k_max: u32) -> (u64, u32) {
         }
     }
     best
+}
+
+/// `floor(log2(floor(sum / n)))`, or 0 when `sum < n`, without a
+/// division: it is the largest `k` with `n·2^k ≤ sum`, which is either the
+/// difference of the two bit lengths or one less.
+#[inline]
+fn floor_log2_mean(sum: u64, n: u64) -> u32 {
+    debug_assert!(n > 0);
+    if sum < n {
+        return 0;
+    }
+    let k = n.leading_zeros() - sum.leading_zeros();
+    // `n << k` has the same bit length as `sum`, so it cannot overflow.
+    if (n << k) <= sum { k } else { k - 1 }
 }
 
 /// Bits per residual sample for an escape partition holding values whose
@@ -221,6 +230,17 @@ fn plan_partitions(
         fs.ors[p] = o;
         idx = end;
     }
+    // The 5-bit method (parameters up to 30) can only win where some
+    // partition wants a parameter above 14. Every partition's closed-form
+    // parameter is floor(log2(mean)), and a merged partition's mean never
+    // exceeds the larger of its halves', so if every finest partition has
+    // mean < 2^13 both methods try the same parameters at every level,
+    // and the 5-bit method then costs exactly one bit more per partition:
+    // it can never win, and its scoring is skipped.
+    let wide = (0..n_fin).any(|p| {
+        let n = if p == 0 { per - order } else { per } as u64;
+        fs.sums[p] >= n << 13
+    });
 
     // Walk from the finest order down, merging pairs in place. Each level
     // is scored under both Rice methods; ties keep the earlier (coarser,
@@ -231,7 +251,12 @@ fn plan_partitions(
     let mut level = finest as i32;
     loop {
         let psize = (block_size >> level) as u64;
-        for (m, (pb, kmax)) in [(4u64, 14u32), (5u64, 30u32)].into_iter().enumerate() {
+        let methods: &[(u64, u32)] = if wide {
+            &[(4, 14), (5, 30)]
+        } else {
+            &[(4, 14)]
+        };
+        for (m, &(pb, kmax)) in methods.iter().enumerate() {
             let mut total = 0u64;
             for p in 0..n_parts {
                 let n = if p == 0 { psize - order as u64 } else { psize };
@@ -347,13 +372,43 @@ fn fixed_magnitudes(s: &[i32]) -> [u64; 5] {
     sums
 }
 
+/// [`fixed_magnitudes`] for samples of at most 27 bits: the order-4
+/// difference is then bounded by `16·2^26 = 2^30`, so every difference is
+/// evaluated exactly in 32-bit lanes, directly from Table 20's polynomials
+/// (no loop-carried state, so the loop vectorises). Same sums.
+fn fixed_magnitudes_narrow(s: &[i32]) -> [u64; 5] {
+    let mut sums = [0u64; 5];
+    if s.len() <= 4 {
+        return sums;
+    }
+    for w in s.windows(5) {
+        let &[x4, x3, x2, x1, x0] = w else {
+            unreachable!("window of 5")
+        };
+        let d1 = x0 - x1;
+        let d2 = d1 - (x1 - x2);
+        let d3 = x0 - 3 * x1 + 3 * x2 - x3;
+        let d4 = x0 - 4 * x1 + 6 * x2 - 4 * x3 + x4;
+        sums[0] += x0.unsigned_abs() as u64;
+        sums[1] += d1.unsigned_abs() as u64;
+        sums[2] += d2.unsigned_abs() as u64;
+        sums[3] += d3.unsigned_abs() as u64;
+        sums[4] += d4.unsigned_abs() as u64;
+    }
+    sums
+}
+
 /// Best fixed order by magnitude and its rough Rice cost estimate.
 fn best_fixed_estimate(s: &[i32], bps: u32) -> (usize, u64) {
     let n = s.len();
     if n <= 4 {
         return (0, n as u64 * bps as u64);
     }
-    let sums = fixed_magnitudes(s);
+    let sums = if bps <= 27 {
+        fixed_magnitudes_narrow(s)
+    } else {
+        fixed_magnitudes(s)
+    };
     let mut best = 0usize;
     for o in 1..5 {
         if sums[o] < sums[best] {
@@ -363,6 +418,38 @@ fn best_fixed_estimate(s: &[i32], bps: u32) -> (usize, u64) {
     let m = (n - 4) as u64;
     let (est, _) = rice_estimate(2 * sums[best], m, 30);
     (best, est * n as u64 / m + best as u64 * bps as u64)
+}
+
+/// [`fixed_residual`] for samples of at most 27 bits: every fixed
+/// residual is then bounded by `16·2^26 = 2^30`, so it is computed exactly
+/// in 32-bit lanes and always inside the §9.2.7.3 range.
+fn fixed_residual_narrow(s: &[i32], order: usize, out: &mut Vec<i32>) {
+    out.clear();
+    out.resize(s.len() - order, 0);
+    let tail = &s[order..];
+    match order {
+        0 => out.copy_from_slice(s),
+        1 => {
+            for ((o, &x0), w) in out.iter_mut().zip(tail).zip(s.windows(1)) {
+                *o = x0 - w[0];
+            }
+        }
+        2 => {
+            for ((o, &x0), w) in out.iter_mut().zip(tail).zip(s.windows(2)) {
+                *o = x0 - 2 * w[1] + w[0];
+            }
+        }
+        3 => {
+            for ((o, &x0), w) in out.iter_mut().zip(tail).zip(s.windows(3)) {
+                *o = x0 - 3 * w[2] + 3 * w[1] - w[0];
+            }
+        }
+        _ => {
+            for ((o, &x0), w) in out.iter_mut().zip(tail).zip(s.windows(4)) {
+                *o = x0 - 4 * w[3] + 6 * w[2] - 4 * w[1] + w[0];
+            }
+        }
+    }
 }
 
 /// Fill `out` with the fixed-order residual; `false` when a residual leaves
@@ -396,11 +483,23 @@ fn fixed_residual(s: &[i32], order: usize, out: &mut Vec<i32>) -> bool {
 /// LPC residual `s[i] - (Σ q[j]·s[i-1-j]) >> shift`; `false` on a residual
 /// outside the §9.2.7.3 range. Orders up to 12 (every subset order at
 /// ≤ 48 kHz) run a fully unrolled kernel.
+///
+/// When `max|s| · (1 + Σ|q|) < 2^31` every partial dot product and every
+/// residual fits an `i32` exactly, so the kernel runs in 32-bit lanes
+/// (and no residual can leave the §9.2.7.3 range); otherwise it
+/// accumulates in 64 bits. Both produce the same residual.
 fn lpc_residual(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> bool {
+    let peak = s.iter().fold(0u32, |m, &x| m.max(x.unsigned_abs())) as u64;
+    let qsum: u64 = q.iter().map(|&c| c.unsigned_abs() as u64).sum();
+    let narrow = peak * (1 + qsum) < 1u64 << 31;
     macro_rules! fixed_n {
         ($($n:literal)*) => {
             match q.len() {
-                $($n => return lpc_residual_n::<$n>(s, q, shift, out),)*
+                $($n => return if narrow {
+                    lpc_residual_n32::<$n>(s, q, shift, out)
+                } else {
+                    lpc_residual_n::<$n>(s, q, shift, out)
+                },)*
                 _ => {}
             }
         };
@@ -409,23 +508,45 @@ fn lpc_residual(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> bool {
     lpc_residual_any(s, q, shift, out)
 }
 
-fn lpc_residual_n<const N: usize>(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> bool {
-    let mut rev = [0i64; N];
+/// Order-`N` kernel in 32-bit arithmetic; the caller guarantees
+/// `max|s| · (1 + Σ|q|) < 2^31`, which bounds every intermediate and the
+/// residual strictly inside `(-2^31, 2^31)`.
+fn lpc_residual_n32<const N: usize>(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> bool {
+    let mut rev = [0i32; N];
     for (j, &c) in q.iter().enumerate() {
-        rev[N - 1 - j] = c as i64;
+        rev[N - 1 - j] = c;
     }
     out.clear();
-    out.reserve(s.len() - N);
+    out.resize(s.len() - N, 0);
+    for (o, (win, &x)) in out.iter_mut().zip(s.windows(N).zip(&s[N..])) {
+        let hist: &[i32; N] = win.try_into().expect("window of N");
+        let mut acc = 0i32;
+        for j in 0..N {
+            acc += rev[j] * hist[j];
+        }
+        *o = x - (acc >> shift);
+    }
+    true
+}
+
+/// Order-`N` kernel with 64-bit accumulation (32×32→64 products).
+fn lpc_residual_n<const N: usize>(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> bool {
+    let mut rev = [0i32; N];
+    for (j, &c) in q.iter().enumerate() {
+        rev[N - 1 - j] = c;
+    }
+    out.clear();
+    out.resize(s.len() - N, 0);
     let mut ok = true;
-    for (i, &x) in s.iter().enumerate().skip(N) {
-        let hist: &[i32; N] = s[i - N..i].try_into().expect("window of N");
+    for (o, (win, &x)) in out.iter_mut().zip(s.windows(N).zip(&s[N..])) {
+        let hist: &[i32; N] = win.try_into().expect("window of N");
         let mut acc = 0i64;
         for j in 0..N {
-            acc += rev[j] * hist[j] as i64;
+            acc += rev[j] as i64 * hist[j] as i64;
         }
         let r = x as i64 - (acc >> shift);
         ok &= r > i32::MIN as i64 && r <= i32::MAX as i64;
-        out.push(r as i32);
+        *o = r as i32;
     }
     ok
 }
@@ -455,6 +576,61 @@ fn lpc_residual_any(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> boo
     ok
 }
 
+/// Autocorrelation `ac[lag] = Σ_i x[i + lag]·x[i]` for every lag in
+/// `0..ac.len()`.
+///
+/// Each lag sums into four interleaved lanes (lane `l` takes the products
+/// at `i ≡ l (mod 4)`, in increasing `i`), then adds a scalar tail: the
+/// independent lanes pipeline instead of serialising every product on one
+/// add chain. Four lags are evaluated per pass over `x`, sharing the loads
+/// of the unshifted operand and giving sixteen independent accumulators;
+/// every lag still performs exactly the same additions in the same order
+/// as a lag-at-a-time loop would, so the result is bit-identical to it.
+fn autocorrelate(x: &[f64], ac: &mut [f64]) {
+    let n = x.len();
+    let lags = ac.len();
+    debug_assert!(lags <= n);
+    // Finish lag `k` from chunk `c0` on: remaining full chunks, then the
+    // tail, onto the lane sums accumulated so far.
+    let finish = |k: usize, c0: usize, mut lanes: [f64; 4]| -> f64 {
+        let len = n - k;
+        let full = len / 4;
+        for c in c0..full {
+            for l in 0..4 {
+                lanes[l] += x[k + 4 * c + l] * x[4 * c + l];
+            }
+        }
+        let mut tail = 0f64;
+        for i in 4 * full..len {
+            tail += x[k + i] * x[i];
+        }
+        (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]) + tail
+    };
+    let mut g = 0;
+    while g + 4 <= lags {
+        // Chunks every lag of the group has in full.
+        let common = (n - (g + 3)) / 4;
+        let mut lanes = [[0f64; 4]; 4];
+        let (head, _) = x[..4 * common].as_chunks::<4>();
+        for (c, b) in head.iter().enumerate() {
+            let at = 4 * c + g;
+            let a: &[f64; 7] = x[at..at + 7].try_into().expect("7 samples");
+            for d in 0..4 {
+                for l in 0..4 {
+                    lanes[d][l] += a[d + l] * b[l];
+                }
+            }
+        }
+        for d in 0..4 {
+            ac[g + d] = finish(g + d, common, lanes[d]);
+        }
+        g += 4;
+    }
+    for k in g..lags {
+        ac[k] = finish(k, 0, [0f64; 4]);
+    }
+}
+
 /// Window + autocorrelate + Levinson-Durbin at every order up to `max`.
 /// Fills `fs.coeffs` (triangular, predictor convention) and `fs.err`;
 /// returns the highest order solved.
@@ -476,29 +652,10 @@ fn lpc_analysis(
         .extend(s.iter().zip(weights).map(|(&x, &w)| x as f64 * w));
     let x = &fs.windowed;
 
-    // Four interleaved partial sums per lag: independent accumulator
-    // lanes pipeline (and vectorise) instead of serialising every product
-    // on one f64 add chain.
     fs.autoc.clear();
     fs.autoc.resize(max + 1, 0.0);
-    let ac = &mut fs.autoc[..];
-    for (lag, out) in ac.iter_mut().enumerate() {
-        let a = &x[lag..];
-        let b = &x[..n - lag];
-        let mut lanes = [0f64; 4];
-        let (ca, ra) = a.as_chunks::<4>();
-        let (cb, rb) = b.as_chunks::<4>();
-        for (qa, qb) in ca.iter().zip(cb) {
-            for l in 0..4 {
-                lanes[l] += qa[l] * qb[l];
-            }
-        }
-        let mut tail = 0f64;
-        for (&p, &q) in ra.iter().zip(rb) {
-            tail += p * q;
-        }
-        *out = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]) + tail;
-    }
+    autocorrelate(x, &mut fs.autoc);
+    let ac = &fs.autoc[..];
     if ac[0].is_nan() || ac[0] <= 0.0 || !ac[0].is_finite() {
         return 0;
     }
@@ -704,7 +861,13 @@ fn search_into(
         None => best_fixed_estimate(&s, bps).0,
     };
     let fixed_order = fixed_order.min(n - 1);
-    if fixed_residual(&s, fixed_order, &mut fs.residual) {
+    let fixed_ok = if bps <= 27 {
+        fixed_residual_narrow(&s, fixed_order, &mut fs.residual);
+        true
+    } else {
+        fixed_residual(&s, fixed_order, &mut fs.residual)
+    };
+    if fixed_ok {
         let res = std::mem::take(&mut fs.residual);
         let (rbits, m, po) = plan_partitions(&res, n, fixed_order, cfg.max_partition_order, fs);
         fs.residual = res;
@@ -917,41 +1080,59 @@ fn mode_slots(mode: u32) -> &'static [usize] {
 
 // --- Bit output -----------------------------------------------------------
 
-/// MSB-first bit writer with a 64-bit accumulator that flushes 32 bits at
-/// a time — the residual writer is the hottest output loop.
+/// MSB-first bit writer. The pending bits sit left-aligned in a 64-bit
+/// accumulator; every write stores the whole accumulator at the current
+/// byte position and advances by the number of completed bytes, so there
+/// is no data-dependent branch per codeword. The bytes past the cursor are
+/// scratch that later stores overwrite; [`Bits::finish`] cuts them off.
 pub(super) struct Bits {
-    pub out: Vec<u8>,
+    out: Vec<u8>,
+    /// Byte position of the first incomplete byte.
+    pos: usize,
+    /// Pending bits, left-aligned (bit 63 is the next bit of the stream).
     acc: u64,
-    /// Valid bits in the low end of `acc` (always < 32 between calls).
+    /// Valid bits in `acc` (always < 8 between calls).
     n: u32,
 }
 
 impl Bits {
     /// Continue after `prefix`, which must be byte-aligned bytes.
     pub fn after(prefix: Vec<u8>) -> Self {
+        let pos = prefix.len();
+        let mut out = prefix;
+        out.resize(pos + 4096, 0);
         Bits {
-            out: prefix,
+            out,
+            pos,
             acc: 0,
             n: 0,
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn put(&mut self, v: u32, bits: u32) {
-        debug_assert!(bits <= 32);
-        if bits == 0 {
-            return;
+        debug_assert!(bits <= 32 && self.n < 8);
+        if self.pos + 8 > self.out.len() {
+            self.grow();
         }
         let v = (v as u64) & ((1u64 << bits) - 1);
-        self.acc = (self.acc << bits) | v;
+        // `n + bits <= 39`, so the shift is at least 25 — except for an
+        // empty write at `n == 0`, where `v` is 0 and the wrapped shift is
+        // harmless.
+        self.acc |= v.wrapping_shl(64 - self.n - bits);
         self.n += bits;
-        if self.n >= 32 {
-            self.n -= 32;
-            // Bits above `n + 32` are stale high bits already emitted; the
-            // `as u32` truncation discards them.
-            self.out
-                .extend_from_slice(&((self.acc >> self.n) as u32).to_be_bytes());
-        }
+        let at = self.pos;
+        self.out[at..at + 8].copy_from_slice(&self.acc.to_be_bytes());
+        let whole = self.n >> 3;
+        self.pos += whole as usize;
+        self.acc = self.acc.wrapping_shl(whole * 8);
+        self.n &= 7;
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let len = (self.out.len() * 2).max(self.pos + 64);
+        self.out.resize(len, 0);
     }
 
     #[inline]
@@ -959,7 +1140,7 @@ impl Bits {
         self.put(v as u32, bits);
     }
 
-    #[inline]
+    #[inline(always)]
     fn put_rice(&mut self, u: u32, k: u32) {
         let q = u >> k;
         if q + 1 + k <= 32 {
@@ -982,12 +1163,10 @@ impl Bits {
 
     /// Zero-pad to a byte boundary and flush; returns the bytes.
     pub fn finish(mut self) -> Vec<u8> {
-        let pad = (8 - self.n % 8) % 8;
-        self.put(0, pad);
-        while self.n >= 8 {
-            self.n -= 8;
-            self.out.push((self.acc >> self.n) as u8);
-        }
+        // The incomplete byte was already stored by the last write, with
+        // zero bits below the valid ones.
+        let end = self.pos + usize::from(self.n > 0);
+        self.out.truncate(end);
         self.out
     }
 }
@@ -1145,6 +1324,131 @@ mod tests {
                 .map(|r| r.unsigned_abs() as u64)
                 .sum();
             assert_eq!(sum, direct, "order {order}");
+        }
+    }
+
+    #[test]
+    fn narrow_fixed_magnitudes_match_the_wide_ones() {
+        let mut st = 0x9E37_79B9u32;
+        for bits in [8u32, 16, 17, 24, 25, 27] {
+            let half = 1i64 << (bits - 1);
+            let s: Vec<i32> = (0..1000)
+                .map(|i| {
+                    st ^= st << 13;
+                    st ^= st >> 17;
+                    st ^= st << 5;
+                    // Alternate full-scale extremes with noise: the worst
+                    // case for the order-4 difference.
+                    if i % 7 < 3 {
+                        if i % 2 == 0 { half - 1 } else { -half }
+                    } else {
+                        (st as i64).rem_euclid(2 * half) - half
+                    }
+                })
+                .map(|v| v as i32)
+                .collect();
+            assert_eq!(
+                fixed_magnitudes_narrow(&s),
+                fixed_magnitudes(&s),
+                "{bits} bits"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_fixed_residual_matches_the_wide_one() {
+        let half = 1i32 << 26;
+        let s: Vec<i32> = (0..600)
+            .map(|i| match i % 5 {
+                0 | 2 => half - 1,
+                1 | 3 => -half,
+                _ => (i * 7919) % half - half / 2,
+            })
+            .collect();
+        for order in 0..=4 {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            fixed_residual_narrow(&s, order, &mut a);
+            assert!(fixed_residual(&s, order, &mut b));
+            assert_eq!(a, b, "order {order}");
+        }
+    }
+
+    #[test]
+    fn floor_log2_mean_matches_division() {
+        let mut st = 12345u32;
+        for _ in 0..20_000 {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            let n = 1 + (st % 5000) as u64;
+            let sum = ((st as u64) << (st % 29)) ^ (st as u64 >> 3);
+            let mean = sum / n;
+            let want = if mean == 0 {
+                0
+            } else {
+                63 - mean.leading_zeros()
+            };
+            assert_eq!(floor_log2_mean(sum, n), want, "sum {sum} n {n}");
+        }
+        for n in 1..300u64 {
+            for sum in 0..2000u64 {
+                let mean = sum / n;
+                let want = if mean == 0 {
+                    0
+                } else {
+                    63 - mean.leading_zeros()
+                };
+                assert_eq!(floor_log2_mean(sum, n), want);
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_lpc_kernel_matches_the_wide_one() {
+        let mut st = 777u32;
+        let s: Vec<i32> = (0..2000)
+            .map(|_| {
+                st ^= st << 13;
+                st ^= st >> 17;
+                st ^= st << 5;
+                (st as i32) >> 16
+            })
+            .collect();
+        let q = [1200, -900, 700, -500, 300, -100, 50, -25];
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        assert!(lpc_residual_n32::<8>(&s, &q, 10, &mut a));
+        assert!(lpc_residual_n::<8>(&s, &q, 10, &mut b));
+        assert_eq!(a, b);
+        assert!(lpc_residual(&s, &q, 10, &mut a));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn autocorrelation_matches_lag_at_a_time() {
+        let x: Vec<f64> = (0..1037)
+            .map(|i| ((i * 7919) % 211) as f64 - 105.3)
+            .collect();
+        for lags in [1usize, 3, 4, 5, 8, 13, 33] {
+            let mut ac = vec![0f64; lags];
+            autocorrelate(&x, &mut ac);
+            for (lag, &v) in ac.iter().enumerate() {
+                let a = &x[lag..];
+                let b = &x[..x.len() - lag];
+                let mut lanes = [0f64; 4];
+                let (ca, ra) = a.as_chunks::<4>();
+                let (cb, rb) = b.as_chunks::<4>();
+                for (qa, qb) in ca.iter().zip(cb) {
+                    for l in 0..4 {
+                        lanes[l] += qa[l] * qb[l];
+                    }
+                }
+                let mut tail = 0f64;
+                for (&p, &q) in ra.iter().zip(rb) {
+                    tail += p * q;
+                }
+                let want = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]) + tail;
+                assert_eq!(v.to_bits(), want.to_bits(), "lag {lag} of {lags}");
+            }
         }
     }
 
