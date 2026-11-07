@@ -31,8 +31,8 @@
 
 use oxideav_core::Encoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat,
-    TimeBase,
+    AudioFrame, CodecId, CodecOptionsStruct, CodecParameters, Error, Frame, MediaType, OptionField,
+    OptionKind, OptionValue, Packet, Result, SampleFormat, TimeBase, parse_options,
 };
 
 use crate::bits_ext::BitWriterExt;
@@ -287,12 +287,12 @@ pub struct FlacEncoderOptions {
     /// | 4 | FIXED + LPC | ≤ 8 | 1 | estimated |
     /// | 5 (default) | FIXED + LPC | ≤ 12 | 1 | estimated |
     /// | 6 | FIXED + LPC | ≤ 12 | 2 | estimated |
-    /// | 7 | FIXED + LPC, 2 precisions | ≤ 12 | 3 | estimated |
-    /// | 8 | FIXED + LPC, 2 precisions | ≤ 12 | 4 | all four searched |
+    /// | 7 | FIXED + LPC, 2 precisions | ≤ 12 | 2 | estimated |
+    /// | 8 | FIXED + LPC, 2 precisions | ≤ 12 | 3 | all four searched |
     ///
     /// Levels 0–2 differ in the partition-order ceiling (3, 4, 6); 3 and
     /// up use the subset ceiling of 8. Higher levels also code more of the
-    /// best-estimated LPC orders per window (1, 1, 2, 2, 3, 3 for 3–8).
+    /// best-estimated LPC orders per window (1, 1, 2, 2, 2, 2 for 3–8).
     ///
     /// Ignored when [`exhaustive_search`](Self::exhaustive_search) is set.
     pub compression_level: Option<u8>,
@@ -300,8 +300,8 @@ pub struct FlacEncoderOptions {
     /// Score every candidate predictor by its exact encoded size instead of
     /// by estimate — the encoder's historical search (every window × every
     /// LPC order × every precision × all four stereo layouts). It is
-    /// typically 0.2–1 % smaller than level 8 at roughly 100× level 8's
-    /// encode time (several hundred times level 5's), so it is meant for
+    /// typically 0.2–1 % smaller than level 8 at roughly 300× level 8's
+    /// encode time (about 1× real time on 44.1 kHz stereo), so it is meant for
     /// archival one-offs and for tests of the search's monotonicity, not
     /// for interactive use.
     ///
@@ -309,6 +309,62 @@ pub struct FlacEncoderOptions {
     /// windows, LPC order 12, precision span 4, partition order 8), and
     /// `compression_level` is ignored. See [`FlacEncoderOptions::exhaustive`].
     pub exhaustive_search: bool,
+}
+
+/// Registry options (`CodecParameters::options`), so callers that only
+/// hold a codec id — the registry, pipelines, command-line tools — can pick
+/// a compression level and the other common knobs.
+impl CodecOptionsStruct for FlacEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "compression_level",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(DEFAULT_COMPRESSION_LEVEL as u32),
+            help: "compression level 0 (fastest) ..= 8 (smallest); larger values clamp to 8",
+        },
+        OptionField {
+            name: "exhaustive",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "exact-cost search over every candidate (very slow; archival use)",
+        },
+        OptionField {
+            name: "verify",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "decode every encoded frame and compare it with the input",
+        },
+        OptionField {
+            name: "block_size",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(DEFAULT_BLOCK_SIZE),
+            help: "samples per frame, 16..=65535 (streamable subset: <= 4608 at <= 48 kHz)",
+        },
+        OptionField {
+            name: "padding",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "bytes of PADDING to reserve after STREAMINFO (0 = none)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        match key {
+            "compression_level" => {
+                let level = value.as_u32()?.min(MAX_COMPRESSION_LEVEL as u32) as u8;
+                self.compression_level = Some(level);
+            }
+            "exhaustive" => self.exhaustive_search = value.as_bool()?,
+            "verify" => self.verify = value.as_bool()?,
+            "block_size" => self.block_size = Some(value.as_u32()?),
+            "padding" => {
+                let n = value.as_u32()? as usize;
+                self.padding_bytes = (n > 0).then_some(n);
+            }
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
 }
 
 /// The compression level used when
@@ -965,14 +1021,20 @@ fn lpc_precision_for(block_len: usize) -> u32 {
     precision.clamp(MIN_LPC_QLP_PRECISION, MAX_LPC_QLP_PRECISION)
 }
 
+/// Build an encoder for `params`. Options come from `params.options`
+/// (keys in [`FlacEncoderOptions`]'s [`CodecOptionsStruct::SCHEMA`]:
+/// `compression_level`, `exhaustive`, `verify`, `block_size`, `padding`);
+/// an empty bag means the defaults (compression level 5). Unknown keys
+/// and malformed values are rejected.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    make_encoder_with_options(params, FlacEncoderOptions::default())
+    let options: FlacEncoderOptions = parse_options(&params.options)?;
+    make_encoder_with_options(params, options)
 }
 
-/// Same as [`make_encoder`] but accepts a [`FlacEncoderOptions`] for
-/// caller-tunable knobs (padding reservation, LPC-order / partition-order
-/// ceilings, apodization window set, per-frame block size). `make_encoder`
-/// is a thin wrapper that passes `FlacEncoderOptions::default()` through.
+/// Same as [`make_encoder`] but takes a [`FlacEncoderOptions`] directly,
+/// for every caller-tunable knob (padding reservation, LPC-order /
+/// partition-order ceilings, apodization window set, per-frame block
+/// size, …). `params.options` is not consulted.
 pub fn make_encoder_with_options(
     params: &CodecParameters,
     options: FlacEncoderOptions,

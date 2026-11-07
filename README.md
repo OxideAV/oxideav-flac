@@ -116,44 +116,52 @@ let _enc = make_encoder_with_options(&params, FlacEncoderOptions::level(8))?;
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-Measured on a 3-minute 44.1 kHz 16-bit stereo test signal (tone sweeps,
-tremolo, echoes and gated noise bursts; `examples/encode_wav.rs`,
-`--release`, Apple Silicon, single thread, CPU time including WAV
-parsing, min of 3 runs), next to the `flac` 1.5 command-line encoder and
-ffmpeg's FLAC encoder run as black boxes on the same file:
+Registry callers (anything that only holds the codec id, such as a
+pipeline or a command-line tool) pick the same presets through
+`CodecParameters::options`: `compression_level` (0–8), `exhaustive`,
+`verify`, `block_size` and `padding`. For example,
+`params.options.insert("compression_level", "8")` before `make_encoder`.
+Unknown keys are rejected.
 
-| encoder | CPU time | file size | vs. `flac -5` |
-|---|---:|---:|---:|
-| level 0 | 0.17 s | 19.89 MB | +24.2 % |
-| level 2 | 0.16 s | 19.88 MB | +24.1 % |
-| level 3 | 0.29 s | 16.44 MB | +2.6 % |
-| level 4 (`fast()`) | 0.32 s | 16.02 MB | +0.03 % |
-| **level 5 (default)** | **0.41 s** | **15.57 MB** | **−2.8 %** |
-| level 6 | 0.59 s | 15.57 MB | −2.8 % |
-| level 7 | 0.75 s | 15.56 MB | −2.8 % |
-| level 8 | 1.75 s | 15.54 MB | −3.0 % |
-| `flac -0` | 0.13 s | 20.42 MB | +27.4 % |
-| `flac -5` | 0.21 s | 16.02 MB | — |
-| `flac -8` | 0.47 s | 15.50 MB | −3.3 % |
-| `ffmpeg -compression_level 5` | 0.33 s | 16.26 MB | +1.5 % |
-| `ffmpeg -compression_level 8` | 0.49 s | 15.85 MB | −1.1 % |
+Measured on two 24-minute 44.1 kHz 16-bit stereo recordings (solo
+piano; distorted rock), with `examples/encode_wav.rs` built with
+`--release` on Apple Silicon. Times are single-thread CPU seconds for
+the whole process, WAV parsing included (best of 2). The `flac` 1.5
+command-line encoder was run as a black box on the same files. "×RT" is
+audio duration divided by CPU time; sizes are relative to `flac -5` on
+the same file.
 
-On a steady two-tone signal level 5 came out 9.6 % smaller than
-`flac -5`, and on pink/brown-noise-heavy content 0.15 % smaller, at
-1.7–1.9× its CPU time.
+| encoder | piano CPU | piano ×RT | piano size | rock CPU | rock ×RT | rock size |
+|---|---:|---:|---:|---:|---:|---:|
+| level 0 | 0.98 s | 1470× | +23.3 % | 0.97 s | 1480× | +6.1 % |
+| level 2 | 0.97 s | 1480× | +23.3 % | 1.01 s | 1430× | +6.0 % |
+| level 3 | 1.39 s | 1040× | +3.2 % | 1.54 s | 940× | +0.2 % |
+| level 4 (`fast()`) | 1.32 s | 1090× | +0.1 % | 1.40 s | 1030× | +0.02 % |
+| **level 5 (default)** | **1.52 s** | **950×** | **−1.2 %** | **1.61 s** | **890×** | **−0.1 %** |
+| level 6 | 1.89 s | 760× | −1.2 % | 2.01 s | 720× | −0.1 % |
+| level 7 | 2.33 s | 620× | −1.3 % | 2.40 s | 600× | −0.1 % |
+| level 8 | 4.69 s | 310× | −1.5 % | 4.97 s | 290× | −0.2 % |
+| `flac -0` | 0.90 s | 1600× | +24.2 % | 1.00 s | 1440× | +8.7 % |
+| `flac -5` | 1.57 s | 920× | — | 1.74 s | 830× | — |
+| `flac -8` | 3.43 s | 420× | −1.5 % | 3.45 s | 420× | −0.4 % |
+
+Level 5 matches `flac -5` in speed and comes out slightly smaller.
+Level 8 is about 1.4× the time of `flac -8` at a similar size.
+`FlacEncoderOptions::exhaustive()` (the default before compression
+levels existed) runs at about 1× real time.
 
 - **Level 5** is the right choice almost everywhere.
 - **Levels 0–2** use only the fixed predictors. Pick them when CPU
-  matters more than about 25 % of file size, such as live capture on
+  matters more than 6–25 % of file size, such as live capture on
   small devices.
 - **Levels 3–4** add a single, shorter linear predictor. They are about
-  25 % faster than level 5.
+  10–15 % faster than level 5.
 - **Levels 6–8** search more analysis windows, coefficient precisions
   and (at 8) all four stereo layouts in full. They gain a few tenths of
   a percent on real program material, and more on synthetic pure tones.
 - **`FlacEncoderOptions::exhaustive()`** is the encoder's historical
   exact-cost search. It writes out every candidate and keeps the
-  smallest: typically 0.2–1 % below level 8, at roughly 100× its time.
+  smallest: typically 0.2–1 % below level 8, at roughly 300× its time.
   It is meant for archival one-offs.
 
 Individual axes can be overridden on top of any level:

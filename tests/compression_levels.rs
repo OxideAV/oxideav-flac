@@ -343,3 +343,64 @@ const PIN_U8: [&str; 9] = [
     "17ca6bf5451a569fc7725502e1e6ad2c",
     "17ca6bf5451a569fc7725502e1e6ad2c",
 ];
+
+#[test]
+fn registry_options_select_the_level() {
+    // `CodecParameters::options` reaches the encoder through `make_encoder`
+    // (the registry factory): a level picked by key matches the typed
+    // builder byte for byte.
+    let pcm = pin_signal(12_000);
+    let base = params(2, 44_100, SampleFormat::S16);
+    let via_options = |opts: &[(&str, &str)]| {
+        let mut p = base.clone();
+        for &(k, v) in opts {
+            p.options.insert(k, v);
+        }
+        let mut enc = oxideav_flac::encoder::make_encoder(&p)?;
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (pcm.len() / 4) as u32,
+            pts: None,
+            data: vec![pcm.clone()],
+        }))?;
+        enc.flush()?;
+        let mut out = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            out.extend_from_slice(&pkt.data);
+        }
+        Ok::<_, Error>((out, enc.output_params().clone()))
+    };
+    let typed = |o: FlacEncoderOptions| encode(&pcm, &base, o, usize::MAX).0;
+    for level in [0u8, 3, 5, 8] {
+        let (bytes, _) = via_options(&[("compression_level", &level.to_string())]).unwrap();
+        assert_eq!(
+            bytes,
+            typed(FlacEncoderOptions::level(level)),
+            "level {level}"
+        );
+    }
+    assert_eq!(
+        via_options(&[]).unwrap().0,
+        typed(FlacEncoderOptions::default())
+    );
+    assert_eq!(
+        via_options(&[("compression_level", "42")]).unwrap().0,
+        typed(FlacEncoderOptions::level(8))
+    );
+    assert_eq!(
+        via_options(&[("block_size", "1152"), ("verify", "true")])
+            .unwrap()
+            .0,
+        typed(FlacEncoderOptions::default().with_block_size(1152))
+    );
+    // PADDING lands in the STREAMINFO chain carried as extradata.
+    let plain = via_options(&[]).unwrap().1.extradata.len();
+    let padded = via_options(&[("padding", "100")])
+        .unwrap()
+        .1
+        .extradata
+        .len();
+    assert_eq!(padded, plain + 4 + 100);
+    // Strict parsing: unknown keys and malformed values are errors.
+    assert!(via_options(&[("level", "5")]).is_err());
+    assert!(via_options(&[("compression_level", "fast")]).is_err());
+}

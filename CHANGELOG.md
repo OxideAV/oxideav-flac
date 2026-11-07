@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/encode_wav.rs`: a complete WAV → FLAC converter through the public API (chunked `send_frame`, `flush`, draining, muxing with the final STREAMINFO, level and knob flags), plus a README section on choosing a compression level with measured speed/size against `flac` and ffmpeg (#12).
 - `FlacEncoderOptions::lpc_precision_search_span` and `FlacEncoderOptions::max_partition_order` — the two remaining search-narrowing knobs (coefficient-precision sweep width, partition-order ceiling); `None` keeps the level's value (#13, follow-up to #12).
 
+- Registry encoder options (#12): `FlacEncoderOptions` implements `CodecOptionsStruct`, and `make_encoder` (the registry factory) reads `CodecParameters::options` — `compression_level`, `exhaustive`, `verify`, `block_size`, `padding` — so callers holding only the codec id can choose a level. The schema is registered (`encoder_options_schema`). Unknown keys are rejected.
+
 ### Changed
 
 - `#[non_exhaustive]` on `FlacMuxerOptions`, `DecodedFrame`,
@@ -47,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - branchless bit writer for residual codewords;
   - MD5 input built straight from the interleaved block into a reused buffer.
 
-  3-minute 44.1 kHz stereo: level 5 0.37 s → 0.21 s, level 0 0.15 s → 0.11 s of encoder CPU.
+  24 minutes of 44.1 kHz stereo (piano / rock), whole-process CPU: level 0 1.20 → 0.98 s, level 5 2.95 → 1.52 s (≈ 950× real time, on par with `flac -5`), level 8 12.8 → 4.7 s. README table updated with per-level real-time factors and sizes against `flac`.
 
 ### Fixed
 

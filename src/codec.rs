@@ -27,6 +27,7 @@ pub fn register(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder)
             .encoder(make_encoder)
+            .encoder_options::<super::encoder::FlacEncoderOptions>()
             .tag(CodecTag::wave_format(0xF1AC))
             .payload_magic(b"\x7fFLAC")
             .payload_magic(b"fLaC"),
@@ -119,6 +120,25 @@ mod tests {
             .resolve_payload_magic(&ogg_flac_first_packet_head())
             .expect("dyn resolver must resolve the Ogg-FLAC first packet");
         assert_eq!(id.as_str(), crate::CODEC_ID_STR);
+    }
+
+    #[test]
+    fn encoder_options_schema_is_registered() {
+        let reg = registry();
+        let schema = reg
+            .encoder_options_schema(&CodecId::new(crate::CODEC_ID_STR))
+            .expect("FLAC encoder declares its options");
+        let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
+        assert_eq!(
+            names,
+            [
+                "compression_level",
+                "exhaustive",
+                "verify",
+                "block_size",
+                "padding"
+            ]
+        );
     }
 
     #[test]
