@@ -164,6 +164,55 @@ levels existed) runs at about 1× real time.
   smallest: typically 0.2–1 % below level 8, at roughly 300× its time.
   It is meant for archival one-offs.
 
+### Multithreaded encoding
+
+FLAC frames are independent of each other, so the encoder can code
+them on several threads. Give it a budget either way:
+
+```rust,ignore
+// Direct construction: the options carry the budget.
+let enc = make_encoder_with_options(&params, FlacEncoderOptions::level(5).with_threads(4))?;
+
+// Registry path (`make_encoder`): the execution context carries it.
+let mut enc = make_encoder(&params)?;
+enc.set_execution_context(&ExecutionContext::with_threads(4));
+```
+
+The output is byte-identical for every thread count. With no context
+or a budget of 1, the encoder runs the serial path and starts no
+threads. With `n > 1`, `n` workers each code whole frames, and at most
+`2 × n` blocks are in flight, so memory stays bounded. The calling
+thread cuts the blocks and keeps the STREAMINFO statistics. The MD5,
+which is one sequential digest, is fed in frame order by whichever
+thread is free. Packets come out in stream order as frames complete,
+and `flush` waits for the rest.
+
+Measured on the same two 24-minute recordings with `encode_wav
+--threads N` (release, Apple Silicon, 6 performance + 12 efficiency
+cores). Times are wall-clock seconds for the encode loop, best of 3.
+
+| level | threads | piano wall | piano ×RT | rock wall | rock ×RT |
+|---|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.97 s | 1480× | 0.98 s | 1460× |
+| 0 | 2 | 0.45 s | 3220× | 0.44 s | 3250× |
+| 0 | 4 | 0.39 s | 3650× | 0.40 s | 3640× |
+| 0 | 8 | 0.36 s | 4020× | 0.36 s | 3980× |
+| **5** | 1 | 1.54 s | 930× | 1.59 s | 910× |
+| **5** | 2 | 0.60 s | 2400× | 0.62 s | 2330× |
+| **5** | 4 | 0.42 s | 3410× | 0.41 s | 3520× |
+| **5** | 8 | 0.39 s | 3700× | 0.39 s | 3680× |
+| 8 | 1 | 4.70 s | 310× | 4.83 s | 300× |
+| 8 | 2 | 2.19 s | 660× | 2.26 s | 640× |
+| 8 | 4 | 1.16 s | 1240× | 1.20 s | 1210× |
+| 8 | 8 | 0.70 s | 2060× | 0.71 s | 2020× |
+
+Two threads already more than double the speed, because the calling
+thread's share of the work (cutting blocks, part of the MD5) runs
+alongside the workers. From 4 threads up, levels 0–5 approach the
+limit set by the MD5. The digest covers all 254 MB of PCM in order and
+takes about 0.36 s on its own here, which caps encoding near 4000× real
+time. Level 8 keeps scaling, since its frame search dominates.
+
 Individual axes can be overridden on top of any level:
 `with_max_lpc_order`, `with_apodization`,
 `with_lpc_precision_search_span`, `with_max_partition_order`,

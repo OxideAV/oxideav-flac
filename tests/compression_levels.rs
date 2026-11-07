@@ -404,3 +404,226 @@ fn registry_options_select_the_level() {
     assert!(via_options(&[("level", "5")]).is_err());
     assert!(via_options(&[("compression_level", "fast")]).is_err());
 }
+
+// --- Frame-parallel encoding ----------------------------------------------
+
+/// Thread counts the parallel encoder is pinned at.
+const THREAD_COUNTS: [usize; 4] = [1, 2, 4, 8];
+
+/// Everything an encode run exposes: frame bytes per packet, packet
+/// `(pts, duration)`, and the final STREAMINFO chain.
+type EncodeRun = (Vec<Vec<u8>>, Vec<(Option<i64>, Option<i64>)>, Vec<u8>);
+
+fn encode_full(
+    pcm: &[u8],
+    p: &CodecParameters,
+    opts: FlacEncoderOptions,
+    chunk: usize,
+) -> EncodeRun {
+    let fmt = p.sample_format.unwrap();
+    let frame_bytes = fmt.bytes_per_sample() * p.channels.unwrap() as usize;
+    let mut enc = make_encoder_with_options(p, opts).expect("encoder");
+    let mut packets = Vec::new();
+    let mut timing = Vec::new();
+    let step = chunk.saturating_mul(frame_bytes).max(frame_bytes);
+    let mut drain = |enc: &mut Box<dyn oxideav_core::Encoder>| {
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => {
+                    timing.push((pkt.pts, pkt.duration));
+                    packets.push(pkt.data);
+                }
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("encoder error: {e:?}"),
+            }
+        }
+    };
+    for piece in pcm.chunks(step) {
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (piece.len() / frame_bytes) as u32,
+            pts: None,
+            data: vec![piece.to_vec()],
+        }))
+        .expect("send_frame");
+        drain(&mut enc);
+    }
+    enc.flush().expect("flush");
+    drain(&mut enc);
+    let extradata = enc.output_params().extradata.clone();
+    (packets, timing, extradata)
+}
+
+#[test]
+fn every_level_is_byte_identical_at_every_thread_count() {
+    // Small blocks so each run spans many frames (more than the 16-block
+    // in-flight window of 8 threads), plus a short tail frame.
+    let cases = [
+        (2u16, 44_100u32, SampleFormat::S16),
+        (1, 22_050, SampleFormat::U8),
+        (2, 96_000, SampleFormat::S24),
+        (2, 48_000, SampleFormat::S32),
+        (6, 48_000, SampleFormat::S16),
+    ];
+    for (ch, rate, fmt) in cases {
+        let pcm = if fmt == SampleFormat::S16 && ch == 2 {
+            pin_signal(40_000)
+        } else {
+            layout_signal(20_000, ch as usize, fmt)
+        };
+        let p = params(ch, rate, fmt);
+        for level in 0..=8u8 {
+            let opts = || FlacEncoderOptions::level(level).with_block_size(1024);
+            let serial = encode_full(&pcm, &p, opts(), usize::MAX);
+            for threads in THREAD_COUNTS {
+                for chunk in [usize::MAX, 4096, 777] {
+                    let got = encode_full(&pcm, &p, opts().with_threads(threads), chunk);
+                    assert!(
+                        got == serial,
+                        "{ch} ch {fmt:?} level {level}: {threads} threads, chunk {chunk} \
+                         differs from the serial encoder"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exhaustive_and_verify_are_byte_identical_at_every_thread_count() {
+    let pcm = pin_signal(13_000);
+    let p = params(2, 44_100, SampleFormat::S16);
+    let opts = [
+        FlacEncoderOptions::exhaustive().with_block_size(2048),
+        FlacEncoderOptions::verifying().with_block_size(1024),
+        FlacEncoderOptions::level(8)
+            .with_verify(true)
+            .with_padding_bytes(64),
+    ];
+    for o in opts {
+        let serial = encode_full(&pcm, &p, o.clone(), 4096);
+        for threads in THREAD_COUNTS {
+            assert!(
+                encode_full(&pcm, &p, o.clone().with_threads(threads), 4096) == serial,
+                "{threads} threads differ for {o:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn execution_context_sets_the_registry_encoders_threads() {
+    // The registry factory has no typed options; the thread budget comes
+    // from the execution context, and the bytes match the serial encoder.
+    let pcm = pin_signal(30_000);
+    let p = params(2, 44_100, SampleFormat::S16);
+    let run = |ctx: Option<oxideav_core::ExecutionContext>| {
+        let mut enc = oxideav_flac::encoder::make_encoder(&p).unwrap();
+        if let Some(ctx) = ctx {
+            enc.set_execution_context(&ctx);
+        }
+        let mut out = Vec::new();
+        for piece in pcm.chunks(1024 * 4) {
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: (piece.len() / 4) as u32,
+                pts: None,
+                data: vec![piece.to_vec()],
+            }))
+            .unwrap();
+            while let Ok(pkt) = enc.receive_packet() {
+                out.push(pkt.data);
+            }
+        }
+        enc.flush().unwrap();
+        while let Ok(pkt) = enc.receive_packet() {
+            out.push(pkt.data);
+        }
+        (out, enc.output_params().extradata.clone())
+    };
+    let serial = run(None);
+    for threads in THREAD_COUNTS {
+        assert!(
+            run(Some(oxideav_core::ExecutionContext::with_threads(threads))) == serial,
+            "{threads} threads"
+        );
+    }
+}
+
+#[test]
+fn thread_budget_can_change_mid_stream() {
+    // Frames already with the workers finish before the new budget codes
+    // the next block, so the stream stays in order and byte-identical.
+    let pcm = pin_signal(60_000);
+    let p = params(2, 44_100, SampleFormat::S16);
+    let serial = encode_full(
+        &pcm,
+        &p,
+        FlacEncoderOptions::new().with_block_size(1024),
+        3000,
+    );
+    let mut enc = make_encoder_with_options(
+        &p,
+        FlacEncoderOptions::new()
+            .with_block_size(1024)
+            .with_threads(4),
+    )
+    .unwrap();
+    let mut packets = Vec::new();
+    for (i, piece) in pcm.chunks(3000 * 4).enumerate() {
+        let budget = [4usize, 1, 3, 8, 2][i % 5];
+        enc.set_execution_context(&oxideav_core::ExecutionContext::with_threads(budget));
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (piece.len() / 4) as u32,
+            pts: None,
+            data: vec![piece.to_vec()],
+        }))
+        .unwrap();
+        while let Ok(pkt) = enc.receive_packet() {
+            packets.push(pkt.data);
+        }
+    }
+    enc.flush().unwrap();
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt.data);
+    }
+    assert!(packets == serial.0, "packets differ");
+    assert_eq!(enc.output_params().extradata, serial.2);
+}
+
+#[test]
+fn parallel_encoder_keeps_a_bounded_window_in_flight() {
+    // One huge send_frame: the encoder may hold at most 2 × threads blocks
+    // with the workers, so every other frame is already queued as a packet
+    // when send_frame returns.
+    let threads = 4;
+    let block = 1024;
+    let blocks = 100;
+    let pcm = pin_signal(block * blocks);
+    let p = params(2, 44_100, SampleFormat::S16);
+    let mut enc = make_encoder_with_options(
+        &p,
+        FlacEncoderOptions::new()
+            .with_block_size(block as u32)
+            .with_threads(threads),
+    )
+    .unwrap();
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: (block * blocks) as u32,
+        pts: None,
+        data: vec![pcm],
+    }))
+    .unwrap();
+    let mut early = 0;
+    while enc.receive_packet().is_ok() {
+        early += 1;
+    }
+    assert!(
+        early >= blocks - 2 * threads,
+        "only {early} of {blocks} frames out before flush"
+    );
+    enc.flush().unwrap();
+    let mut late = 0;
+    while enc.receive_packet().is_ok() {
+        late += 1;
+    }
+    assert_eq!(early + late, blocks);
+}

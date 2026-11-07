@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Registry encoder options (#12): `FlacEncoderOptions` implements `CodecOptionsStruct`, and `make_encoder` (the registry factory) reads `CodecParameters::options` — `compression_level`, `exhaustive`, `verify`, `block_size`, `padding` — so callers holding only the codec id can choose a level. The schema is registered (`encoder_options_schema`). Unknown keys are rejected.
 
+- Multithreaded encoding. `FlacEncoderOptions::threads` / `with_threads(n)` set the worker budget for direct construction. `Encoder::set_execution_context` sets it on the registry path, and replaces an options value once called. FLAC frames are independent, so with `n > 1` workers code whole frames, each with its own search scratch, and the coded frames come back in stream order. At most `2 × n` blocks are in flight, so memory is bounded. The STREAMINFO MD5 is fed in frame order by whichever thread is free, and the frame-size and sample statistics are kept on the calling thread, so STREAMINFO matches the serial encoder. Output is byte-identical at every thread count, pinned for 1, 2, 4 and 8 threads at levels 0–8, under the exhaustive search and with verify. A budget of 1, or no context, keeps the serial path and starts no threads. The budget may change mid-stream: frames already with the workers finish first. On a 24-minute 44.1 kHz stereo file, level 5 goes from 910–930× real time (1 thread) to 2330–2400× (2) and 3700× (8); level 8 goes from 300× to 2020–2060× (8). `examples/encode_wav.rs` gained `--threads N`.
+
 ### Changed
 
 - `#[non_exhaustive]` on `FlacMuxerOptions`, `DecodedFrame`,

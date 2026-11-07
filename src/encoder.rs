@@ -43,6 +43,7 @@ use crate::metadata::{BlockHeader, BlockType, StreamInfo, write_padding};
 use oxideav_core::bits::BitWriter;
 
 mod fast;
+mod parallel;
 
 /// Caller-supplied tuning knobs for [`make_encoder_with_options`]. The
 /// default ([`FlacEncoderOptions::new`] / `Default`) is compression level
@@ -207,8 +208,8 @@ pub struct FlacEncoderOptions {
     /// original block sample-for-sample. On any mismatch — or if the
     /// round-tripped frame fails to decode at all (e.g. a corrupt
     /// frame-header / CRC the encoder somehow emitted) —
-    /// [`Encoder::send_frame`](oxideav_core::Encoder::send_frame) /
-    /// [`Encoder::flush`](oxideav_core::Encoder::flush) returns
+    /// [`Encoder::send_frame`] /
+    /// [`Encoder::flush`] returns
     /// `Error::InvalidData` naming the first offending `(channel, sample)`,
     /// and the offending frame is *not* queued for `receive_packet`, so a
     /// caller that propagates the error never writes a silently-corrupt
@@ -309,6 +310,33 @@ pub struct FlacEncoderOptions {
     /// windows, LPC order 12, precision span 4, partition order 8), and
     /// `compression_level` is ignored. See [`FlacEncoderOptions::exhaustive`].
     pub exhaustive_search: bool,
+
+    /// Worker threads that encode frames in parallel. `None` (the
+    /// default) takes the budget from the execution context the caller
+    /// hands the encoder through
+    /// [`Encoder::set_execution_context`],
+    /// and runs serial when none is given. `Some(n)` sets the budget
+    /// directly (values below 1 count as 1); a later
+    /// `set_execution_context` call replaces it, since the context is the
+    /// threading authority once supplied.
+    ///
+    /// FLAC frames are coded independently (RFC 9639 §9: every frame
+    /// carries its own header, subframes and CRC-16, and no predictor
+    /// state crosses a frame boundary), so with a budget of `n > 1` the
+    /// encoder cuts each block on the calling thread, hands it to one of
+    /// `n` workers, and returns the coded frames in stream order. The
+    /// STREAMINFO MD5 is fed in frame order by whichever thread is free,
+    /// and the frame-size and sample-count statistics are folded in on
+    /// the calling thread, so STREAMINFO matches the serial encoder. At
+    /// most `2 × n` blocks are in flight at once, so memory stays bounded
+    /// however much input a single `send_frame` carries.
+    ///
+    /// The output is **byte-identical** for every thread count: each
+    /// frame's search depends only on that frame's samples. A budget of 1
+    /// runs the serial path with no worker threads at all. Packets of
+    /// frames still in flight become available from `receive_packet` as
+    /// they complete; `flush` waits for all of them.
+    pub threads: Option<usize>,
 }
 
 /// Registry options (`CodecParameters::options`), so callers that only
@@ -461,6 +489,13 @@ impl FlacEncoderOptions {
     /// Set [`allow_non_subset_block_size`](Self::allow_non_subset_block_size).
     pub fn with_allow_non_subset_block_size(mut self, on: bool) -> Self {
         self.allow_non_subset_block_size = on;
+        self
+    }
+
+    /// Set [`threads`](Self::threads): encode frames on `threads` worker
+    /// threads (1 = serial).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads.max(1));
         self
     }
 
@@ -1163,6 +1198,9 @@ pub fn make_encoder_with_options(
         padding_bytes: options.padding_bytes,
         verify: options.verify,
         scratch: build_scratch(&options),
+        threads: options.threads.unwrap_or(1).max(1),
+        options,
+        pool: None,
     }))
 }
 
@@ -1428,6 +1466,30 @@ struct FlacEncoder {
     /// subsequent frames reuse the capacity in place. See
     /// [`SubframeScratch`] for details.
     scratch: SubframeScratch,
+    /// Worker budget (≥ 1) from [`FlacEncoderOptions::threads`] or the
+    /// execution context. 1 runs the serial path.
+    threads: usize,
+    /// The options the encoder was built with, so frame workers can build
+    /// their own search scratch.
+    options: FlacEncoderOptions,
+    /// Frame workers, started on the first block coded with
+    /// `threads > 1`.
+    pool: Option<parallel::FramePool>,
+}
+
+/// Split interleaved samples into the (empty) per-channel `planes`.
+fn deinterleave(src: &[i32], planes: &mut [Vec<i32>]) {
+    let n_ch = planes.len();
+    if let [l, r] = planes {
+        for pair in src.as_chunks::<2>().0 {
+            l.push(pair[0]);
+            r.push(pair[1]);
+        }
+    } else {
+        for (c, plane) in planes.iter_mut().enumerate() {
+            plane.extend(src.iter().skip(c).step_by(n_ch));
+        }
+    }
 }
 
 /// Feed interleaved PCM into the MD5 digest in FLAC's canonical byte
@@ -1516,9 +1578,170 @@ impl FlacEncoder {
         // block would memmove the whole remaining input every block, which
         // is quadratic when a caller sends a long recording in one frame.
         let mut start = 0usize;
-        let result = self.encode_blocks_from(&mut start, n_ch, block, drain_all);
+        let result = if self.threads > 1 {
+            self.encode_blocks_parallel(&mut start, n_ch, block, drain_all)
+        } else {
+            // Frames still with workers from an earlier, larger budget
+            // precede anything the serial path codes now.
+            self.retire_pool()
+                .and_then(|()| self.encode_blocks_from(&mut start, n_ch, block, drain_all))
+        };
         self.interleaved.drain(..start);
         result
+    }
+
+    /// Interchannel samples of the next block to code from `start`, or
+    /// `None` when no (complete, unless `drain_all`) block is queued.
+    fn next_block_len(
+        &self,
+        start: usize,
+        n_ch: usize,
+        block: usize,
+        drain_all: bool,
+    ) -> Option<usize> {
+        let frames_avail = (self.interleaved.len() - start) / n_ch;
+        let take = if drain_all {
+            frames_avail
+        } else if frames_avail >= block {
+            block
+        } else {
+            0
+        };
+        (take > 0).then_some(take)
+    }
+
+    /// Queue a coded frame's packet and fold it into the STREAMINFO
+    /// statistics. Frames arrive here in stream order on both paths.
+    fn queue_frame(&mut self, frame_number: u64, samples: usize, data: Vec<u8>) {
+        let fsize = data.len() as u32;
+        if fsize < self.min_frame_size {
+            self.min_frame_size = fsize;
+        }
+        if fsize > self.max_frame_size {
+            self.max_frame_size = fsize;
+        }
+        self.total_samples += samples as u64;
+
+        let pts = (frame_number as i64) * (self.block_size as i64);
+        let mut pkt = Packet::new(0, self.time_base, data);
+        pkt.pts = Some(pts);
+        pkt.dts = Some(pts);
+        pkt.duration = Some(samples as i64);
+        pkt.flags.keyframe = true;
+        self.pending.push_back(pkt);
+    }
+
+    /// Hand a worker's coded block to [`queue_frame`](Self::queue_frame).
+    fn queue_done(&mut self, done: parallel::Done) -> Result<()> {
+        let data = done.result?;
+        self.queue_frame(done.frame_number, done.samples as usize, data);
+        Ok(())
+    }
+
+    /// Queue the blocks a pool call handed back, in order, stopping at the
+    /// first that failed to code.
+    fn queue_all_done(&mut self, done: &mut Vec<parallel::Done>) -> Result<()> {
+        let mut result = Ok(());
+        for d in done.drain(..) {
+            if result.is_ok() {
+                result = self.queue_done(d);
+            }
+        }
+        result
+    }
+
+    /// Queue every block the workers have finished, in order, without
+    /// waiting for the ones still in flight.
+    fn collect_pool(&mut self) -> Result<()> {
+        let mut done = Vec::new();
+        let polled = match self.pool.as_mut() {
+            Some(pool) => pool.poll(&mut |d| {
+                done.push(d);
+                Ok(())
+            }),
+            None => Ok(()),
+        };
+        let queued = self.queue_all_done(&mut done);
+        polled.and(queued)
+    }
+
+    /// Wait for every in-flight block, stop the workers and take the
+    /// digest back. Blocks after a failed one are still waited for (and
+    /// dropped), so the digest stays whole; the first error is returned.
+    fn retire_pool(&mut self) -> Result<()> {
+        let Some(mut pool) = self.pool.take() else {
+            return Ok(());
+        };
+        let mut done = Vec::new();
+        let drained = pool.drain(&mut |d| {
+            done.push(d);
+            Ok(())
+        });
+        if drained.is_ok() {
+            self.md5 = pool.finish();
+        }
+        let queued = self.queue_all_done(&mut done);
+        drained.and(queued)
+    }
+
+    /// The parallel counterpart of [`encode_blocks_from`](Self::encode_blocks_from):
+    /// cut blocks here, in order, and code them (and feed the MD5) on the
+    /// frame workers, at most the pool's window at a time.
+    fn encode_blocks_parallel(
+        &mut self,
+        start: &mut usize,
+        n_ch: usize,
+        block: usize,
+        drain_all: bool,
+    ) -> Result<()> {
+        if self
+            .pool
+            .as_ref()
+            .is_some_and(|p| p.threads() != self.threads)
+        {
+            self.retire_pool()?;
+        }
+        if self.pool.is_none()
+            && self
+                .next_block_len(*start, n_ch, block, drain_all)
+                .is_none()
+        {
+            return Ok(());
+        }
+        let mut pool = match self.pool.take() {
+            Some(pool) => pool,
+            None => parallel::FramePool::new(
+                self.threads,
+                &self.options,
+                self.frame_shape(),
+                self.verify,
+                self.frame_number,
+                std::mem::take(&mut self.md5),
+            ),
+        };
+        let mut done = Vec::new();
+        let mut result = Ok(());
+        while let Some(take) = self.next_block_len(*start, n_ch, block, drain_all) {
+            let mut planes = pool.planes(n_ch, take);
+            let src = &self.interleaved[*start..*start + take * n_ch];
+            deinterleave(src, &mut planes);
+            *start += take * n_ch;
+            result = pool.submit(self.frame_number, take as u32, planes, &mut |d| {
+                done.push(d);
+                Ok(())
+            });
+            if result.is_err() {
+                break;
+            }
+            self.frame_number += 1;
+            if let Err(e) = self.queue_all_done(&mut done) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.pool = Some(pool);
+        let queued = self.queue_all_done(&mut done);
+        result.and(queued)
     }
 
     fn encode_blocks_from(
@@ -1528,31 +1751,11 @@ impl FlacEncoder {
         block: usize,
         drain_all: bool,
     ) -> Result<()> {
-        loop {
-            let frames_avail = (self.interleaved.len() - *start) / n_ch;
-            let take = if drain_all {
-                frames_avail
-            } else if frames_avail >= block {
-                block
-            } else {
-                return Ok(());
-            };
-            if take == 0 {
-                return Ok(());
-            }
+        while let Some(take) = self.next_block_len(*start, n_ch, block, drain_all) {
             let mut per_channel: Vec<Vec<i32>> =
                 (0..n_ch).map(|_| Vec::with_capacity(take)).collect();
             let src = &self.interleaved[*start..*start + take * n_ch];
-            if let [l, r] = &mut per_channel[..] {
-                for pair in src.as_chunks::<2>().0 {
-                    l.push(pair[0]);
-                    r.push(pair[1]);
-                }
-            } else {
-                for (c, plane) in per_channel.iter_mut().enumerate() {
-                    plane.extend(src.iter().skip(c).step_by(n_ch));
-                }
-            }
+            deinterleave(src, &mut per_channel);
             feed_md5(&mut self.md5, &mut self.md5_buf, self.bps, src);
             *start += take * n_ch;
 
@@ -1573,24 +1776,10 @@ impl FlacEncoder {
                 self.verify_frame(&data, &per_channel)?;
             }
 
-            let fsize = data.len() as u32;
-            if fsize < self.min_frame_size {
-                self.min_frame_size = fsize;
-            }
-            if fsize > self.max_frame_size {
-                self.max_frame_size = fsize;
-            }
-            self.total_samples += take as u64;
-
-            let pts = (self.frame_number as i64) * (self.block_size as i64);
-            let mut pkt = Packet::new(0, self.time_base, data);
-            pkt.pts = Some(pts);
-            pkt.dts = Some(pts);
-            pkt.duration = Some(take as i64);
-            pkt.flags.keyframe = true;
-            self.pending.push_back(pkt);
+            self.queue_frame(self.frame_number, take, data);
             self.frame_number += 1;
         }
+        Ok(())
     }
 
     /// Decode `frame` (the freshly-encoded frame bytes) back to PCM and
@@ -1603,55 +1792,17 @@ impl FlacEncoder {
     /// index so an encoder regression is pinpointed rather than reported as a
     /// vague whole-file mismatch.
     fn verify_frame(&self, frame: &[u8], per_channel: &[Vec<i32>]) -> Result<()> {
-        // A minimal STREAMINFO is all `decode_frame_channels` needs: the
-        // frame header is self-describing except for the "get from
-        // STREAMINFO" escapes (block size / sample rate / bit depth), which
-        // this encoder never emits, but we populate the relevant fields
-        // anyway so the escape path resolves correctly if it ever does.
-        let info = StreamInfo {
-            min_block_size: self.block_size as u16,
-            max_block_size: self.block_size as u16,
-            min_frame_size: 0,
-            max_frame_size: 0,
-            sample_rate: self.sample_rate,
-            channels: self.channels as u8,
-            bits_per_sample: self.bps,
-            total_samples: 0,
-            md5: [0u8; 16],
-        };
-        let decoded = decode_frame_channels(frame, &info).map_err(|e| {
-            Error::invalid(format!(
-                "FLAC verify (frame {}): encoded frame failed to decode: {}",
-                self.frame_number, e
-            ))
-        })?;
+        verify_encoded_frame(&self.frame_shape(), self.frame_number, frame, per_channel)
+    }
 
-        if decoded.channels.len() != per_channel.len() {
-            return Err(Error::invalid(format!(
-                "FLAC verify (frame {}): channel count {} != input {}",
-                self.frame_number,
-                decoded.channels.len(),
-                per_channel.len()
-            )));
+    /// The stream-constant facts a frame's verify pass needs.
+    fn frame_shape(&self) -> FrameShape {
+        FrameShape {
+            block_size: self.block_size,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            bps: self.bps,
         }
-        for (c, (got, want)) in decoded.channels.iter().zip(per_channel.iter()).enumerate() {
-            if got.len() != want.len() {
-                return Err(Error::invalid(format!(
-                    "FLAC verify (frame {}): channel {} length {} != input {}",
-                    self.frame_number,
-                    c,
-                    got.len(),
-                    want.len()
-                )));
-            }
-            if let Some(i) = got.iter().zip(want.iter()).position(|(g, w)| g != w) {
-                return Err(Error::invalid(format!(
-                    "FLAC verify (frame {}): channel {} sample {} decoded {} != input {}",
-                    self.frame_number, c, i, got[i], want[i]
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Rebuild STREAMINFO in `output_params.extradata` using live stats.
@@ -1700,6 +1851,9 @@ impl Encoder for FlacEncoder {
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
+        if self.pending.is_empty() && self.pool.as_ref().is_some_and(|p| p.in_flight() > 0) {
+            self.collect_pool()?;
+        }
         self.pending.pop_front().ok_or(Error::NeedMore)
     }
 
@@ -1707,10 +1861,92 @@ impl Encoder for FlacEncoder {
         if !self.eof {
             self.eof = true;
             self.encode_ready_frames(true)?;
+            // The workers hold the digest; take it back before STREAMINFO
+            // is written.
+            self.retire_pool()?;
             self.finalize_streaminfo();
         }
         Ok(())
     }
+
+    /// Take the worker budget from `ctx` (see
+    /// [`FlacEncoderOptions::threads`]). A change of budget takes effect
+    /// at the next block: frames already with workers finish first, so
+    /// the output stays in order and byte-identical.
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        self.threads = ctx.threads.max(1);
+    }
+}
+
+/// Stream-constant facts about every frame of one encoder: what the
+/// verify pass needs to parse a frame back, and what a parallel worker
+/// needs to code one.
+#[derive(Clone, Copy, Debug)]
+struct FrameShape {
+    block_size: u32,
+    sample_rate: u32,
+    channels: u16,
+    bps: u8,
+}
+
+/// Decode `frame` back to PCM and check it equals `per_channel` — the
+/// body of [`FlacEncoder::verify_frame`], free-standing so a parallel
+/// worker runs the same check on the frames it codes.
+fn verify_encoded_frame(
+    shape: &FrameShape,
+    frame_number: u64,
+    frame: &[u8],
+    per_channel: &[Vec<i32>],
+) -> Result<()> {
+    // A minimal STREAMINFO is all `decode_frame_channels` needs: the
+    // frame header is self-describing except for the "get from
+    // STREAMINFO" escapes (block size / sample rate / bit depth), which
+    // this encoder never emits, but we populate the relevant fields
+    // anyway so the escape path resolves correctly if it ever does.
+    let info = StreamInfo {
+        min_block_size: shape.block_size as u16,
+        max_block_size: shape.block_size as u16,
+        min_frame_size: 0,
+        max_frame_size: 0,
+        sample_rate: shape.sample_rate,
+        channels: shape.channels as u8,
+        bits_per_sample: shape.bps,
+        total_samples: 0,
+        md5: [0u8; 16],
+    };
+    let decoded = decode_frame_channels(frame, &info).map_err(|e| {
+        Error::invalid(format!(
+            "FLAC verify (frame {}): encoded frame failed to decode: {}",
+            frame_number, e
+        ))
+    })?;
+
+    if decoded.channels.len() != per_channel.len() {
+        return Err(Error::invalid(format!(
+            "FLAC verify (frame {}): channel count {} != input {}",
+            frame_number,
+            decoded.channels.len(),
+            per_channel.len()
+        )));
+    }
+    for (c, (got, want)) in decoded.channels.iter().zip(per_channel.iter()).enumerate() {
+        if got.len() != want.len() {
+            return Err(Error::invalid(format!(
+                "FLAC verify (frame {}): channel {} length {} != input {}",
+                frame_number,
+                c,
+                got.len(),
+                want.len()
+            )));
+        }
+        if let Some(i) = got.iter().zip(want.iter()).position(|(g, w)| g != w) {
+            return Err(Error::invalid(format!(
+                "FLAC verify (frame {}): channel {} sample {} decoded {} != input {}",
+                frame_number, c, i, got[i], want[i]
+            )));
+        }
+    }
+    Ok(())
 }
 
 // --- Per-frame encoding ---------------------------------------------------
@@ -5930,6 +6166,9 @@ mod tests {
             padding_bytes: None,
             verify: true,
             scratch: build_scratch(&FlacEncoderOptions::verifying()),
+            threads: 1,
+            options: FlacEncoderOptions::verifying(),
+            pool: None,
         }
     }
 
