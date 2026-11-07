@@ -319,8 +319,42 @@ fn bench_encode_mono_constant_s16(c: &mut Criterion) {
     g.finish();
 }
 
+/// Thread scaling: 30 s of stereo S16 at 44.1 kHz, level 5, through the
+/// registry encoder with an execution context of 1 / 2 / 4 / 8 threads.
+/// The output is byte-identical at every count; only wall time moves.
+fn bench_encode_stereo_s16_44k1_30s_threads(c: &mut Criterion) {
+    let n = 44_100 * 30;
+    let pcm = build_pcm_per_channel(n, 2, 16);
+    let frame = build_audio_frame(SampleFormat::S16, 2, &pcm);
+    let mut params = CodecParameters::audio(CodecId::new("flac"));
+    params.channels = Some(2);
+    params.sample_rate = Some(44_100);
+    params.sample_format = Some(SampleFormat::S16);
+    let mut g = c.benchmark_group("encode_stereo_s16_44k1_30s_threads");
+    g.throughput(Throughput::Bytes((n * 2 * 2) as u64));
+    g.sample_size(10);
+    for threads in [1usize, 2, 4, 8] {
+        g.bench_function(BenchmarkId::from_parameter(threads), |b| {
+            b.iter(|| {
+                let mut enc = oxideav_flac::encoder::make_encoder(&params).expect("make_encoder");
+                enc.set_execution_context(&oxideav_core::ExecutionContext::with_threads(threads));
+                enc.send_frame(&Frame::Audio(frame.clone()))
+                    .expect("send_frame");
+                enc.flush().expect("flush");
+                let mut total = 0usize;
+                while let Ok(p) = enc.receive_packet() {
+                    total += p.data.len();
+                }
+                criterion::black_box(total);
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    bench_encode_stereo_s16_44k1_30s_threads,
     bench_encode_mono_s16_44k1_1s,
     bench_encode_stereo_s16_44k1_1s,
     bench_encode_stereo_s24_48k_500ms,

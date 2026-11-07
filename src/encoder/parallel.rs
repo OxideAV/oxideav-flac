@@ -30,6 +30,7 @@
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -213,6 +214,9 @@ pub(super) struct FramePool {
     spare: Vec<Vec<Vec<i32>>>,
     /// The digest over every block submitted to this pool.
     md5: Arc<Md5Stage>,
+    /// Set when the pool is dropped with blocks still queued: workers skip
+    /// the rest instead of coding frames nobody will read.
+    cancel: Arc<AtomicBool>,
 }
 
 impl FramePool {
@@ -233,15 +237,19 @@ impl FramePool {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (done_tx, done_rx) = mpsc::channel::<Done>();
         let job_rx = Arc::new(Mutex::new(job_rx));
+        let cancel = Arc::new(AtomicBool::new(false));
         let workers = (0..threads)
             .map(|i| {
                 let job_rx = Arc::clone(&job_rx);
                 let done_tx = done_tx.clone();
                 let options = options.clone();
                 let md5 = Arc::clone(&md5);
+                let cancel = Arc::clone(&cancel);
                 std::thread::Builder::new()
                     .name(format!("flac-enc-{i}"))
-                    .spawn(move || worker(&job_rx, &done_tx, &md5, &options, shape, verify))
+                    .spawn(move || {
+                        worker(&job_rx, &done_tx, &md5, &cancel, &options, shape, verify)
+                    })
                     .expect("spawn FLAC encoder worker")
             })
             .collect();
@@ -255,6 +263,7 @@ impl FramePool {
             window: 2 * threads,
             spare: Vec::new(),
             md5,
+            cancel,
         }
     }
 
@@ -429,6 +438,9 @@ impl FramePool {
 
 impl Drop for FramePool {
     fn drop(&mut self) {
+        // Blocks still queued belong to an encoder that is going away
+        // (dropped mid-stream, or after an error): don't code them.
+        self.cancel.store(true, Ordering::Relaxed);
         self.stop();
     }
 }
@@ -444,6 +456,7 @@ fn worker(
     jobs: &Mutex<Receiver<Job>>,
     done: &Sender<Done>,
     md5: &Md5Stage,
+    cancel: &AtomicBool,
     options: &FlacEncoderOptions,
     shape: FrameShape,
     verify: bool,
@@ -457,6 +470,9 @@ fn worker(
                 Err(_) => return,
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let coded = catch_unwind(AssertUnwindSafe(|| {
             let frame = encode_frame(
                 job.frame_number,

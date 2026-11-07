@@ -627,3 +627,44 @@ fn parallel_encoder_keeps_a_bounded_window_in_flight() {
     }
     assert_eq!(early + late, blocks);
 }
+
+#[test]
+fn parallel_encoder_moves_between_threads_and_drops_mid_stream() {
+    let pcm = pin_signal(40_000);
+    let p = params(2, 44_100, SampleFormat::S16);
+    let opts = || FlacEncoderOptions::new().with_block_size(1024);
+    let serial = encode_full(&pcm, &p, opts(), 5000);
+    let frame = |piece: &[u8]| {
+        Frame::Audio(AudioFrame {
+            samples: (piece.len() / 4) as u32,
+            pts: None,
+            data: vec![piece.to_vec()],
+        })
+    };
+    // Start on this thread, finish on another: the encoder (and its
+    // in-flight frames) is `Send`.
+    let mut enc = make_encoder_with_options(&p, opts().with_threads(4)).unwrap();
+    let (head, tail) = pcm.split_at(pcm.len() / 2);
+    enc.send_frame(&frame(head)).unwrap();
+    let tail = tail.to_vec();
+    let (enc, packets) = std::thread::spawn(move || {
+        let mut packets = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            packets.push(pkt.data);
+        }
+        enc.send_frame(&frame(&tail)).unwrap();
+        enc.flush().unwrap();
+        while let Ok(pkt) = enc.receive_packet() {
+            packets.push(pkt.data);
+        }
+        (enc, packets)
+    })
+    .join()
+    .unwrap();
+    assert!(packets == serial.0);
+    assert_eq!(enc.output_params().extradata, serial.2);
+    // Dropping with blocks still in flight stops the workers.
+    let mut enc = make_encoder_with_options(&p, opts().with_threads(8)).unwrap();
+    enc.send_frame(&frame(&pcm)).unwrap();
+    drop(enc);
+}
