@@ -257,8 +257,9 @@ fn decode_residual_into(
         ));
     }
     let partition_size = block_size / n_partitions;
-    if partition_size as usize <= predictor_order {
-        // First partition would have zero or negative samples — invalid.
+    if (partition_size as usize) < predictor_order {
+        // The first partition holds `partition_size - predictor_order` residuals;
+        // zero is legal (RFC 9639 section 9.2.7.1), fewer is not.
         return Err(Error::invalid(
             "FLAC residual: first partition smaller than predictor order",
         ));
@@ -503,7 +504,7 @@ fn decode_residual_into_wide(
         ));
     }
     let partition_size = block_size / n_partitions;
-    if partition_size as usize <= predictor_order {
+    if (partition_size as usize) < predictor_order {
         return Err(Error::invalid(
             "FLAC residual: first partition smaller than predictor order",
         ));
@@ -799,5 +800,76 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         let s = decode_subframe_wide(&mut br, 8, 33).unwrap();
         assert_eq!(s, expected);
+    }
+
+    // --- First partition of exactly `predictor_order` samples ------------
+    //
+    // RFC 9639 §9.2.7.1: the first partition holds `block_size / 2^order -
+    // predictor_order` residuals, so a partition as long as the predictor
+    // order leaves it empty. That is legal (libFLAC only rejects a negative
+    // count, and FFmpeg's encoder writes it for near-silent audio).
+
+    /// A FIXED subframe of `block_size` samples with `order` warm-up
+    /// samples `1, 2, 3, ...`, then Rice partitions (parameter 0) of
+    /// all-zero residuals at the given partition order.
+    fn fixed_subframe(order: u32, block_size: u32, bps: u32, partition_order: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_u32(0, 1);
+        w.write_u32(0b001000 | order, 6);
+        w.write_u32(0, 1);
+        for n in 0..order {
+            w.write_u64(u64::from(n + 1), bps);
+        }
+        w.write_u32(0, 2); // residual method 0
+        w.write_u32(partition_order, 4);
+        let size = block_size >> partition_order;
+        for p in 0..(1u32 << partition_order) {
+            w.write_u32(0, 4); // Rice parameter 0
+            let n = if p == 0 {
+                size.saturating_sub(order)
+            } else {
+                size
+            };
+            for _ in 0..n {
+                write_rice(&mut w, 0, 0);
+            }
+        }
+        w.align_to_byte();
+        w.finish()
+    }
+
+    #[test]
+    fn first_partition_exactly_the_predictor_order_is_empty_and_decodes() {
+        // Order 2, 8 samples, 4 partitions of 2: the first holds no residual.
+        let bytes = fixed_subframe(2, 8, 16, 2);
+        let mut br = BitReader::new(&bytes);
+        let s = decode_subframe(&mut br, 8, 16).unwrap();
+        // Zero residual under a second-order fixed predictor extends the line.
+        assert_eq!(s, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        // Order 4, partition size 4 (two partitions of a block of 8).
+        let bytes = fixed_subframe(4, 8, 16, 1);
+        let mut br = BitReader::new(&bytes);
+        let s = decode_subframe(&mut br, 8, 16).unwrap();
+        assert_eq!(s, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn first_partition_shorter_than_the_predictor_order_is_still_rejected() {
+        // Order 4, partition size 2 (four partitions of a block of 8).
+        let bytes = fixed_subframe(4, 8, 16, 2);
+        let mut br = BitReader::new(&bytes);
+        let err = decode_subframe(&mut br, 8, 16).expect_err("negative first partition");
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+    }
+
+    #[test]
+    fn wide_first_partition_exactly_the_predictor_order_is_empty_and_decodes() {
+        let bytes = fixed_subframe(4, 8, 33, 1);
+        let mut br = BitReader::new(&bytes);
+        let s = decode_subframe_wide(&mut br, 8, 33).unwrap();
+        assert_eq!(s, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let bytes = fixed_subframe(4, 8, 33, 2);
+        let mut br = BitReader::new(&bytes);
+        assert!(decode_subframe_wide(&mut br, 8, 33).is_err());
     }
 }
