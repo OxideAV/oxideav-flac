@@ -5,7 +5,9 @@
 //! Two programme-like signals are synthesised (no files are read):
 //! 16-bit / 44.1 kHz stereo and 24-bit / 96 kHz stereo. Each is encoded
 //! at the default and at the maximum compression level, single-threaded,
-//! and the resulting packets are decoded again. Every figure is the
+//! and the resulting packets are decoded again — once packet by packet
+//! ("decode") and once as a `.flac` file image through the demuxer
+//! ("file"). Every figure is the
 //! median of `RUNS` runs (default 5) over `SECONDS` seconds of audio
 //! (default 30), expressed as "seconds of audio per second of wall
 //! clock". Decoding is so much faster than encoding that each run times
@@ -15,7 +17,10 @@
 
 use std::time::Instant;
 
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, SampleFormat};
+use oxideav_core::{
+    AudioFrame, CodecId, CodecParameters, ContainerRegistry, Error, Frame, NullCodecResolver,
+    Packet, ReadSeek, SampleFormat,
+};
 use oxideav_flac::encoder::{
     DEFAULT_COMPRESSION_LEVEL, FlacEncoderOptions, MAX_COMPRESSION_LEVEL, make_encoder_with_options,
 };
@@ -125,6 +130,32 @@ fn decode(packets: &[Packet], params: &CodecParameters, out: &mut Vec<u8>) {
     }
 }
 
+/// Decode a whole `.flac` file image: the demuxer cuts it into frames
+/// (and confirms each by its CRC-16), the decoder decodes them.
+fn decode_file(file: &[u8], out: &mut Vec<u8>) {
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let input: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(file.to_vec()));
+    let mut demux = reg
+        .open_demuxer("flac", input, &NullCodecResolver)
+        .expect("demuxer");
+    let mut dec = oxideav_flac::decoder::make_decoder(&demux.streams()[0].params).expect("decoder");
+    out.clear();
+    loop {
+        match demux.next_packet() {
+            Ok(p) => {
+                dec.send_packet(&p).expect("send_packet");
+                match dec.receive_frame().expect("receive_frame") {
+                    Frame::Audio(a) => out.extend_from_slice(&a.data[0]),
+                    _ => panic!("expected audio"),
+                }
+            }
+            Err(Error::Eof) => break,
+            Err(e) => panic!("next_packet: {e:?}"),
+        }
+    }
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
@@ -142,13 +173,14 @@ fn main() {
     ];
     println!("{seconds} s of audio per signal, median of {runs} runs, one thread");
     println!(
-        "{:<26} {:>5} {:>8} {:>14} {:>14}",
-        "signal", "level", "ratio", "encode x RT", "decode x RT"
+        "{:<26} {:>5} {:>8} {:>12} {:>12} {:>12}",
+        "signal", "level", "ratio", "encode x RT", "decode x RT", "file x RT"
     );
     for sig in &signals {
         for level in [DEFAULT_COMPRESSION_LEVEL, MAX_COMPRESSION_LEVEL] {
             let mut enc_times = Vec::new();
             let mut dec_times = Vec::new();
+            let mut file_times = Vec::new();
             let mut size = 0usize;
             let mut out = Vec::with_capacity(sig.pcm.len());
             for _ in 0..runs {
@@ -163,15 +195,28 @@ fn main() {
                 }
                 dec_times.push(t.elapsed().as_secs_f64() / passes as f64);
                 assert!(out == sig.pcm, "round trip is not lossless");
+
+                let mut file = b"fLaC".to_vec();
+                file.extend_from_slice(&params.extradata);
+                for p in &packets {
+                    file.extend_from_slice(&p.data);
+                }
+                let t = Instant::now();
+                for _ in 0..passes {
+                    decode_file(&file, &mut out);
+                }
+                file_times.push(t.elapsed().as_secs_f64() / passes as f64);
+                assert!(out == sig.pcm, "file round trip is not lossless");
             }
             let audio = sig.seconds as f64;
             println!(
-                "{:<26} {:>5} {:>7.1}% {:>14.0} {:>14.0}",
+                "{:<26} {:>5} {:>7.1}% {:>12.0} {:>12.0} {:>12.0}",
                 sig.name,
                 level,
                 100.0 * size as f64 / sig.pcm.len() as f64,
                 audio / median(enc_times),
                 audio / median(dec_times),
+                audio / median(file_times),
             );
         }
     }

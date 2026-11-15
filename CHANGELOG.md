@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   predictors carry their history in locals. Decoding allocates only the
   output buffer of each frame. Output is unchanged for every valid
   stream; `examples/speed.rs` measures it (see the README).
+- verify: whole-stream MD5 verification reuses one set of sample planes
+  instead of allocating per frame.
 - decoder: a Rice-coded residual outside the 32-bit residual range of
   RFC 9639 §9.2.7.3 is now an error instead of being truncated, and a
   side sample of a 32-bit stereo frame outside 33 bits is an error.

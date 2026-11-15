@@ -277,11 +277,31 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 - **Subframe types**: CONSTANT, VERBATIM, FIXED predictor (orders 0–4),
   LPC (orders 1–32) with full QLP precision / shift handling.
 - **Residual coding**: both partitioned Rice methods (4-bit and 5-bit
-  parameters), all 16 partition orders, and the escape partitions that
-  store raw unencoded residuals.
+  parameters, Rice parameters 0–14 and 0–30), all 16 partition orders,
+  and the escape partitions that store raw unencoded residuals at 0–31
+  bits each. A Rice-coded value outside the residual range of RFC 9639
+  §9.2.7.3 is an error.
 - **Wasted bits per sample** (unary-coded count per subframe).
 - **Frame CRC**: header CRC-8 and frame CRC-16 are both verified; bad
   frames are rejected.
+- **What is refused**: every reserved or forbidden field value of
+  RFC 9639 §9 — reserved block size / channel / bit depth / subframe
+  type / residual method codes, sample rate code 15, the block size
+  65536, a frame number above 31 bits, a set reserved bit, coefficient
+  precision 0b1111, a negative prediction shift, wasted bits that leave
+  no sample bits, a partition count that does not divide the block, a
+  predictor order above the partition length. One deliberate
+  tolerance: a first residual partition with *zero* samples (partition
+  length equal to the predictor order), which §9.2.7 forbids but which
+  is unambiguous and which other decoders play, is decoded;
+  `decoder::FrameScratch::strict()` refuses it, and the encoder checks
+  its own frames that way.
+- **Stream parameters**: the output layout comes from STREAMINFO. A
+  frame whose header announces another channel count or bit depth is
+  refused by `receive_frame` (the next conforming frame decodes
+  normally).
+- **Allocation**: sample planes and the packet buffer are kept between
+  frames; decoding a frame allocates only its output buffer.
 - **Verify-decoder MD5** (RFC 9639 §8.2): the `verify` module
   recomputes the STREAMINFO MD5 from the decoded PCM and checks it,
   confirming the whole-stream decode is lossless — the canonical FLAC
@@ -476,8 +496,16 @@ trait:
 
 - **Demuxer**: parses `fLaC` magic + metadata block chain
   (STREAMINFO, VORBIS_COMMENT, SEEKTABLE, PICTURE, CUESHEET, plus
-  ID3v2 tags prepended by some taggers), emits one packet per frame
-  via a CRC-verified sync-code scanner.
+  ID3v2 tags prepended by some taggers) and emits one packet per frame.
+  A frame starts at a sync code whose header passes its CRC-8 and ends
+  where its CRC-16 confirms it: a header-shaped run inside coded audio
+  (fifteen sync bits and an 8-bit checksum do occur by chance) does not
+  split a frame. A frame whose CRC-16 never matches — damaged data, or
+  a seek that landed mid-frame — is cut at the next header once the
+  scan is past the longest such a frame can be, so the damage stays
+  with that frame and the stream resynchronises on the next one. The
+  scan never revisits a byte and buffers at most about two frames, also
+  on input that contains no frames at all.
 - **Muxer**: writes `fLaC` + metadata blocks + frame packets. Packets
   produced by the encoder pass straight through.
 - **SEEKTABLE generation** (RFC 9639 §8.5): by default the muxer builds
@@ -506,15 +534,16 @@ trait:
   lands on the nearest prior seek point). Files **without** a SEEKTABLE
   seek via a frame-header scanning fallback (RFC 9639 §8.5 — "it is
   possible to seek to any given sample in a FLAC stream without a seek
-  table, but the delay can be unpredictable"): the demuxer scans
-  CRC-8-verified frame headers forward from the start of the frame
-  stream and lands on the last frame whose first sample is ≤ the
-  target, exhausting to the final frame for targets past the end and
-  clamping to sample 0 for negative targets. The scan applies the
+  table, but the delay can be unpredictable"): the demuxer walks the
+  frames forward from the start of the frame stream (the same framing
+  as packet reading) and lands on the last frame whose first sample is
+  ≤ the target, exhausting to the final frame for targets past the end
+  and clamping to sample 0 for negative targets. The scan applies the
   §11 anti-DoS plausibility checks — each accepted coded number must
-  be CRC-verified, strictly increasing, and within the STREAMINFO
-  total-sample bound — so a stream with non-monotonic or out-of-range
-  coded numbers can never loop the scanner.
+  be strictly increasing and within the STREAMINFO total-sample bound —
+  so a stream with non-monotonic or out-of-range coded numbers can
+  never loop the scanner. A seek point whose 64-bit offset cannot
+  address a byte of the stream is ignored in favour of that scan.
 - **Metadata surfaces**: Vorbis-comment key/value pairs and attached
   pictures (FLAC PICTURE block + ID3v2 APIC fallback).
 - **Chapters**: CUESHEET tracks are surfaced through
@@ -571,7 +600,51 @@ silently when absent), `metadata_walker`, `encoder_options`,
 `subframe_decode`, `application`, and `seek` (demuxer `seek_to` +
 post-seek packet drain against unsorted / placeholder / out-of-range
 SEEKTABLE points the §8.5.1-enforcing writer never emits). Daily split
-run in `.github/workflows/fuzz.yml`.
+run in `.github/workflows/fuzz.yml`. `subframe_decode` also decodes
+every input at both sample widths and under both rule sets and compares
+the results. Inputs that once failed a scheduled run are kept as
+regression tests (`tests/decode_fuzz_regression.rs`,
+`tests/seek_fuzz_regression.rs`).
+
+`tests/spec_edges.rs` and `tests/stream_edges.rs` walk RFC 9639 §9 with
+frames assembled bit by bit in the test and checked against an
+independent model: the extremes of every header field, partition
+orders, Rice parameters, escaped partitions, wasted bits, the 33-bit
+side channel, block sizes 1..=65535, coded numbers at the limits of
+every length, both checksums bit by bit, resynchronisation after
+damage, variable block size streams, and the encoder's output across
+block sizes, last-block lengths, depths, layouts, levels and sample
+rates (decoded in strict mode as well).
+
+## Speed
+
+`examples/speed.rs` synthesises two programme-like signals, encodes each
+at the default and the maximum level on one thread, and decodes the
+result again, packet by packet ("decode") and as a `.flac` file image
+through the demuxer ("file"). Figures are seconds of audio per second of
+wall clock, median of 5 runs over 30 s of audio, on an Apple M-series
+laptop that was running other builds at the time (the before and after
+binaries were measured back to back):
+
+```text
+cargo run --release --example speed -- 30 5 10
+```
+
+| signal | level | encode × RT | decode × RT, before → after | file × RT, before → after |
+|---|---|---|---|---|
+| 16-bit / 44.1 kHz stereo | 5 | 730 | 815 → 2450 | 800 → 2110 |
+| 16-bit / 44.1 kHz stereo | 8 | 224 | 800 → 2470 | 765 → 2125 |
+| 24-bit / 96 kHz stereo | 5 | 260 | 335 → 900 | 295 → 710 |
+| 24-bit / 96 kHz stereo | 8 | 68 | 335 → 905 | 285 → 685 |
+
+"Before" is the decoder that read each field through single bit reads
+and built a vector per subframe; "after" decodes subframes on a 64-bit
+bit reservoir into planes it keeps between frames (a Rice code word is
+taken with one leading-zero count; the linear predictor has one loop
+per order). The decoded samples are identical. The encoder's search was
+not changed in that step, so its column has one figure. The "file"
+column includes the demuxer, which reads every frame's CRC-16 once to
+find where the frame ends before the decoder checks it again.
 
 ## Benchmarks
 

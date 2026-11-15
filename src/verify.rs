@@ -27,7 +27,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::decoder::{DecodedFrame, decode_frame_channels};
+use crate::decoder::FrameScratch;
 use crate::md5::Md5;
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 
@@ -84,7 +84,7 @@ impl Md5Verifier {
     ///
     /// `channels` is one `Vec<i32>` per channel, all of equal length (the
     /// frame's interchannel sample count) — exactly the shape
-    /// [`decode_frame_channels`] returns. Samples are emitted interleaved:
+    /// [`decode_frame_channels`](crate::decoder::decode_frame_channels) returns. Samples are emitted interleaved:
     /// channel 0 sample 0, channel 1 sample 0, …, channel 0 sample 1, …
     pub fn update(&mut self, channels: &[Vec<i32>]) {
         let n_ch = channels.len();
@@ -172,17 +172,15 @@ pub enum VerifyOutcome {
 pub fn verify_frame_stream(frames: &[u8], streaminfo: &StreamInfo) -> Result<VerifyOutcome> {
     let mut verifier = Md5Verifier::new(streaminfo.bits_per_sample as u32);
     let mut pos = 0usize;
+    // One set of sample planes for the whole stream.
+    let mut scratch = FrameScratch::new();
     while pos < frames.len() {
-        let DecodedFrame {
-            channels,
-            frame_byte_len,
-            ..
-        } = decode_frame_channels(&frames[pos..], streaminfo)?;
-        verifier.update(&channels);
-        if frame_byte_len == 0 {
+        let shape = scratch.decode(&frames[pos..], streaminfo)?;
+        verifier.update(&scratch.planes()[..shape.channels]);
+        if shape.frame_byte_len == 0 {
             return Err(Error::invalid("FLAC verify: zero-length frame"));
         }
-        pos += frame_byte_len;
+        pos += shape.frame_byte_len;
     }
     match verifier.verify(&streaminfo.md5)? {
         true => Ok(VerifyOutcome::Match),

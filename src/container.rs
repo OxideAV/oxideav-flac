@@ -4,7 +4,7 @@
 //! [`CodecParameters`] from STREAMINFO, then emits frames as packets by
 //! scanning for the FLAC frame sync pattern (0xFF, 0xF8/0xF9),
 //! CRC-8-verifying each candidate header and confirming the end of each
-//! frame by its CRC-16 (see [`crate::framing`]). The
+//! frame by its CRC-16 (the `framing` module). The
 //! full set of metadata blocks (including their headers) is preserved
 //! verbatim in `extradata` so the muxer can round-trip byte-identical
 //! output, and per-packet timestamps are computed directly from the
