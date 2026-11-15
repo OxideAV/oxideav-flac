@@ -459,6 +459,13 @@ fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
     for p in &encoded.packets {
         file.extend_from_slice(&p.data);
     }
+    // An outside decoder agrees that the stream is valid and that its
+    // MD5 matches (skipped when none is installed).
+    if !encoded.packets.is_empty() {
+        if let Some(accepted) = black_box_accepts(&file) {
+            assert!(accepted, "black-box decoder rejected the stream");
+        }
+    }
     let mut demux = open(file);
     let mut dec = oxideav_flac::decoder::make_decoder(&demux.streams()[0].params).unwrap();
     let mut via_file = Vec::new();
@@ -470,6 +477,31 @@ fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
     }
     assert_eq!(direct, via_file);
     direct
+}
+
+/// Hand `file` to a black-box FLAC decoder in test mode, which decodes
+/// the stream, checks every frame and compares the STREAMINFO MD5.
+/// `None` when no such binary is installed (the check is then skipped).
+fn black_box_accepts(file: &[u8]) -> Option<bool> {
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SERIAL: AtomicUsize = AtomicUsize::new(0);
+    let probe = Command::new("flac").arg("--version").output().ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "oxideav-flac-stream-edges-{}-{}.flac",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, file).ok()?;
+    let status = Command::new("flac")
+        .args(["--test", "--silent", "--warnings-as-errors"])
+        .arg(&path)
+        .output();
+    let _ = std::fs::remove_file(&path);
+    Some(status.ok()?.status.success())
 }
 
 /// PCM of `frames` interleaved samples: a few tones, noise, and runs at
