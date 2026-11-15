@@ -230,3 +230,85 @@ fn flac_seek_without_seektable_past_end_lands_on_last_frame() {
     let pkt = demuxer.next_packet().expect("packet after seek");
     assert_eq!(pkt.pts, Some(384));
 }
+
+/// A SEEKTABLE whose 64-bit offsets (RFC 9639 §8.5.1) carry the absolute
+/// position past `u64::MAX` cannot address any byte of the stream. The
+/// demuxer must neither overflow nor fail: it discards the unusable point
+/// and locates the frame by scanning headers, exactly as it does for a
+/// file with no SEEKTABLE.
+#[test]
+fn flac_seek_with_overflowing_seekpoint_offset_falls_back_to_scan() {
+    let (f0, _) = build_frame(0);
+    let (f1, _) = build_frame(1);
+    let (f2, _) = build_frame(2);
+
+    let mut seektable = Vec::new();
+    seektable.extend_from_slice(&seek_point(0, u64::MAX, 192));
+    seektable.extend_from_slice(&seek_point(192, u64::MAX - 1, 192));
+    seektable.extend_from_slice(&seek_point(384, u64::MAX - 41, 192));
+
+    let streaminfo = build_streaminfo();
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 3, seektable.len()));
+    file.extend_from_slice(&seektable);
+    file.extend_from_slice(&f0);
+    file.extend_from_slice(&f1);
+    file.extend_from_slice(&f2);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let mut demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
+
+    for (target, want) in [(0i64, 0i64), (300, 192), (384, 384), (i64::MAX, 384)] {
+        let landed = demuxer.seek_to(0, target).expect("seek");
+        assert_eq!(landed, want, "target {target}");
+        let pkt = demuxer.next_packet().expect("packet after seek");
+        assert_eq!(pkt.pts, Some(want), "target {target}");
+    }
+}
+
+/// A seek point whose offset is representable but lies past the end of
+/// the file is not an error at seek time; the following read reports the
+/// end of the stream and a later seek recovers.
+#[test]
+fn flac_seek_with_offset_past_end_reports_eof_then_recovers() {
+    let (f0, _) = build_frame(0);
+    let (f1, _) = build_frame(1);
+    let o1 = f0.len() as u64;
+
+    let mut seektable = Vec::new();
+    seektable.extend_from_slice(&seek_point(0, 0, 192));
+    seektable.extend_from_slice(&seek_point(192, 1 << 40, 192));
+
+    let streaminfo = build_streaminfo();
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 3, seektable.len()));
+    file.extend_from_slice(&seektable);
+    file.extend_from_slice(&f0);
+    file.extend_from_slice(&f1);
+    assert!(o1 > 0);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let mut demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open flac");
+
+    assert_eq!(demuxer.seek_to(0, 200).expect("seek"), 192);
+    assert!(matches!(
+        demuxer.next_packet(),
+        Err(oxideav_core::Error::Eof)
+    ));
+    assert_eq!(demuxer.seek_to(0, 10).expect("seek"), 0);
+    assert_eq!(demuxer.next_packet().expect("packet").pts, Some(0));
+}

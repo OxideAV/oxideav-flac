@@ -703,8 +703,21 @@ impl Demuxer for FlacDemuxer {
             }
         };
 
-        self.input
-            .seek(SeekFrom::Start(self.first_frame_offset + byte_offset))?;
+        // A SEEKTABLE is untrusted input: its 64-bit offset (RFC 9639
+        // §8.5.1) can be any value, including one that carries the
+        // absolute position past `u64::MAX`. Such a point cannot address
+        // a byte of this stream, so it is discarded and the target is
+        // located by the header scan instead — the same answer a file
+        // without a SEEKTABLE would get.
+        let (anchor_sample, position) = match self.first_frame_offset.checked_add(byte_offset) {
+            Some(position) => (anchor_sample, position),
+            None => {
+                let (sample, offset) = self.scan_for_target(target)?;
+                (sample, self.first_frame_offset.saturating_add(offset))
+            }
+        };
+
+        self.input.seek(SeekFrom::Start(position))?;
         self.scan.reset_to(anchor_sample);
         self.eof = false;
         Ok(anchor_sample as i64)

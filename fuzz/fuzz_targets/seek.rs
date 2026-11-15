@@ -210,12 +210,15 @@ fn synth_stream_with_planted_seektable(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     let final_params = enc.output_params().clone();
-    let streaminfo_bytes = final_params.extradata;
-    // `make_encoder` always stashes the 34-byte STREAMINFO payload in
-    // extradata; bail defensively if a future encoder change doesn't.
-    if streaminfo_bytes.len() < 34 {
+    // The encoder's extradata is a metadata chain whose first block is
+    // STREAMINFO: a 4-byte block header followed by the 34-byte payload
+    // (RFC 9639 §8.2). Slice the payload out; bail defensively if a
+    // future encoder change reorders the chain.
+    let chain = final_params.extradata;
+    if chain.len() < 38 || chain[0] & 0x7F != 0 {
         return None;
     }
+    let streaminfo_bytes = &chain[4..38];
 
     // 2. Hand-assemble the SEEKTABLE payload from fuzzer bytes: as many
     //    whole 18-byte seekpoints as the input affords, capped so a
@@ -237,7 +240,7 @@ fn synth_stream_with_planted_seektable(data: &[u8]) -> Option<Vec<u8>> {
         length: 34,
     };
     si_header.write_into(&mut file).ok()?;
-    file.extend_from_slice(&streaminfo_bytes[..34]);
+    file.extend_from_slice(streaminfo_bytes);
 
     let st_header = BlockHeader {
         last: true,

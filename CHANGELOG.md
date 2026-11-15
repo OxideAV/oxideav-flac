@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- demuxer: a SEEKTABLE seek point whose 64-bit offset, added to the
+  position of the first frame, exceeds `u64::MAX` no longer overflows in
+  `seek_to` (found by the scheduled `seek` fuzz target). The unusable
+  point is discarded and the target is located by the frame-header scan,
+  as for a file without a SEEKTABLE.
+- fuzz: the `seek` target's planted-SEEKTABLE path sliced the STREAMINFO
+  payload from the wrong offset of the encoder's metadata chain, so the
+  synthesised stream never opened and that path was dead; it now runs.
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-flac/compare/v0.0.12...v0.0.13) - 2026-11-07
 
 ### Fixed
