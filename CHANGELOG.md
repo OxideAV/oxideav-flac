@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `seek_to` (found by the scheduled `seek` fuzz target). The unusable
   point is discarded and the target is located by the frame-header scan,
   as for a file without a SEEKTABLE.
+- fuzz: the `frame_header` target ran its input-independent boundary
+  sweep (about 240 000 headers) on every input, which held it to roughly
+  one execution per second — a few hundred runs per scheduled slot. The
+  sweep now runs once per process; the target does about 20 000
+  executions per second. Its oracle expects the forbidden frame numbers
+  and block size to be refused.
 - fuzz: the `seek` target's planted-SEEKTABLE path sliced the STREAMINFO
   payload from the wrong offset of the encoder's metadata chain, so the
   synthesised stream never opened and that path was dead; it now runs.

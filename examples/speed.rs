@@ -1,6 +1,6 @@
 //! Encode and decode speed in multiples of real time.
 //!
-//!     cargo run --release --example speed [-- SECONDS [RUNS]]
+//!     cargo run --release --example speed [-- SECONDS [RUNS [DECODE_PASSES]]]
 //!
 //! Two programme-like signals are synthesised (no files are read):
 //! 16-bit / 44.1 kHz stereo and 24-bit / 96 kHz stereo. Each is encoded
@@ -8,8 +8,10 @@
 //! and the resulting packets are decoded again. Every figure is the
 //! median of `RUNS` runs (default 5) over `SECONDS` seconds of audio
 //! (default 30), expressed as "seconds of audio per second of wall
-//! clock". The decoded PCM is compared with the input on every run, so a
-//! number is only printed for a lossless round trip.
+//! clock". Decoding is so much faster than encoding that each run times
+//! `DECODE_PASSES` passes over the packets (default 10) to get a
+//! measurable interval. The decoded PCM is compared with the input on
+//! every run, so a number is only printed for a lossless round trip.
 
 use std::time::Instant;
 
@@ -132,6 +134,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let seconds: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
     let runs: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let passes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
 
     let signals = [
         synthesise("16-bit / 44.1 kHz stereo", 16, 44_100, seconds),
@@ -155,8 +158,10 @@ fn main() {
                 size = packets.iter().map(|p| p.data.len()).sum();
 
                 let t = Instant::now();
-                decode(&packets, &params, &mut out);
-                dec_times.push(t.elapsed().as_secs_f64());
+                for _ in 0..passes {
+                    decode(&packets, &params, &mut out);
+                }
+                dec_times.push(t.elapsed().as_secs_f64() / passes as f64);
                 assert!(out == sig.pcm, "round trip is not lossless");
             }
             let audio = sig.seconds as f64;

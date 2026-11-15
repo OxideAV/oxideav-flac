@@ -300,8 +300,25 @@ struct ExpectedHeader {
 }
 
 /// Verify the parser recovered every field the constructor encoded
-/// and reports the total byte length.
+/// and reports the total byte length — or, for the two field values
+/// that are well-formed but forbidden, that it refused the header:
+///
+///   * a frame number (fixed block size stream) above 31 bits — RFC 9639
+///     §9.1.5: "the value MUST NOT be larger than what fits a value of
+///     31 bits unencoded or 6 bytes encoded";
+///   * the block size 65536 — §9.1.6: "A value of 65535 (corresponding
+///     to a block size of 65536) is forbidden and MUST NOT be used".
 fn assert_recovered(expected: &ExpectedHeader, bytes: &[u8]) {
+    let forbidden = (expected.blocking_strategy == BlockingStrategy::Fixed
+        && expected.coded_number > 0x7FFF_FFFF)
+        || expected.block_size > 65_535;
+    if forbidden {
+        assert!(
+            parse_frame_header(bytes).is_err(),
+            "forbidden frame number / block size must be rejected",
+        );
+        return;
+    }
     let parsed = parse_frame_header(bytes).expect("constructed header must parse");
     assert_eq!(
         parsed.blocking_strategy, expected.blocking_strategy,
@@ -378,19 +395,14 @@ fn flip_and_assert_rejected(bytes: &[u8], bit_index: usize) {
     }
 }
 
-fuzz_target!(|data: &[u8]| {
-    // -----------------------------------------------------------------
-    // Boundary sweep. Runs every iteration so a regression on a
-    // boundary tuple (every block-size-code, every sample-rate-code,
-    // every channel-code, every sample-size-code) is hit even when
-    // the fuzzer hasn't yet produced the right input bytes.
-    //
-    // 16 × 16 × 11 × 7 = 19 712 combinations; sweep a deterministic
-    // subset on every iteration (all 4 outer dimensions × 7
-    // representative coded-number boundary values × {fixed,variable}
-    // blocking == ~28 000 well-formed headers per iter). Most modern
-    // fuzzers hit ~50 K iter/s so this is well inside the budget.
-    // -----------------------------------------------------------------
+/// Boundary sweep: every block-size code × sample-rate code × channel
+/// code × bit-depth code × blocking strategy at seven coded-number
+/// boundaries (about 240 000 well-formed headers), then every reserved
+/// code. It does not depend on the fuzz input, so it runs once per
+/// process — a regression on any tuple still fails the target on its
+/// first input — instead of on every iteration, where it held the
+/// target to about one execution per second.
+fn boundary_sweep() {
     let coded_number_boundaries: [u64; 7] = [
         0,
         0x7F,
@@ -532,6 +544,12 @@ fuzz_target!(|data: &[u8]| {
             cc,
         );
     }
+
+}
+
+fuzz_target!(|data: &[u8]| {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(boundary_sweep);
 
     // -----------------------------------------------------------------
     // Fuzzer-driven construction. The first 16 bytes drive a single
