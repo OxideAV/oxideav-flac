@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decoder: `Decoder::output_params` answers from STREAMINFO (channels,
+  sample format, sample rate) at construction.
+- `examples/speed.rs`: encode, decode and file-level decode speed in
+  multiples of real time.
+
 ### Changed
+
+- decoder: `Decoder::reset` drops the pending packet and clears the
+  end-of-stream mark; it used to leave the decoder reporting the end of
+  the stream after a seek, and to surface the error of a packet that
+  was being discarded.
 
 - decoder: subframes are decoded on a 64-bit bit reservoir straight into
   sample planes that the decoder keeps between frames. A Rice code word

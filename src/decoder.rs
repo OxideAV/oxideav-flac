@@ -113,9 +113,30 @@ impl Decoder for FlacDecoder {
         Ok(())
     }
 
-    // FLAC has no inter-packet DSP state (subframe LPC predictors are
-    // initialised from the frame header), so the default drain-then-
-    // forget `reset` is sufficient.
+    /// Frames are independent of each other (RFC 9639 §10), so there is
+    /// no predictor state to wipe: a reset drops the packet that was
+    /// waiting, if any, and clears the end-of-stream mark so the decoder
+    /// asks for input again instead of reporting the end.
+    fn reset(&mut self) -> Result<()> {
+        self.has_pending = false;
+        self.pending.clear();
+        self.eof = false;
+        Ok(())
+    }
+
+    /// The output description, known from STREAMINFO at construction and
+    /// constant for the life of the decoder: frames that would change
+    /// the channel count or bit depth are refused by `receive_frame`.
+    fn output_params(&self) -> Option<CodecParameters> {
+        let mut p = CodecParameters::audio(self.codec_id.clone());
+        p.channels = Some(self.streaminfo.channels as u16);
+        p.sample_format = Some(self.output_format);
+        // §8.2: a sample rate of 0 marks a stream that is not audio.
+        if self.streaminfo.sample_rate != 0 {
+            p.sample_rate = Some(self.streaminfo.sample_rate);
+        }
+        Some(p)
+    }
 }
 
 fn find_streaminfo(extradata: &[u8]) -> Result<StreamInfo> {
@@ -483,6 +504,45 @@ mod tests {
             let r = make_decoder(&make_params(bps));
             assert!(r.is_ok(), "make_decoder({bps} bps) failed: {:?}", r.err());
         }
+    }
+
+    #[test]
+    fn output_params_come_from_streaminfo() {
+        for (bps, format) in [
+            (8u8, SampleFormat::U8),
+            (12, SampleFormat::S16),
+            (16, SampleFormat::S16),
+            (20, SampleFormat::S24),
+            (24, SampleFormat::S24),
+            (32, SampleFormat::S32),
+        ] {
+            let dec = make_decoder(&make_params(bps)).unwrap();
+            let out = dec.output_params().expect("known from STREAMINFO");
+            assert_eq!(out.sample_format, Some(format));
+            assert_eq!(out.channels, Some(1));
+            assert_eq!(out.sample_rate, Some(44_100));
+            assert_eq!(dec.output_params_generation(), 0);
+        }
+    }
+
+    #[test]
+    fn reset_drops_the_pending_packet_and_the_end_mark() {
+        let mut dec = make_decoder(&make_params(16)).unwrap();
+        let tb = oxideav_core::TimeBase::new(1, 44_100);
+        // Not a frame: decoding it would fail.
+        dec.send_packet(&Packet::new(0, tb, vec![0u8; 16])).unwrap();
+        dec.flush().unwrap();
+        dec.reset().unwrap();
+        // The bad packet is gone and the decoder is not at its end.
+        assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+        dec.send_packet(&Packet::new(0, tb, vec![0u8; 16])).unwrap();
+        assert!(matches!(dec.receive_frame(), Err(Error::InvalidData(_))));
+        // A failed frame leaves the decoder ready for the next packet.
+        dec.send_packet(&Packet::new(0, tb, vec![0u8; 16])).unwrap();
+        assert!(dec.send_packet(&Packet::new(0, tb, vec![0u8; 16])).is_err());
+        dec.flush().unwrap();
+        assert!(dec.receive_frame().is_err());
+        assert!(matches!(dec.receive_frame(), Err(Error::Eof)));
     }
 
     // --- 32-bit stereo-decorrelated frame (33-bit side channel) --------
