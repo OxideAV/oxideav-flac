@@ -1,12 +1,8 @@
-//! FLAC frame header parsing.
-//!
-//! Format reference: <https://xiph.org/flac/format.html#frame_header>
+//! FLAC frame header parsing (RFC 9639 §9.1).
 
 use oxideav_core::{Error, Result};
 
-use crate::bits_ext::BitReaderExt;
 use crate::crc;
-use oxideav_core::bits::BitReader;
 
 /// Per-channel layout of the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,69 +58,95 @@ impl FrameHeader {
     }
 }
 
+/// Longest possible frame header: 4 fixed bytes, a 7-byte coded number,
+/// a 2-byte uncommon block size, a 2-byte uncommon sample rate and the
+/// CRC-8 (RFC 9639 §9.1).
+pub const MAX_FRAME_HEADER_LEN: usize = 16;
+
+/// Largest block size a frame header may carry. The 16-bit uncommon
+/// block size field could express 65536, but RFC 9639 §9.1.6 forbids it
+/// because STREAMINFO cannot represent it.
+pub const MAX_BLOCK_SIZE: u32 = 65_535;
+
+/// Decode the coded number of RFC 9639 §9.1.5 (Table 18) from the start
+/// of `bytes`: a UTF-8-shaped variable-length code extended to 7 bytes /
+/// 36 bits. Returns the value and the number of bytes it occupies, or
+/// `Error::NeedMore` when `bytes` ends inside the code.
+fn parse_coded_number(bytes: &[u8]) -> Result<(u64, usize)> {
+    let Some(&lead) = bytes.first() else {
+        return Err(Error::NeedMore);
+    };
+    // The number of leading one bits is the length of the sequence; a
+    // single byte has none, and one leading one bit (a continuation
+    // byte) or eight of them cannot start a sequence.
+    let len = match lead.leading_ones() {
+        0 => 1,
+        n @ 2..=7 => n as usize,
+        _ => {
+            return Err(Error::invalid(
+                "FLAC frame: invalid first byte of coded number",
+            ));
+        }
+    };
+    // A sequence of `len` bytes keeps `7 - len` payload bits in its first
+    // byte (seven of them when it is a single byte).
+    let mut value = if len == 1 {
+        lead as u64
+    } else {
+        (lead as u64) & (0x7F >> len)
+    };
+    for i in 1..len {
+        let Some(&byte) = bytes.get(i) else {
+            return Err(Error::NeedMore);
+        };
+        if byte & 0xC0 != 0x80 {
+            return Err(Error::invalid(
+                "FLAC frame: invalid continuation byte in coded number",
+            ));
+        }
+        value = (value << 6) | (byte & 0x3F) as u64;
+    }
+    Ok((value, len))
+}
+
 /// Parse a frame header from `bytes`. Verifies the trailing CRC-8.
 ///
-/// Returns the parsed header on success. The caller is responsible for
-/// supplying enough bytes — this function returns `Error::NeedMore` when
-/// `bytes` is short.
+/// Returns `Error::NeedMore` when `bytes` ends before the header does
+/// (a header is at most [`MAX_FRAME_HEADER_LEN`] bytes), and
+/// `Error::InvalidData` when the bytes are not a frame header: wrong sync
+/// code, a reserved or forbidden field value, a set reserved bit, or a
+/// CRC-8 mismatch.
 pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
-    if bytes.len() < 6 {
+    if bytes.len() < 2 {
         return Err(Error::NeedMore);
     }
+    // §9.1: the 15-bit sync code 0b111111111111100, then the blocking
+    // strategy bit.
     if bytes[0] != 0xFF || (bytes[1] & 0xFE) != 0xF8 {
         return Err(Error::invalid("FLAC frame: missing sync"));
     }
-
-    let mut br = BitReader::new(bytes);
-    // Bits 0..15: sync. Bit 14 is the 14th sync bit.
-    // We've already validated bytes[0..2] above, so just consume them.
-    let _sync = br.read_u32(14)?;
-    let _reserved_a = br.read_u32(1)?; // must be 0
-    let blocking_bit = br.read_u32(1)?;
-    let blocking_strategy = if blocking_bit == 0 {
+    if bytes.len() < 4 {
+        return Err(Error::NeedMore);
+    }
+    let blocking_strategy = if bytes[1] & 1 == 0 {
         BlockingStrategy::Fixed
     } else {
         BlockingStrategy::Variable
     };
+    let block_size_code = bytes[2] >> 4;
+    let sample_rate_code = bytes[2] & 0x0F;
+    let channel_code = bytes[3] >> 4;
+    let sample_size_code = (bytes[3] >> 1) & 0x07;
 
-    let block_size_code = br.read_u32(4)? as u8;
-    let sample_rate_code = br.read_u32(4)? as u8;
-    let channel_code = br.read_u32(4)? as u8;
-    let sample_size_code = br.read_u32(3)? as u8;
-    let _reserved_b = br.read_u32(1)?; // must be 0
-
-    let coded_number = br.read_utf8_u64()?;
-
-    let block_size = match block_size_code {
-        0 => return Err(Error::invalid("FLAC frame: reserved block size code 0")),
-        1 => 192,
-        2..=5 => 576 << (block_size_code - 2),
-        6 => br.read_u32(8)? + 1,
-        7 => br.read_u32(16)? + 1,
-        8..=15 => 256u32 << (block_size_code - 8),
-        _ => unreachable!(),
-    };
-
-    let sample_rate = match sample_rate_code {
-        0 => 0, // get from streaminfo
-        1 => 88_200,
-        2 => 176_400,
-        3 => 192_000,
-        4 => 8_000,
-        5 => 16_000,
-        6 => 22_050,
-        7 => 24_000,
-        8 => 32_000,
-        9 => 44_100,
-        10 => 48_000,
-        11 => 96_000,
-        12 => br.read_u32(8)? * 1000,
-        13 => br.read_u32(16)?,
-        14 => br.read_u32(16)? * 10,
-        15 => return Err(Error::invalid("FLAC frame: invalid sample rate code 15")),
-        _ => unreachable!(),
-    };
-
+    // Everything the first four bytes can rule out is checked before the
+    // variable part is read, so a false sync code is rejected without
+    // waiting for more input.
+    if block_size_code == 0 {
+        return Err(Error::invalid("FLAC frame: reserved block size code 0"));
+    }
+    if sample_rate_code == 15 {
+        return Err(Error::invalid("FLAC frame: invalid sample rate code 15"));
+    }
     let channels = match channel_code {
         0..=7 => ChannelAssignment::Independent(channel_code + 1),
         8 => ChannelAssignment::LeftSide,
@@ -136,32 +158,75 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
             )));
         }
     };
-
-    // RFC 9639 §9.1.4 Table 17 — sample-size (bit-depth) code:
-    //   0b000 → from STREAMINFO, 0b001 → 8, 0b010 → 12, 0b011 reserved,
-    //   0b100 → 16, 0b101 → 20, 0b110 → 24, 0b111 → 32.
+    // §9.1.4, Table 17. Code 0 means "only stored in STREAMINFO".
     let bits_per_sample = match sample_size_code {
-        0 => 0, // get from streaminfo
+        0 => 0,
         1 => 8,
         2 => 12,
         3 => return Err(Error::invalid("FLAC frame: reserved sample size code 3")),
         4 => 16,
         5 => 20,
         6 => 24,
-        7 => 32,
-        _ => unreachable!(),
+        _ => 32,
+    };
+    if bytes[3] & 1 != 0 {
+        return Err(Error::invalid("FLAC frame: reserved header bit is set"));
+    }
+
+    let (coded_number, coded_len) = parse_coded_number(&bytes[4..])?;
+    // §9.1.5: a frame number is at most 31 bits (6 bytes); only a sample
+    // number may use the 7-byte form.
+    if blocking_strategy == BlockingStrategy::Fixed && coded_number > 0x7FFF_FFFF {
+        return Err(Error::invalid(
+            "FLAC frame: frame number does not fit in 31 bits",
+        ));
+    }
+    let mut pos = 4 + coded_len;
+    // Big-endian field of `len` bytes at `pos` (§9.1.6, §9.1.7).
+    let mut field = |len: usize| -> Result<u32> {
+        let Some(raw) = bytes.get(pos..pos + len) else {
+            return Err(Error::NeedMore);
+        };
+        pos += len;
+        Ok(raw.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32))
     };
 
-    // Header is now byte-aligned. The next byte is the CRC-8.
-    if !br.is_byte_aligned() {
-        return Err(Error::invalid("FLAC frame: header not byte aligned at CRC"));
+    // §9.1.1, Table 14; an uncommon block size follows the coded number.
+    let block_size = match block_size_code {
+        1 => 192,
+        2..=5 => 576 << (block_size_code - 2),
+        6 => field(1)? + 1,
+        7 => field(2)? + 1,
+        _ => 256u32 << (block_size_code - 8),
+    };
+    if block_size > MAX_BLOCK_SIZE {
+        return Err(Error::invalid("FLAC frame: forbidden block size 65536"));
     }
-    let header_bytes_so_far = br.byte_position();
-    if bytes.len() < header_bytes_so_far + 1 {
+    // §9.1.2, Table 15; an uncommon sample rate follows the uncommon
+    // block size. Code 0 means "only stored in STREAMINFO".
+    let sample_rate = match sample_rate_code {
+        0 => 0,
+        1 => 88_200,
+        2 => 176_400,
+        3 => 192_000,
+        4 => 8_000,
+        5 => 16_000,
+        6 => 22_050,
+        7 => 24_000,
+        8 => 32_000,
+        9 => 44_100,
+        10 => 48_000,
+        11 => 96_000,
+        12 => field(1)? * 1000,
+        13 => field(2)?,
+        _ => field(2)? * 10,
+    };
+
+    // §9.1.8: CRC-8 over everything before it, sync code included.
+    let Some(&claimed_crc) = bytes.get(pos) else {
         return Err(Error::NeedMore);
-    }
-    let claimed_crc = bytes[header_bytes_so_far];
-    let computed = crc::crc8(&bytes[..header_bytes_so_far]);
+    };
+    let computed = crc::crc8(&bytes[..pos]);
     if computed != claimed_crc {
         return Err(Error::invalid(format!(
             "FLAC frame header CRC-8 mismatch (got {:#04x}, want {:#04x})",
@@ -176,7 +241,7 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader> {
         channels,
         bits_per_sample,
         coded_number,
-        header_byte_len: header_bytes_so_far + 1,
+        header_byte_len: pos + 1,
     })
 }
 

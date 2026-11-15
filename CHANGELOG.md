@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- frame header: the forbidden block size 65536 (RFC 9639 §9.1.6), a set
+  reserved bit after the bit depth (§9.1.4) and a frame number of more
+  than 31 bits (§9.1.5) are rejected. A header that is cut short by the
+  end of the input reports `Error::NeedMore` at any length instead of
+  "invalid" once six bytes were present, so a header straddling two
+  reads is no longer mistaken for a false sync code.
 - demuxer: a SEEKTABLE seek point whose 64-bit offset, added to the
   position of the first frame, exceeds `u64::MAX` no longer overflows in
   `seek_to` (found by the scheduled `seek` fuzz target). The unusable
