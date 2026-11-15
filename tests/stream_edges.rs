@@ -461,10 +461,10 @@ fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
     }
     // An outside decoder agrees that the stream is valid and that its
     // MD5 matches (skipped when none is installed).
-    if !encoded.packets.is_empty() {
-        if let Some(accepted) = black_box_accepts(&file) {
-            assert!(accepted, "black-box decoder rejected the stream");
-        }
+    if !encoded.packets.is_empty()
+        && let Some(accepted) = black_box_accepts(&file)
+    {
+        assert!(accepted, "black-box decoder rejected the stream");
     }
     let mut demux = open(file);
     let mut dec = oxideav_flac::decoder::make_decoder(&demux.streams()[0].params).unwrap();
