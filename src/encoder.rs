@@ -37,7 +37,7 @@ use oxideav_core::{
 
 use crate::bits_ext::BitWriterExt;
 use crate::crc;
-use crate::decoder::decode_frame_channels;
+use crate::decoder::FrameScratch;
 use crate::md5::Md5;
 use crate::metadata::{BlockHeader, BlockType, StreamInfo, write_padding};
 use oxideav_core::bits::BitWriter;
@@ -1960,22 +1960,26 @@ fn verify_encoded_frame(
         total_samples: 0,
         md5: [0u8; 16],
     };
-    let decoded = decode_frame_channels(frame, &info).map_err(|e| {
+    // Strict: the self-check also refuses frames a lenient decoder would
+    // play although RFC 9639 forbids them.
+    let mut scratch = FrameScratch::strict();
+    let decoded = scratch.decode(frame, &info).map_err(|e| {
         Error::invalid(format!(
             "FLAC verify (frame {}): encoded frame failed to decode: {}",
             frame_number, e
         ))
     })?;
+    let channels = &scratch.planes()[..decoded.channels];
 
-    if decoded.channels.len() != per_channel.len() {
+    if channels.len() != per_channel.len() {
         return Err(Error::invalid(format!(
             "FLAC verify (frame {}): channel count {} != input {}",
             frame_number,
-            decoded.channels.len(),
+            channels.len(),
             per_channel.len()
         )));
     }
-    for (c, (got, want)) in decoded.channels.iter().zip(per_channel.iter()).enumerate() {
+    for (c, (got, want)) in channels.iter().zip(per_channel.iter()).enumerate() {
         if got.len() != want.len() {
             return Err(Error::invalid(format!(
                 "FLAC verify (frame {}): channel {} length {} != input {}",

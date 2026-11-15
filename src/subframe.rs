@@ -52,6 +52,28 @@ pub fn decode_subframe_wide(br: &mut BitReservoir, block_size: u32, bps: u32) ->
     Ok(samples)
 }
 
+/// How a subframe whose first residual partition is empty is treated.
+///
+/// RFC 9639 §9.2.7 requires `block size >> partition order` to be larger
+/// than the predictor order, so that the first partition — which is
+/// shorter than the others by the predictor order — holds at least one
+/// residual sample. A stream that makes the two equal is not valid, but
+/// it is still unambiguous: the count the same section defines,
+/// `(block size >> partition order) - predictor order`, is zero, and the
+/// partition consists of its parameter alone. Decoders in the field play
+/// such streams, so this one does too unless asked to be strict. A
+/// predictor order *above* the partition length has no meaning (the
+/// count would be negative) and is always an error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmptyFirstPartition {
+    /// Decode it: the first partition contributes no residual samples.
+    #[default]
+    Accept,
+    /// Refuse it, as the letter of §9.2.7 does. What an encoder's
+    /// self-check wants.
+    Reject,
+}
+
 /// Decode one subframe into `out`; the block size is `out.len()`.
 ///
 /// `bps` must be `1..=32` for an `i32` slice and `1..=33` for an `i64`
@@ -60,6 +82,17 @@ pub fn decode_subframe_into<S: Sample>(
     br: &mut BitReservoir,
     out: &mut [S],
     bps: u32,
+) -> Result<()> {
+    decode_subframe_with(br, out, bps, EmptyFirstPartition::Accept)
+}
+
+/// [`decode_subframe_into`] with an explicit choice for an empty first
+/// residual partition.
+pub fn decode_subframe_with<S: Sample>(
+    br: &mut BitReservoir,
+    out: &mut [S],
+    bps: u32,
+    empty_first: EmptyFirstPartition,
 ) -> Result<()> {
     debug_assert!((1..=33).contains(&bps));
     // §9.2.1: one zero bit, six type bits, the wasted-bits flag.
@@ -92,7 +125,7 @@ pub fn decode_subframe_into<S: Sample>(
         0b001000..=0b001100 => {
             let order = (type_code - 8) as usize;
             read_warm_up(br, out, order, depth)?;
-            decode_residual(br, out, order)?;
+            decode_residual(br, out, order, empty_first)?;
             restore_fixed(out, order);
         }
         0b100000..=0b111111 => {
@@ -114,7 +147,7 @@ pub fn decode_subframe_into<S: Sample>(
             }
             let mut coefficients = [0i32; MAX_LPC_ORDER];
             br.read_signed_run(precision, &mut coefficients[..order])?;
-            decode_residual(br, out, order)?;
+            decode_residual(br, out, order, empty_first)?;
             restore_linear(out, &coefficients[..order], shift);
         }
         _ => {
@@ -134,19 +167,18 @@ pub fn decode_subframe_into<S: Sample>(
 }
 
 /// Read the `order` unencoded warm-up samples that open a predicted
-/// subframe (§9.2.5, §9.2.6). A predictor needs more samples than its
-/// order to have anything to predict, so an order that does not leave at
-/// least one residual sample is rejected here, before anything is
-/// written past the block.
+/// subframe (§9.2.5, §9.2.6). An order above the block size is rejected
+/// here, before anything is written past the block; an order equal to it
+/// leaves no residual at all and is settled by [`decode_residual`].
 fn read_warm_up<S: Sample>(
     br: &mut BitReservoir,
     out: &mut [S],
     order: usize,
     depth: u32,
 ) -> Result<()> {
-    if order >= out.len() {
+    if order > out.len() {
         return Err(Error::invalid(format!(
-            "FLAC subframe: predictor order {order} needs a block larger than {} samples",
+            "FLAC subframe: predictor order {order} exceeds the block of {} samples",
             out.len()
         )));
     }
@@ -158,12 +190,16 @@ fn read_warm_up<S: Sample>(
 ///
 /// The residual is cut into `2^partition order` partitions of
 /// `block size >> partition order` samples each, the first one shortened
-/// by the predictor order. Two MUSTs bound the partition order: the block
-/// size is evenly divisible by the partition count, and
-/// `block size >> partition order` is larger than the predictor order —
-/// so the first partition always holds at least one residual sample, and
-/// a stream where it would hold none (or fewer) is invalid.
-fn decode_residual<S: Sample>(br: &mut BitReservoir, out: &mut [S], order: usize) -> Result<()> {
+/// by the predictor order. The block size MUST be evenly divisible by the
+/// partition count, and `block size >> partition order` MUST be larger
+/// than the predictor order; see [`EmptyFirstPartition`] for the case
+/// where the two are equal.
+fn decode_residual<S: Sample>(
+    br: &mut BitReservoir,
+    out: &mut [S],
+    order: usize,
+    empty_first: EmptyFirstPartition,
+) -> Result<()> {
     let block_size = out.len();
     // Two method bits and four partition-order bits.
     let lead = br.read_u32(6)?;
@@ -179,7 +215,9 @@ fn decode_residual<S: Sample>(br: &mut BitReservoir, out: &mut [S], order: usize
             "FLAC residual: block size {block_size} is not divisible by 2^{partition_order} partitions"
         )));
     }
-    if partition_len <= order {
+    if partition_len < order
+        || (partition_len == order && empty_first == EmptyFirstPartition::Reject)
+    {
         return Err(Error::invalid(format!(
             "FLAC residual: partition of {partition_len} samples is not larger than predictor order {order}"
         )));

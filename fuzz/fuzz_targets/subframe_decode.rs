@@ -88,7 +88,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_flac::reservoir::BitReservoir;
-use oxideav_flac::subframe::{decode_subframe, decode_subframe_into, decode_subframe_wide};
+use oxideav_flac::subframe::{
+    EmptyFirstPartition, decode_subframe, decode_subframe_into, decode_subframe_wide,
+    decode_subframe_with,
+};
 
 /// Largest block size a §9.1 frame header can encode (16-bit immediate).
 const MAX_BLOCK_SIZE: u32 = 65535;
@@ -137,11 +140,26 @@ fuzz_target!(|data: &[u8]| {
             let mut br64 = BitReservoir::new(body);
             let wide_result = decode_subframe_into(&mut br64, &mut wide, bps);
             assert_eq!(narrow.is_ok(), wide_result.is_ok());
+            // The strict rule set only ever refuses more: whatever it
+            // accepts, the default accepts with the same samples.
+            let mut strict = vec![0i32; block_size as usize];
+            let mut br_strict = BitReservoir::new(body);
+            let strict_result = decode_subframe_with(
+                &mut br_strict,
+                &mut strict,
+                bps,
+                EmptyFirstPartition::Reject,
+            );
             if let Ok(narrow) = narrow {
                 assert_eq!(br.bit_position(), br64.bit_position());
                 if wide.iter().all(|&s| s == s as i32 as i64) {
                     assert!(narrow.iter().zip(&wide).all(|(&a, &b)| a as i64 == b));
                 }
+                if strict_result.is_ok() {
+                    assert_eq!(narrow, strict);
+                }
+            } else {
+                assert!(strict_result.is_err());
             }
         }
     }

@@ -9,7 +9,7 @@ use crate::crc;
 use crate::frame::{ChannelAssignment, parse_frame_header};
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 use crate::reservoir::BitReservoir;
-use crate::subframe::decode_subframe_into;
+use crate::subframe::{EmptyFirstPartition, decode_subframe_with};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let streaminfo = find_streaminfo(&params.extradata)?;
@@ -201,12 +201,23 @@ pub struct FrameScratch {
     planes: Vec<Vec<i32>>,
     /// The 33-bit side channel of a 32-bit stereo-decorrelated frame.
     side: Vec<i64>,
+    empty_first: EmptyFirstPartition,
 }
 
 impl FrameScratch {
     /// Empty scratch; nothing is allocated until the first frame.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A scratch that refuses what RFC 9639 forbids even where decoding
+    /// would be unambiguous (see [`EmptyFirstPartition`]). The encoder
+    /// checks its own frames with this.
+    pub fn strict() -> Self {
+        Self {
+            empty_first: EmptyFirstPartition::Reject,
+            ..Self::default()
+        }
     }
 
     /// The planes of the most recently decoded frame. Only the first
@@ -257,15 +268,16 @@ impl FrameScratch {
         if wide_side {
             self.side.resize(block_size, 0);
         }
+        let rule = self.empty_first;
         for (index, plane) in self.planes[..n_channels].iter_mut().enumerate() {
             if side_index == Some(index) {
                 if wide_side {
-                    decode_subframe_into(&mut br, &mut self.side[..], bps + 1)?;
+                    decode_subframe_with(&mut br, &mut self.side[..], bps + 1, rule)?;
                 } else {
-                    decode_subframe_into(&mut br, &mut plane[..], bps + 1)?;
+                    decode_subframe_with(&mut br, &mut plane[..], bps + 1, rule)?;
                 }
             } else {
-                decode_subframe_into(&mut br, &mut plane[..], bps)?;
+                decode_subframe_with(&mut br, &mut plane[..], bps, rule)?;
             }
         }
 

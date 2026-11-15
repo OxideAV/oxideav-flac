@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - decoder: a Rice-coded residual outside the 32-bit residual range of
   RFC 9639 §9.2.7.3 is now an error instead of being truncated, and a
   side sample of a 32-bit stereo frame outside 33 bits is an error.
+- decoder: a predicted subframe whose first residual partition is empty
+  (`block size >> partition order` equal to the predictor order) is
+  decoded: the partition's sample count as RFC 9639 §9.2.7 defines it is
+  zero, so the stream is unambiguous although §9.2.7 forbids it, and
+  black-box decoders play it. A predictor order above the partition
+  length stays an error. The encoder never emits either, and its
+  `verify` self-check now decodes in a strict mode that refuses both.
 - decoder: `Decoder::receive_frame` refuses a frame whose header
   announces a channel count or bit depth other than the one in
   STREAMINFO (RFC 9639 §9 lets a decoder stop on such a change); the

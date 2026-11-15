@@ -442,8 +442,16 @@ fn encode(
 fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
     let mut dec = oxideav_flac::decoder::make_decoder(&encoded.params).unwrap();
     let mut direct = Vec::new();
+    // The strict decoder refuses everything RFC 9639 forbids, including
+    // what the default decoder tolerates.
+    let mut strict = oxideav_flac::decoder::FrameScratch::strict();
+    let info = oxideav_flac::metadata::StreamInfo::parse(&encoded.params.extradata[4..38]).unwrap();
     for p in &encoded.packets {
         direct.extend_from_slice(&decode_packet(&mut dec, p).expect("own frame decodes"));
+        let shape = strict
+            .decode(&p.data, &info)
+            .expect("own frame is strictly valid");
+        assert_eq!(shape.frame_byte_len, p.data.len());
     }
 
     let mut file = b"fLaC".to_vec();

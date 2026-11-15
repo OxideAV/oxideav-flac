@@ -511,11 +511,20 @@ fn partition_count_must_divide_the_block() {
 // --- The first partition and the predictor order ----------------------------
 
 /// §9.2.7: "The partition order also MUST be such that the (block size >>
-/// partition order) is larger than the predictor order." The first
-/// partition therefore always carries at least one residual sample.
+/// partition order) is larger than the predictor order." A valid stream
+/// therefore has at least one residual sample in its first partition.
+///
+/// A stream that makes the two *equal* breaks that rule but is still
+/// unambiguous — the first partition's sample count, "(block size >>
+/// partition order) - predictor order", is zero — and black-box decoders
+/// play it, so the decoder accepts it by default and refuses it in strict
+/// mode. A predictor order above the partition length would make the
+/// count negative and is always refused.
 #[test]
-fn first_partition_must_be_larger_than_the_predictor_order() {
-    // One residual sample in the first partition: the smallest legal case.
+fn first_partition_against_the_predictor_order() {
+    use oxideav_flac::decoder::FrameScratch;
+
+    // One residual sample in the first partition: the smallest valid case.
     for (block_size, order, partition_order) in [
         (2u32, 1usize, 0u32),
         (5, 4, 0),
@@ -526,15 +535,17 @@ fn first_partition_must_be_larger_than_the_predictor_order() {
         let (bytes, want) = fixed_signal_frame(block_size, order, 0, partition_order, 6);
         assert_eq!(
             decode(&bytes, 1, 16).unwrap(),
-            vec![want],
+            vec![want.clone()],
             "block {block_size} order {order} partition order {partition_order}"
         );
+        let mut strict = FrameScratch::strict();
+        strict.decode(&bytes, &stream_info(1, 16)).unwrap();
+        assert_eq!(strict.planes()[0], want);
     }
 
-    // Zero residual samples in the first partition (partition length
-    // equal to the predictor order): forbidden. The partition is written
-    // out completely — parameter and no code words — so the only thing
-    // wrong with the frame is the rule itself.
+    // Zero residual samples in the first partition: its parameter (or
+    // escape code and width) is present, no code word follows. The last
+    // two cases have a single partition, so the subframe is all warm-up.
     for (block_size, order, partition_order) in [
         (4096u32, 4usize, 10u32),
         (16, 4, 2),
@@ -545,21 +556,36 @@ fn first_partition_must_be_larger_than_the_predictor_order() {
     ] {
         let per = (block_size >> partition_order) as usize;
         assert_eq!(per, order);
-        let parts: Vec<Partition> = (0..1usize << partition_order)
-            .map(|p| Partition::Rice(2, vec![1; if p == 0 { 0 } else { per }]))
-            .collect();
-        let warm_up = vec![0i64; order];
-        let bytes = frame(&Header::new(block_size, 0, 4), |w| {
-            put_fixed(w, order, &warm_up, 16, 0, 0, partition_order, &parts)
-        });
-        assert!(
-            decode(&bytes, 1, 16).is_err(),
-            "block {block_size} order {order} partition order {partition_order}"
-        );
+        let sig = signal(block_size as usize, 3);
+        let residuals = fixed_residuals(&sig, order);
+        for first_escaped in [false, true] {
+            let mut parts = vec![if first_escaped {
+                Partition::Escape(9, vec![])
+            } else {
+                Partition::Rice(2, vec![])
+            }];
+            parts.extend(
+                residuals
+                    .chunks(per)
+                    .map(|r| Partition::Rice(7, r.to_vec())),
+            );
+            assert_eq!(parts.len(), 1 << partition_order);
+            let bytes = frame(&Header::new(block_size, 0, 4), |w| {
+                put_fixed(w, order, &sig[..order], 16, 0, 0, partition_order, &parts)
+            });
+            let what =
+                format!("block {block_size} order {order} partition order {partition_order}");
+            assert_eq!(decode(&bytes, 1, 16).unwrap(), vec![as_i32(&sig)], "{what}");
+            assert!(
+                FrameScratch::strict()
+                    .decode(&bytes, &stream_info(1, 16))
+                    .is_err(),
+                "{what} (strict)"
+            );
+        }
     }
 
-    // Predictor order above the partition length: the first partition
-    // would have a negative sample count.
+    // Predictor order above the partition length: refused either way.
     for (block_size, order, partition_order) in [(16u32, 4usize, 3u32), (4096, 3, 11), (3, 4, 0)] {
         let per = (block_size >> partition_order) as usize;
         assert!(per < order);
@@ -574,9 +600,13 @@ fn first_partition_must_be_larger_than_the_predictor_order() {
             }
             put_residual(w, 0, partition_order, &parts);
         });
+        let what = format!("block {block_size} order {order} partition order {partition_order}");
+        assert!(decode(&bytes, 1, 16).is_err(), "{what}");
         assert!(
-            decode(&bytes, 1, 16).is_err(),
-            "block {block_size} order {order} partition order {partition_order}"
+            FrameScratch::strict()
+                .decode(&bytes, &stream_info(1, 16))
+                .is_err(),
+            "{what} (strict)"
         );
     }
 }
@@ -596,9 +626,30 @@ fn linear_predictor_order_against_block_size() {
         assert_eq!(model, sig);
         assert_eq!(decode(&bytes, 1, 16).unwrap(), vec![as_i32(&sig)]);
     }
-    // A 32-sample block has no residual left; smaller ones cannot even
-    // hold the warm-up.
-    for block_size in [32u32, 31, 16, 1] {
+    // A 32-sample block is all warm-up: no residual sample is left, which
+    // §9.2.7 forbids; it decodes to the warm-up samples by default and is
+    // refused in strict mode.
+    let bytes = frame(&Header::new(32, 0, 4), |w| {
+        put_linear(
+            w,
+            &warm_up,
+            16,
+            5,
+            4,
+            &coefficients,
+            0,
+            0,
+            &[Partition::Rice(0, vec![])],
+        )
+    });
+    assert_eq!(decode(&bytes, 1, 16).unwrap(), vec![as_i32(&warm_up)]);
+    assert!(
+        oxideav_flac::decoder::FrameScratch::strict()
+            .decode(&bytes, &stream_info(1, 16))
+            .is_err()
+    );
+    // Smaller blocks cannot even hold the warm-up.
+    for block_size in [31u32, 16, 1] {
         let bytes = frame(&Header::new(block_size, 0, 4), |w| {
             put_subframe_header(w, 0b111111, 0);
             for &s in warm_up.iter().take(block_size as usize) {
