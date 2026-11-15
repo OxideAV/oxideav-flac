@@ -200,7 +200,6 @@ pub fn decode_frame_channels(data: &[u8], streaminfo: &StreamInfo) -> Result<Dec
 }
 
 /// What [`FrameScratch::decode`] found in a frame.
-#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FrameShape {
@@ -216,7 +215,10 @@ pub struct FrameShape {
 
 /// Reusable sample planes for decoding frame after frame without
 /// allocating: the planes grow to the largest block seen and stay.
-#[doc(hidden)]
+///
+/// This is the frame-level decoder underneath the [`Decoder`] trait
+/// object and [`decode_frame_channels`], for callers that want the
+/// decoded `i32` planes rather than packed PCM bytes.
 #[derive(Default)]
 pub struct FrameScratch {
     planes: Vec<Vec<i32>>,
@@ -232,8 +234,12 @@ impl FrameScratch {
     }
 
     /// A scratch that refuses what RFC 9639 forbids even where decoding
-    /// would be unambiguous (see [`EmptyFirstPartition`]). The encoder
-    /// checks its own frames with this.
+    /// would be unambiguous: a predicted subframe whose first residual
+    /// partition is empty (§9.2.7 requires `block size >> partition
+    /// order` to be larger than the predictor order; the default decoder
+    /// also accepts the two being equal, where the first partition
+    /// simply holds no residual sample). The encoder checks its own
+    /// frames with this.
     pub fn strict() -> Self {
         Self {
             empty_first: EmptyFirstPartition::Reject,

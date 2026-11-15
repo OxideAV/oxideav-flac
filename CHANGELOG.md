@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - decoder: `Decoder::output_params` answers from STREAMINFO (channels,
   sample format, sample rate) at construction.
+- decoder: `FrameScratch` — the frame-level decoder with reusable `i32`
+  sample planes (`decode` returns a `FrameShape`), and
+  `FrameScratch::strict()`, which also refuses the one invalid stream
+  shape the default decoder tolerates.
 - `examples/speed.rs`: encode, decode and file-level decode speed in
   multiples of real time.
 
