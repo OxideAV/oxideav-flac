@@ -63,6 +63,8 @@ enum Probe {
     NeedData,
     /// The buffered bytes are exhausted and the stream has ended.
     End,
+    /// The search reached the position it was told to stop at.
+    Stop,
 }
 
 pub(crate) struct FrameScanner {
@@ -203,12 +205,16 @@ impl FrameScanner {
         self.crc.value() == u16::from_be_bytes([self.buffer[end - 2], self.buffer[end - 1]])
     }
 
-    /// Find the next header-shaped position at or after `probe`.
-    fn probe_next(&mut self, eof: bool) -> Probe {
+    /// Find the next header-shaped position at or after `probe` and
+    /// before `stop`. Stopping at a position that depends only on the
+    /// stream — not on how many bytes happen to be buffered — keeps the
+    /// cuts the same however the input is chunked.
+    fn probe_next(&mut self, eof: bool, stop: usize) -> Probe {
         let len = self.buffer.len();
+        let end = len.min(stop);
         let mut at = self.probe;
-        while at < len {
-            let Some(step) = self.buffer[at..].iter().position(|&b| b == 0xFF) else {
+        while at < end {
+            let Some(step) = self.buffer[at..end].iter().position(|&b| b == 0xFF) else {
                 break;
             };
             at += step;
@@ -226,6 +232,10 @@ impl FrameScanner {
                 Err(_) => at += 1,
             }
         }
+        if self.probe >= stop || len >= stop {
+            self.probe = self.probe.max(stop);
+            return Probe::Stop;
+        }
         self.probe = len;
         if eof { Probe::End } else { Probe::NeedData }
     }
@@ -235,12 +245,12 @@ impl FrameScanner {
     pub fn next_frame(&mut self, eof: bool) -> Option<FrameSpan> {
         loop {
             let Some(header) = self.head_frame.clone() else {
-                match self.probe_next(eof) {
+                match self.probe_next(eof, usize::MAX) {
                     Probe::Found(position, header) => {
                         self.begin(position, header);
                         continue;
                     }
-                    Probe::NeedData | Probe::End => {
+                    Probe::NeedData | Probe::End | Probe::Stop => {
                         // Nothing before `probe` starts a frame.
                         self.head = self.probe;
                         self.crc_pos = self.probe;
@@ -274,13 +284,15 @@ impl FrameScanner {
                 self.tested += 1;
             }
 
-            if !give_up && self.probe - self.head <= self.limit {
-                match self.probe_next(eof) {
+            if !give_up {
+                // A frame of this shape ends at or before `head + limit`.
+                match self.probe_next(eof, self.head + self.limit + 1) {
                     Probe::Found(position, next) => {
                         self.candidates.push_back((position, next));
                         continue;
                     }
                     Probe::NeedData => return None,
+                    Probe::Stop => {}
                     Probe::End => {
                         // The stream ends here; so may the frame.
                         let end = self.buffer.len();
@@ -478,6 +490,52 @@ mod tests {
         // is not confirmed, and a decoder ignores bytes after the frame.
         assert!(got[1].1.starts_with(&frames[1]));
         assert!(!got[1].2);
+    }
+
+    /// The cuts depend on the stream, not on how it arrives: junk, damage
+    /// and frames with nothing recognisable after them come out the same
+    /// for every chunking.
+    #[test]
+    fn cuts_do_not_depend_on_chunking() {
+        let mut stream = Vec::new();
+        let mut seed = 0x1234_5678u32;
+        let mut junk = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    // Plenty of 0xFF and 0xF8 bytes to exercise the probe.
+                    match seed % 5 {
+                        0 => 0xFF,
+                        1 => 0xF8,
+                        _ => (seed >> 8) as u8,
+                    }
+                })
+                .collect()
+        };
+        stream.extend_from_slice(&junk(300));
+        for i in 0..12u8 {
+            let mut f = frame(i, &body(50 + 13 * i as usize, i));
+            if i % 4 == 1 {
+                f[9] ^= 0x40; // damaged audio
+            }
+            stream.extend_from_slice(&f);
+            if i % 3 == 2 {
+                // Far more junk than a frame can be long.
+                stream.extend_from_slice(&junk(2500));
+                stream.extend_from_slice(&false_sync(i));
+            }
+        }
+        stream.extend_from_slice(&junk(1700));
+
+        let reference = scan(&stream, stream.len());
+        assert!(reference.len() >= 12);
+        let covered: usize = reference.iter().map(|(_, bytes, _)| bytes.len()).sum();
+        assert!(covered <= stream.len());
+        for chunk in [1, 2, 3, 7, 64, 255, 256, 1000, 8192] {
+            assert_eq!(scan(&stream, chunk), reference, "chunk {chunk}");
+        }
     }
 
     #[test]
