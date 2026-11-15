@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- demuxer: a frame is cut where its CRC-16 confirms it ends, not at the
+  first sync code with a valid header CRC-8. Such a header-shaped run
+  occurs by chance inside coded audio (and can be put there on
+  purpose); the demuxer used to split the frame at it, and the decoder
+  then rejected both halves. A frame whose CRC-16 never matches is cut
+  at the next header once the scan is past the longest a frame of that
+  shape can be, so damage stays confined to the frame it hit.
+- demuxer: scanning for frames no longer rescans the buffered bytes on
+  every read, and the buffer no longer grows without bound when the
+  input holds no further frame; CRC work is budgeted against the input
+  consumed. Seeking without a SEEKTABLE uses the same framing.
+- demuxer: a metadata block or ID3v2 tag whose length field promises
+  more bytes than the input holds no longer allocates that length up
+  front (up to 16 MiB and 256 MiB respectively).
 - frame header: the forbidden block size 65536 (RFC 9639 §9.1.6), a set
   reserved bit after the bit depth (§9.1.4) and a frame number of more
   than 31 bits (§9.1.5) are rejected. A header that is cut short by the

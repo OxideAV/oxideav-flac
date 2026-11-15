@@ -28,6 +28,7 @@ pub mod crc;
 pub mod decoder;
 pub mod encoder;
 pub mod frame;
+mod framing;
 #[doc(hidden)]
 pub mod md5;
 pub mod metadata;
