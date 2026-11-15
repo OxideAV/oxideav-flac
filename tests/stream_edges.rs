@@ -439,7 +439,8 @@ fn encode(
 
 /// Decode `encoded` twice — packet by packet, and as a muxed file through
 /// the demuxer — and return the PCM, which must be the same both ways.
-fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
+/// With `black_box`, an outside decoder has to accept the stream too.
+fn decode_both_ways(encoded: &Encoded, black_box: bool) -> Vec<u8> {
     let mut dec = oxideav_flac::decoder::make_decoder(&encoded.params).unwrap();
     let mut direct = Vec::new();
     // The strict decoder refuses everything RFC 9639 forbids, including
@@ -461,7 +462,8 @@ fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
     }
     // An outside decoder agrees that the stream is valid and that its
     // MD5 matches (skipped when none is installed).
-    if !encoded.packets.is_empty()
+    if black_box
+        && !encoded.packets.is_empty()
         && let Some(accepted) = black_box_accepts(&file)
     {
         assert!(accepted, "black-box decoder rejected the stream");
@@ -481,13 +483,26 @@ fn decode_both_ways(encoded: &Encoded) -> Vec<u8> {
 
 /// Hand `file` to a black-box FLAC decoder in test mode, which decodes
 /// the stream, checks every frame and compares the STREAMINFO MD5.
-/// `None` when no such binary is installed (the check is then skipped).
+/// `None` when no suitable binary is installed (the check is then
+/// skipped).
 fn black_box_accepts(file: &[u8]) -> Option<bool> {
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SERIAL: AtomicUsize = AtomicUsize::new(0);
     let probe = Command::new("flac").arg("--version").output().ok()?;
     if !probe.status.success() {
+        return None;
+    }
+    // "flac 1.5.0". Releases before 1.4 do not take 32-bit samples, which
+    // the sweeps include; skip rather than fail on such a tool.
+    let banner = String::from_utf8_lossy(&probe.stdout).into_owned();
+    let mut version = banner
+        .split_whitespace()
+        .nth(1)?
+        .split('.')
+        .map(|part| part.parse::<u32>().ok());
+    let (major, minor) = (version.next()??, version.next()??);
+    if (major, minor) < (1, 4) {
         return None;
     }
     let path = std::env::temp_dir().join(format!(
@@ -582,7 +597,7 @@ fn encoder_output_decodes_for_every_shape() {
             .with_verify(true);
         let encoded = encode(&pcm, format, channels, 44_100, options);
         assert_eq!(encoded.packets.len(), frames.div_ceil(block as usize));
-        let decoded = decode_both_ways(&encoded);
+        let decoded = decode_both_ways(&encoded, true);
         assert!(
             decoded == pcm,
             "block {block}, {frames} frames, {format:?}, {channels} ch, level {level}"
@@ -614,7 +629,7 @@ fn encoder_output_decodes_for_every_depth_layout_and_level() {
                 let options = FlacEncoderOptions::level(level).with_block_size(576);
                 let encoded = encode(&pcm, format, channels, 48_000, options);
                 assert!(
-                    decode_both_ways(&encoded) == pcm,
+                    decode_both_ways(&encoded, true) == pcm,
                     "{format:?}, {channels} ch, level {level}"
                 );
             }
@@ -636,7 +651,8 @@ fn encoder_output_decodes_at_uncommon_sample_rates() {
             .with_block_size(256)
             .with_allow_non_subset_block_size(true);
         let encoded = encode(&pcm, SampleFormat::S16, 2, rate, options);
-        assert!(decode_both_ways(&encoded) == pcm, "{rate} Hz");
+        // No outside decoder here: tools differ in the rates they take.
+        assert!(decode_both_ways(&encoded, false) == pcm, "{rate} Hz");
         // Whatever the header says about the rate agrees with STREAMINFO
         // or defers to it.
         for p in &encoded.packets {
