@@ -8,8 +8,8 @@ use oxideav_core::{
 use crate::crc;
 use crate::frame::{ChannelAssignment, parse_frame_header};
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
-use crate::subframe::{decode_subframe, decode_subframe_wide};
-use oxideav_core::bits::BitReader;
+use crate::reservoir::BitReservoir;
+use crate::subframe::decode_subframe_into;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let streaminfo = find_streaminfo(&params.extradata)?;
@@ -34,7 +34,10 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id: params.codec_id.clone(),
         streaminfo,
         output_format,
-        pending: None,
+        scratch: FrameScratch::new(),
+        pending: Vec::new(),
+        pending_pts: None,
+        has_pending: false,
         eof: false,
     }))
 }
@@ -43,7 +46,13 @@ struct FlacDecoder {
     codec_id: CodecId,
     streaminfo: StreamInfo,
     output_format: SampleFormat,
-    pending: Option<Packet>,
+    /// Sample planes reused from frame to frame.
+    scratch: FrameScratch,
+    /// Bytes of the packet waiting for `receive_frame`; the buffer is
+    /// kept between packets so queuing one does not allocate.
+    pending: Vec<u8>,
+    pending_pts: Option<i64>,
+    has_pending: bool,
     eof: bool,
 }
 
@@ -53,24 +62,50 @@ impl Decoder for FlacDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
+        if self.has_pending {
             return Err(Error::other(
                 "FLAC decoder: receive_frame must be called before sending another packet",
             ));
         }
-        self.pending = Some(packet.clone());
+        self.pending.clear();
+        self.pending.extend_from_slice(&packet.data);
+        self.pending_pts = packet.pts;
+        self.has_pending = true;
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let Some(pkt) = self.pending.take() else {
+        if !self.has_pending {
             return if self.eof {
                 Err(Error::Eof)
             } else {
                 Err(Error::NeedMore)
             };
-        };
-        decode_one_frame(&pkt.data, &self.streaminfo, self.output_format, pkt.pts)
+        }
+        self.has_pending = false;
+        let shape = self.scratch.decode(&self.pending, &self.streaminfo)?;
+        // RFC 9639 §9: channel count and bit depth are repeated in every
+        // frame header and a decoder MAY stop when they change. The output
+        // layout is fixed by the stream parameters (STREAMINFO), so a
+        // frame that disagrees with them cannot be delivered.
+        if shape.channels != self.streaminfo.channels as usize
+            || shape.bits_per_sample != self.streaminfo.bits_per_sample as u32
+        {
+            return Err(Error::invalid(format!(
+                "FLAC frame: {} channel(s) at {} bits, but STREAMINFO declares {} at {}",
+                shape.channels,
+                shape.bits_per_sample,
+                self.streaminfo.channels,
+                self.streaminfo.bits_per_sample
+            )));
+        }
+        let planes = &self.scratch.planes[..shape.channels];
+        let data = interleave(planes, self.output_format)?;
+        Ok(Frame::Audio(AudioFrame {
+            samples: shape.block_size as u32,
+            pts: self.pending_pts,
+            data: vec![data],
+        }))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -129,237 +164,269 @@ pub struct DecodedFrame {
 /// This is the shared decode core behind both the streaming `Frame::Audio`
 /// path and the MD5 verifier in [`crate::verify`]; keeping it as one
 /// function means the verifier checks exactly the bytes the decoder emits.
+///
+/// Each call allocates the planes it returns. A caller decoding many
+/// frames keeps a [`FrameScratch`] instead and reuses its planes.
 pub fn decode_frame_channels(data: &[u8], streaminfo: &StreamInfo) -> Result<DecodedFrame> {
-    let header = parse_frame_header(data)?;
-    let body_offset = header.header_byte_len;
-
-    let bps = if header.bits_per_sample != 0 {
-        header.bits_per_sample as u32
-    } else {
-        streaminfo.bits_per_sample as u32
-    };
-
-    let mut br = BitReader::new(&data[body_offset..]);
-
-    // A stereo-decorrelated frame at the 32-bit ceiling carries a 33-bit
-    // side channel (RFC 9639 §4.2 / Appendix A.2). That one channel does
-    // not fit in `i32`, so it is decoded through the wider `i64` path; the
-    // reconstructed left/right pair fits back inside `i32` because the
-    // original samples are at most 32-bit.
-    let decorrelated = !matches!(header.channels, ChannelAssignment::Independent(_));
-    let channels: Vec<Vec<i32>> = if bps == 32 && decorrelated {
-        decode_decorrelated_wide(&mut br, header.block_size, bps, header.channels)?
-    } else {
-        let n_channels = header.channels.channel_count() as usize;
-        let mut channels: Vec<Vec<i32>> = Vec::with_capacity(n_channels);
-        for ch in 0..n_channels {
-            let bps_for_channel = match header.channels {
-                ChannelAssignment::LeftSide if ch == 1 => bps + 1,
-                ChannelAssignment::RightSide if ch == 0 => bps + 1,
-                ChannelAssignment::MidSide if ch == 1 => bps + 1,
-                _ => bps,
-            };
-            let samples = decode_subframe(&mut br, header.block_size, bps_for_channel)?;
-            if samples.len() != header.block_size as usize {
-                return Err(Error::invalid("subframe sample count mismatch"));
-            }
-            channels.push(samples);
-        }
-        apply_decorrelation(&mut channels, header.channels);
-        channels
-    };
-
-    // Skip frame-body padding to reach the byte-aligned 16-bit CRC at end.
-    br.align_to_byte();
-    let body_used = br.byte_position();
-    let frame_byte_len = body_offset + body_used;
-    if frame_byte_len + 2 > data.len() {
-        return Err(Error::invalid(
-            "FLAC frame: not enough bytes for trailing CRC-16",
-        ));
-    }
-    let claimed_crc = u16::from_be_bytes([data[frame_byte_len], data[frame_byte_len + 1]]);
-    // Streaming validator: fold the frame bytes through `Crc16` in one
-    // call. Equivalent to the one-shot `crc::crc16(&data[..n])` form
-    // it replaced, but exercises the streaming API in production so a
-    // regression that broke `Crc16::update` would surface on every
-    // decode call instead of only in the unit-test path. The cost is
-    // identical (single table-driven byte loop either way).
-    let mut crc = crc::Crc16::new();
-    crc.update(&data[..frame_byte_len]);
-    let computed = crc.value();
-    if computed != claimed_crc {
-        return Err(Error::invalid(format!(
-            "FLAC frame CRC-16 mismatch (got {:#06x}, want {:#06x})",
-            computed, claimed_crc
-        )));
-    }
-
+    let mut scratch = FrameScratch::new();
+    let shape = scratch.decode(data, streaminfo)?;
+    scratch.planes.truncate(shape.channels);
     Ok(DecodedFrame {
-        channels,
-        bits_per_sample: bps,
-        frame_byte_len: frame_byte_len + 2,
+        channels: scratch.planes,
+        bits_per_sample: shape.bits_per_sample,
+        frame_byte_len: shape.frame_byte_len,
     })
 }
 
-fn decode_one_frame(
-    data: &[u8],
-    streaminfo: &StreamInfo,
-    output_format: SampleFormat,
-    pts: Option<i64>,
-) -> Result<Frame> {
-    let DecodedFrame { channels, .. } = decode_frame_channels(data, streaminfo)?;
-
-    let total_samples = channels[0].len();
-    let n_out = channels.len();
-    let bytes_per_sample = output_format.bytes_per_sample();
-    let mut out = Vec::with_capacity(total_samples * n_out * bytes_per_sample);
-    for i in 0..total_samples {
-        for c in 0..n_out {
-            let s = channels[c][i];
-            match output_format {
-                // FLAC stores 8-bit samples as signed two's complement;
-                // SampleFormat::U8 is unsigned-offset (WAV/PCM convention),
-                // so add 128 to land in 0..=255.
-                SampleFormat::U8 => out.push(((s + 128) & 0xFF) as u8),
-                SampleFormat::S16 => out.extend_from_slice(&(s as i16).to_le_bytes()),
-                SampleFormat::S24 => {
-                    out.push((s & 0xFF) as u8);
-                    out.push(((s >> 8) & 0xFF) as u8);
-                    out.push(((s >> 16) & 0xFF) as u8);
-                }
-                SampleFormat::S32 => out.extend_from_slice(&s.to_le_bytes()),
-                _ => {
-                    return Err(Error::unsupported(
-                        "FLAC decoder output format not supported",
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(Frame::Audio(AudioFrame {
-        samples: total_samples as u32,
-        pts,
-        data: vec![out],
-    }))
+/// What [`FrameScratch::decode`] found in a frame.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FrameShape {
+    /// Number of channels; the first that many planes hold the samples.
+    pub channels: usize,
+    /// Samples per channel.
+    pub block_size: usize,
+    /// Bit depth of the decoded samples.
+    pub bits_per_sample: u32,
+    /// Bytes the frame occupies (header + subframes + CRC-16).
+    pub frame_byte_len: usize,
 }
 
-/// Decode a stereo-decorrelated frame at the 32-bit ceiling, where the
-/// side channel is 33-bit and must be carried in `i64`.
-///
-/// The two subframes are decoded in wire order (`ch0` then `ch1`), one at
-/// the declared 32-bit depth and the other — the side — at 33 bits. The
-/// per-channel decode itself is the same code the narrow path uses (the
-/// 32-bit channel goes through [`decode_subframe`], the side through
-/// [`decode_subframe_wide`]); only the inverse decorrelation runs in `i64`
-/// before narrowing the recovered left/right pair back to `i32`.
-fn decode_decorrelated_wide(
-    br: &mut BitReader,
-    block_size: u32,
-    bps: u32,
-    assign: ChannelAssignment,
-) -> Result<Vec<Vec<i32>>> {
-    // Which of the two channels is the wide (side) one.
-    // LeftSide: ch0=left(32), ch1=side(33). RightSide: ch0=side(33),
-    // ch1=right(32). MidSide: ch0=mid(32), ch1=side(33).
-    let ch0_wide = matches!(assign, ChannelAssignment::RightSide);
+/// Reusable sample planes for decoding frame after frame without
+/// allocating: the planes grow to the largest block seen and stay.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct FrameScratch {
+    planes: Vec<Vec<i32>>,
+    /// The 33-bit side channel of a 32-bit stereo-decorrelated frame.
+    side: Vec<i64>,
+}
 
-    let read_plane = |br: &mut BitReader, wide: bool| -> Result<Vec<i64>> {
-        let plane = if wide {
-            decode_subframe_wide(br, block_size, bps + 1)?
+impl FrameScratch {
+    /// Empty scratch; nothing is allocated until the first frame.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The planes of the most recently decoded frame. Only the first
+    /// [`FrameShape::channels`] entries are meaningful.
+    pub fn planes(&self) -> &[Vec<i32>] {
+        &self.planes
+    }
+
+    /// Decode one frame from the start of `data` into the planes: header,
+    /// subframes, inverse stereo decorrelation, CRC-16 check (RFC 9639
+    /// §9). Bytes after the frame are ignored.
+    pub fn decode(&mut self, data: &[u8], streaminfo: &StreamInfo) -> Result<FrameShape> {
+        let header = parse_frame_header(data)?;
+        let body_offset = header.header_byte_len;
+        let block_size = header.block_size as usize;
+
+        let bps = if header.bits_per_sample != 0 {
+            header.bits_per_sample as u32
         } else {
-            decode_subframe(br, block_size, bps)?
-                .into_iter()
-                .map(|s| s as i64)
-                .collect()
+            streaminfo.bits_per_sample as u32
         };
-        if plane.len() != block_size as usize {
-            return Err(Error::invalid("subframe sample count mismatch"));
+        if bps == 0 || bps > 32 {
+            return Err(Error::unsupported(format!(
+                "FLAC frame: bit depth {bps} out of supported range 1..=32"
+            )));
         }
-        Ok(plane)
-    };
 
-    let ch0 = read_plane(br, ch0_wide)?;
-    let ch1 = read_plane(br, !ch0_wide)?;
+        let n_channels = header.channels.channel_count() as usize;
+        if self.planes.len() < n_channels {
+            self.planes.resize_with(n_channels, Vec::new);
+        }
+        for plane in &mut self.planes[..n_channels] {
+            plane.resize(block_size, 0);
+        }
 
-    let n = ch0.len();
-    let mut left = vec![0i32; n];
-    let mut right = vec![0i32; n];
-    // Inverse decorrelation runs in `i64` because the side channel is
-    // 33-bit (RFC 9639 §4.2). For any *valid* 32-bit stream the operands
-    // are bounded — mid/left/right at 32 bits, side at 33 — so every sum or
-    // difference below fits comfortably inside `i64` and never overflows.
-    // A malformed stream, however, can drive the wide `_wide` predictors
-    // (which reconstruct with wrapping arithmetic) to an out-of-range side
-    // sample far beyond its spec-legal 33-bit envelope; the reconstruction
-    // arithmetic would then overflow `i64`. That can only mean the input is
-    // invalid, so the checked ops surface a typed decode error rather than
-    // panicking (debug) or silently wrapping to a bogus sample.
-    let overflow = || Error::invalid("FLAC 32-bit decorrelation: reconstructed sample exceeds i64");
-    match assign {
-        ChannelAssignment::LeftSide => {
-            // ch0 = left, ch1 = side = left - right → right = left - side.
-            for i in 0..n {
-                left[i] = ch0[i] as i32;
-                right[i] = (ch0[i].checked_sub(ch1[i]).ok_or_else(overflow)?) as i32;
+        let mut br = BitReservoir::new(&data[body_offset..]);
+        // Which subframe, if any, is the side channel: it carries one
+        // extra bit (RFC 9639 §4.2).
+        let side_index = match header.channels {
+            ChannelAssignment::Independent(_) => None,
+            ChannelAssignment::LeftSide | ChannelAssignment::MidSide => Some(1),
+            ChannelAssignment::RightSide => Some(0),
+        };
+        // At 32 bits the side channel is 33 bits wide and does not fit an
+        // `i32` plane; it is decoded into the `i64` side buffer and the
+        // left/right pair, which does fit, is rebuilt from there.
+        let wide_side = bps == 32 && side_index.is_some();
+        if wide_side {
+            self.side.resize(block_size, 0);
+        }
+        for (index, plane) in self.planes[..n_channels].iter_mut().enumerate() {
+            if side_index == Some(index) {
+                if wide_side {
+                    decode_subframe_into(&mut br, &mut self.side[..], bps + 1)?;
+                } else {
+                    decode_subframe_into(&mut br, &mut plane[..], bps + 1)?;
+                }
+            } else {
+                decode_subframe_into(&mut br, &mut plane[..], bps)?;
             }
         }
-        ChannelAssignment::RightSide => {
-            // ch0 = side = left - right, ch1 = right → left = right + side.
-            for i in 0..n {
-                left[i] = (ch1[i].checked_add(ch0[i]).ok_or_else(overflow)?) as i32;
-                right[i] = ch1[i] as i32;
-            }
+
+        // §9.3: zero bits up to the byte boundary, then the CRC-16 over
+        // everything before it, sync code included.
+        br.align_to_byte();
+        let crc_offset = body_offset + br.byte_position();
+        let Some(stored) = data.get(crc_offset..crc_offset + 2) else {
+            return Err(Error::invalid(
+                "FLAC frame: not enough bytes for trailing CRC-16",
+            ));
+        };
+        let claimed_crc = u16::from_be_bytes([stored[0], stored[1]]);
+        let mut crc = crc::Crc16::new();
+        crc.update(&data[..crc_offset]);
+        let computed = crc.value();
+        if computed != claimed_crc {
+            return Err(Error::invalid(format!(
+                "FLAC frame CRC-16 mismatch (got {:#06x}, want {:#06x})",
+                computed, claimed_crc
+            )));
         }
-        ChannelAssignment::MidSide => {
-            // ch0 = mid (with absorbed LSB), ch1 = side.
-            for i in 0..n {
-                let mid = ch0[i];
-                let side = ch1[i];
-                // `mid` is the narrow (≤ 32-bit) channel, so `mid << 1`
-                // never overflows; only the ± side steps can.
-                let m = (mid << 1) | (side & 1);
-                left[i] = (m.checked_add(side).ok_or_else(overflow)? >> 1) as i32;
-                right[i] = (m.checked_sub(side).ok_or_else(overflow)? >> 1) as i32;
-            }
+
+        if wide_side {
+            let (first, second) = self.planes.split_at_mut(1);
+            undo_decorrelation_wide(&mut first[0], &mut second[0], &self.side, header.channels)?;
+        } else if side_index.is_some() {
+            let (first, second) = self.planes.split_at_mut(1);
+            undo_decorrelation(&mut first[0], &mut second[0], header.channels);
         }
-        ChannelAssignment::Independent(_) => {
-            unreachable!("decode_decorrelated_wide is only reached for decorrelated assignments")
-        }
+
+        Ok(FrameShape {
+            channels: n_channels,
+            block_size,
+            bits_per_sample: bps,
+            frame_byte_len: crc_offset + 2,
+        })
     }
-    Ok(vec![left, right])
 }
 
-fn apply_decorrelation(channels: &mut [Vec<i32>], assign: ChannelAssignment) {
+/// Pack per-channel planes into one interleaved little-endian buffer in
+/// `format`.
+fn interleave(planes: &[Vec<i32>], format: SampleFormat) -> Result<Vec<u8>> {
+    let width = match format {
+        SampleFormat::U8 => 1,
+        SampleFormat::S16 => 2,
+        SampleFormat::S24 => 3,
+        SampleFormat::S32 => 4,
+        _ => {
+            return Err(Error::unsupported(
+                "FLAC decoder output format not supported",
+            ));
+        }
+    };
+    let samples = planes.first().map_or(0, Vec::len);
+    let stride = width * planes.len();
+    let mut out = vec![0u8; samples * stride];
+    for (channel, plane) in planes.iter().enumerate() {
+        let at = channel * width;
+        let frames = out.chunks_exact_mut(stride).zip(plane);
+        match format {
+            // FLAC stores 8-bit samples as signed two's complement;
+            // SampleFormat::U8 is unsigned with a +128 offset.
+            SampleFormat::U8 => {
+                for (frame, &s) in frames {
+                    frame[at] = (s as u8).wrapping_add(128);
+                }
+            }
+            SampleFormat::S16 => {
+                for (frame, &s) in frames {
+                    frame[at..at + 2].copy_from_slice(&(s as i16).to_le_bytes());
+                }
+            }
+            SampleFormat::S24 => {
+                for (frame, &s) in frames {
+                    frame[at..at + 3].copy_from_slice(&s.to_le_bytes()[..3]);
+                }
+            }
+            _ => {
+                for (frame, &s) in frames {
+                    frame[at..at + 4].copy_from_slice(&s.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Undo stereo decorrelation (RFC 9639 §4.2) where the side channel is at
+/// most 32 bits wide. `first` and `second` hold the two subframes in
+/// bitstream order and receive left and right.
+fn undo_decorrelation(first: &mut [i32], second: &mut [i32], assign: ChannelAssignment) {
     match assign {
         ChannelAssignment::Independent(_) => {}
         ChannelAssignment::LeftSide => {
-            // ch[0] = left, ch[1] = side = left - right → right = left - side.
-            let n = channels[0].len();
-            for i in 0..n {
-                channels[1][i] = channels[0][i].wrapping_sub(channels[1][i]);
+            // left, side = left - right  →  right = left - side.
+            for (&left, side) in first.iter().zip(second.iter_mut()) {
+                *side = left.wrapping_sub(*side);
             }
         }
         ChannelAssignment::RightSide => {
-            // ch[0] = side = left - right, ch[1] = right → left = right + side.
-            let n = channels[0].len();
-            for i in 0..n {
-                channels[0][i] = channels[1][i].wrapping_add(channels[0][i]);
+            // side = left - right, right  →  left = right + side.
+            for (side, &right) in first.iter_mut().zip(second.iter()) {
+                *side = right.wrapping_add(*side);
             }
         }
         ChannelAssignment::MidSide => {
-            // ch[0] = mid (with absorbed LSB), ch[1] = side.
-            let n = channels[0].len();
-            for i in 0..n {
-                let mid = channels[0][i] as i64;
-                let side = channels[1][i] as i64;
-                let m = (mid << 1) | (side & 1);
-                channels[0][i] = ((m + side) >> 1) as i32;
-                channels[1][i] = ((m - side) >> 1) as i32;
+            // mid = (left + right) >> 1, side = left - right. The bit the
+            // shift dropped is the parity of side.
+            for (mid, side) in first.iter_mut().zip(second.iter_mut()) {
+                let s = *side as i64;
+                let sum = ((*mid as i64) << 1) | (s & 1);
+                *mid = ((sum + s) >> 1) as i32;
+                *side = ((sum - s) >> 1) as i32;
             }
         }
     }
+}
+
+/// Undo stereo decorrelation for a 32-bit frame, whose side channel is 33
+/// bits wide and lives in `side`. `first` and `second` are the two output
+/// planes; the one that was not the side subframe already holds its
+/// 32-bit channel (left, right or mid).
+///
+/// A side sample outside the 33-bit range cannot come from two 32-bit
+/// channels, so it marks the stream invalid; with the side bounded, none
+/// of the sums below can leave `i64`.
+fn undo_decorrelation_wide(
+    first: &mut [i32],
+    second: &mut [i32],
+    side: &[i64],
+    assign: ChannelAssignment,
+) -> Result<()> {
+    const SIDE_MIN: i64 = -(1 << 32);
+    const SIDE_MAX: i64 = (1 << 32) - 1;
+    if side.iter().any(|s| !(SIDE_MIN..=SIDE_MAX).contains(s)) {
+        return Err(Error::invalid(
+            "FLAC 32-bit decorrelation: side sample exceeds 33 bits",
+        ));
+    }
+    match assign {
+        ChannelAssignment::Independent(_) => {}
+        ChannelAssignment::LeftSide => {
+            for ((&left, right), &s) in first.iter().zip(second.iter_mut()).zip(side) {
+                *right = (left as i64 - s) as i32;
+            }
+        }
+        ChannelAssignment::RightSide => {
+            for ((left, &right), &s) in first.iter_mut().zip(second.iter()).zip(side) {
+                *left = (right as i64 + s) as i32;
+            }
+        }
+        ChannelAssignment::MidSide => {
+            for ((mid, right), &s) in first.iter_mut().zip(second.iter_mut()).zip(side) {
+                let sum = ((*mid as i64) << 1) | (s & 1);
+                *mid = ((sum + s) >> 1) as i32;
+                *right = ((sum - s) >> 1) as i32;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -512,7 +579,10 @@ mod tests {
         let left: Vec<i64> = vec![2_000_000_000, -2_000_000_000, 100, -100];
         let right: Vec<i64> = vec![-2_000_000_000, 2_000_000_000, -100, 100];
         let frame = build_32bit_frame(8, &left, &right); // left-side
-        let params = make_params(32);
+        // The stream parameters declare what the frames carry: stereo.
+        let mut params = make_params(32);
+        params.channels = Some(2);
+        params.extradata[4 + 12] |= 1 << 1; // channels - 1 = 1
         let mut dec = make_decoder(&params).unwrap();
 
         let pkt = Packet::new(0, oxideav_core::TimeBase::new(1, 192_000), frame);

@@ -5323,8 +5323,6 @@ mod tests {
     /// happens to prefer the high-order plan on this particular block.
     #[test]
     fn encode_decode_lpc_orders_9_to_12_subframe_roundtrip() {
-        use oxideav_core::bits::BitReader;
-
         let n = 4096usize;
         let a: [f64; 11] = [
             0.62, -0.31, 0.18, -0.12, 0.09, -0.07, 0.06, -0.05, 0.04, -0.03, 0.02,
@@ -5355,7 +5353,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("encode_lpc_plan failed at order {order}"));
             // Decode the subframe payload back and check bit-exact
             // recovery against the source samples.
-            let mut br = BitReader::new(&plan.payload);
+            let mut br = crate::reservoir::BitReservoir::new(&plan.payload);
             let decoded = crate::subframe::decode_subframe(&mut br, n as u32, bps)
                 .unwrap_or_else(|e| panic!("decode failed at order {order}: {e}"));
             assert_eq!(decoded.len(), n, "decode length mismatch at order {order}");

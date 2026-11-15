@@ -32,6 +32,8 @@ pub mod frame;
 pub mod md5;
 pub mod metadata;
 #[doc(hidden)]
+pub mod reservoir;
+#[doc(hidden)]
 pub mod subframe;
 pub mod verify;
 

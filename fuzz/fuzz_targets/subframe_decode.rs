@@ -26,9 +26,9 @@
 //!
 //! ## What this target drives directly
 //!
-//! `decode_subframe(&mut BitReader, block_size, bps)` is a public entry
+//! `decode_subframe(&mut BitReservoir, block_size, bps)` is a public entry
 //! point (`pub fn`, `pub mod subframe`). The harness constructs a
-//! `BitReader` over fuzzer-supplied bytes and calls it with
+//! `BitReservoir` over fuzzer-supplied bytes and calls it with
 //! fuzzer-chosen `(block_size, bps)` pulled from the genuinely-reachable
 //! production envelope:
 //!
@@ -87,8 +87,8 @@
 //! rather than waiting for the corpus to rediscover a valid header.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::bits::BitReader;
-use oxideav_flac::subframe::{decode_subframe, decode_subframe_wide};
+use oxideav_flac::reservoir::BitReservoir;
+use oxideav_flac::subframe::{decode_subframe, decode_subframe_into, decode_subframe_wide};
 
 /// Largest block size a §9.1 frame header can encode (16-bit immediate).
 const MAX_BLOCK_SIZE: u32 = 65535;
@@ -99,12 +99,12 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {
         // Still exercise the guard rails on tiny inputs.
         for &bps in &[0u32, 1, 16, 32, 33] {
-            let mut br = BitReader::new(data);
+            let mut br = BitReservoir::new(data);
             let _ = decode_subframe(&mut br, 1, bps);
         }
         // The wide path accepts only bps == 33; drive it too.
         {
-            let mut br = BitReader::new(data);
+            let mut br = BitReservoir::new(data);
             let _ = decode_subframe_wide(&mut br, 1, 33);
         }
         return;
@@ -125,14 +125,31 @@ fuzz_target!(|data: &[u8]| {
 
     let body = &data[3..];
     {
-        let mut br = BitReader::new(body);
-        let _ = decode_subframe(&mut br, block_size, bps);
+        let mut br = BitReservoir::new(body);
+        let narrow = decode_subframe(&mut br, block_size, bps);
+        // Differential check of the two sample widths. The same bits
+        // decoded into 64-bit slots must be accepted or rejected alike,
+        // consume the same number of bits, and — whenever every 64-bit
+        // sample fits 32 bits, so no truncation fed a predictor — give
+        // the same samples.
+        if (1..=32).contains(&bps) {
+            let mut wide = vec![0i64; block_size as usize];
+            let mut br64 = BitReservoir::new(body);
+            let wide_result = decode_subframe_into(&mut br64, &mut wide, bps);
+            assert_eq!(narrow.is_ok(), wide_result.is_ok());
+            if let Ok(narrow) = narrow {
+                assert_eq!(br.bit_position(), br64.bit_position());
+                if wide.iter().all(|&s| s == s as i32 as i64) {
+                    assert!(narrow.iter().zip(&wide).all(|(&a, &b)| a as i64 == b));
+                }
+            }
+        }
     }
     // Drive the wide (33-bit side-channel) path over the same body. It
     // rejects every width but 33, so pin bps to 33 here; the body still
     // steers type_code / predictor order / residual layout freely.
     {
-        let mut br = BitReader::new(body);
+        let mut br = BitReservoir::new(body);
         let _ = decode_subframe_wide(&mut br, block_size, 33);
     }
 
@@ -146,7 +163,7 @@ fuzz_target!(|data: &[u8]| {
         // count" branches far more often.
         let small_bs = (raw_bs % 4096).max(1);
         let bps2 = ((data[3] % 32) + 1) as u32; // 1..=32 — always in-range
-        let mut br = BitReader::new(body);
+        let mut br = BitReservoir::new(body);
         let _ = decode_subframe(&mut br, small_bs, bps2);
     }
 
@@ -163,11 +180,11 @@ fuzz_target!(|data: &[u8]| {
         let slice = &data[off..];
         for &bs in &[1u32, 2, 5, 16, 192, 576, 4096, 65535] {
             for &bp in &[0u32, 1, 4, 8, 16, 24, 32, 33] {
-                let mut br = BitReader::new(slice);
+                let mut br = BitReservoir::new(slice);
                 let _ = decode_subframe(&mut br, bs, bp);
             }
             // Sweep the wide path across the same block sizes.
-            let mut br = BitReader::new(slice);
+            let mut br = BitReservoir::new(slice);
             let _ = decode_subframe_wide(&mut br, bs, 33);
         }
     }

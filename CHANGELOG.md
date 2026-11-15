@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- decoder: subframes are decoded on a 64-bit bit reservoir straight into
+  sample planes that the decoder keeps between frames. A Rice code word
+  comes out of the reservoir with one leading-zero count; escaped,
+  verbatim and warm-up samples are read in runs; the linear predictor
+  has one loop per order (1..=32) over a fixed-length window, the fixed
+  predictors carry their history in locals. Decoding allocates only the
+  output buffer of each frame. Output is unchanged for every valid
+  stream; `examples/speed.rs` measures it (see the README).
+- decoder: a Rice-coded residual outside the 32-bit residual range of
+  RFC 9639 §9.2.7.3 is now an error instead of being truncated, and a
+  side sample of a 32-bit stereo frame outside 33 bits is an error.
+- decoder: `Decoder::receive_frame` refuses a frame whose header
+  announces a channel count or bit depth other than the one in
+  STREAMINFO (RFC 9639 §9 lets a decoder stop on such a change); the
+  output layout is fixed by the stream parameters.
+
 ### Fixed
 
 - demuxer: a SEEKTABLE seek point whose 64-bit offset, added to the

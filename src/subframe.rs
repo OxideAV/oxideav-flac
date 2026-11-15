@@ -1,560 +1,308 @@
-//! Subframe decoding: constant, verbatim, fixed-predictor, LPC.
+//! Subframe decoding: constant, verbatim, fixed predictor, linear
+//! predictor, and the partitioned Rice coded residual (RFC 9639 §9.2).
 //!
-//! Reference: <https://xiph.org/flac/format.html#subframe>
+//! Everything decodes straight into a caller-supplied sample slice, so a
+//! frame decoder that keeps its planes between frames allocates nothing
+//! per frame. The slice element is [`Sample`]: `i32` for ordinary
+//! channels, `i64` for the 33-bit side channel of a 32-bit
+//! stereo-decorrelated frame (RFC 9639 §4.2, Appendix A.2). Predictions
+//! are always accumulated in 64 bits (Appendix A.3: a 33-bit sample times
+//! a 15-bit coefficient summed over 32 taps needs 53 bits), with wrapping
+//! arithmetic so that a stream which breaks the format's value limits
+//! yields garbage samples rather than an overflow trap.
 
 use oxideav_core::{Error, Result};
 
-use crate::bits_ext::BitReaderExt;
-use oxideav_core::bits::BitReader;
+use crate::reservoir::{BitReservoir, Sample};
 
-/// Decode one subframe from the bitstream.
+/// Largest linear-predictor order (RFC 9639 §9.2.1, Table 19).
+const MAX_LPC_ORDER: usize = 32;
+
+/// Decode one subframe of `block_size` samples at `bps` bits per sample
+/// (`1..=32`) into a new vector.
 ///
-/// `bps` is the per-sample bit depth for *this* channel — caller must add 1
-/// for the side channel of left-side / right-side / mid-side stereo frames.
-///
-/// Returns [`Error::Unsupported`] if `bps` exceeds 32. The decoder reads
-/// samples through `BitReader::read_i32`, which is bounded at 32-bit
-/// reads, so a 33-bit side channel (which arises from a STREAMINFO
-/// declaring `bits_per_sample=32` combined with a stereo-decorrelated
-/// frame) does not fit in `i32`. The caller decodes that one channel
-/// through [`decode_subframe_wide`] instead, which returns `i64`
-/// samples; this narrow path stays `i32`-only so the common ≤ 32-bit
-/// hot loop is never widened. Rejecting `bps > 32` up front here (rather
-/// than panicking inside the bit reader) was first added for the
-/// `panic_free_decode` fuzz harness on 2026-05-10.
-pub fn decode_subframe(br: &mut BitReader, block_size: u32, bps: u32) -> Result<Vec<i32>> {
+/// `bps` is the bit depth of *this* subframe: the caller adds one for the
+/// side channel of a left-side, side-right or mid-side frame. A 33-bit
+/// side channel does not fit `i32` and goes through
+/// [`decode_subframe_wide`]; this function reports
+/// [`Error::Unsupported`] for it.
+pub fn decode_subframe(br: &mut BitReservoir, block_size: u32, bps: u32) -> Result<Vec<i32>> {
     if bps == 0 || bps > 32 {
         return Err(Error::unsupported(format!(
-            "FLAC subframe bps {bps} out of supported range 1..=32 \
-             (32-bit samples cannot be combined with stereo decorrelation)"
+            "FLAC subframe bps {bps} out of supported range 1..=32"
         )));
     }
-    let pad = br.read_u32(1)?;
-    if pad != 0 {
-        return Err(Error::invalid("subframe header pad bit must be zero"));
-    }
-    let type_code = br.read_u32(6)? as u8;
-    let has_wasted = br.read_bit()?;
-    let wasted = if has_wasted {
-        // Wasted-bit count is unary-encoded — count of leading zeros, plus 1
-        // (because at least one wasted bit was indicated).
-        br.read_unary()? + 1
-    } else {
-        0
-    };
-
-    if wasted >= bps {
-        return Err(Error::invalid(format!("wasted bits {wasted} >= bps {bps}")));
-    }
-    let effective_bps = bps - wasted;
-
-    let mut samples = match type_code {
-        0b000000 => decode_constant(br, block_size, effective_bps)?,
-        0b000001 => decode_verbatim(br, block_size, effective_bps)?,
-        0b001000..=0b001100 => {
-            let order = (type_code & 0x07) as usize;
-            decode_fixed(br, block_size, effective_bps, order)?
-        }
-        0b100000..=0b111111 => {
-            let order = ((type_code & 0x1F) + 1) as usize;
-            decode_lpc(br, block_size, effective_bps, order)?
-        }
-        _ => {
-            return Err(Error::invalid(format!(
-                "reserved FLAC subframe type 0x{type_code:02x}"
-            )));
-        }
-    };
-
-    if wasted > 0 {
-        for s in samples.iter_mut() {
-            *s = ((*s as i64) << wasted) as i32;
-        }
-    }
+    let mut samples = vec![0i32; block_size as usize];
+    decode_subframe_into(br, &mut samples, bps)?;
     Ok(samples)
 }
 
-fn decode_constant(br: &mut BitReader, block_size: u32, bps: u32) -> Result<Vec<i32>> {
-    let v = br.read_i32(bps)?;
-    Ok(vec![v; block_size as usize])
-}
-
-fn decode_verbatim(br: &mut BitReader, block_size: u32, bps: u32) -> Result<Vec<i32>> {
-    let mut s = Vec::with_capacity(block_size as usize);
-    for _ in 0..block_size {
-        s.push(br.read_i32(bps)?);
-    }
-    Ok(s)
-}
-
-fn decode_fixed(br: &mut BitReader, block_size: u32, bps: u32, order: usize) -> Result<Vec<i32>> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..order {
-        samples.push(br.read_i32(bps)?);
-    }
-    // Decode the residual straight onto the tail of `samples` (no separate
-    // residual buffer / copy), then reconstruct in place.
-    decode_residual_into(br, &mut samples, block_size, order)?;
-    apply_fixed_predictor(&mut samples, order);
-    Ok(samples)
-}
-
-/// Reconstruct the block *in place* by running the §9.2.6 fixed
-/// predictor. On entry `samples` holds `[warm-up(order) | residuals]`
-/// (the residual coder wrote its output straight onto the tail). Each
-/// position `t >= order` is overwritten by
-/// `prediction(samples[t-order..t]) + residual[t]`; the predictor only
-/// reads *earlier* positions, so overwriting `samples[t]` after reading
-/// its window is safe and needs no separate residual buffer.
-///
-/// Each order's difference equation is unrolled into a branch-free
-/// closed form so the per-sample inner loop carries no coefficient
-/// iterator, no `samples.len()` recomputation, and — because it is
-/// driven by an absolute index `t` with the window `samples[t-order..t]`
-/// — no per-access bounds check. Output is bit-identical to the naive
-/// `sum(coeff[i] * samples[len-1-i]) + r` form: the coefficients here
-/// are the same Table-of-differences constants
-/// (`{}`, `{1}`, `{2,-1}`, `{3,-3,1}`, `{4,-6,4,-1}`), just spelled
-/// out. All arithmetic stays in `i64` and truncates to `i32` exactly
-/// as before.
-fn apply_fixed_predictor(samples: &mut [i32], order: usize) {
-    let total = samples.len();
-    let buf = samples;
-    match order {
-        // order 0: prediction is 0, so `buf[t]` already *is* the
-        // residual — nothing to reconstruct.
-        0 => {}
-        1 => {
-            for t in order..total {
-                let p = buf[t - 1] as i64;
-                buf[t] = (p + buf[t] as i64) as i32;
-            }
-        }
-        2 => {
-            for t in order..total {
-                let p = 2 * buf[t - 1] as i64 - buf[t - 2] as i64;
-                buf[t] = (p + buf[t] as i64) as i32;
-            }
-        }
-        3 => {
-            for t in order..total {
-                let p = 3 * buf[t - 1] as i64 - 3 * buf[t - 2] as i64 + buf[t - 3] as i64;
-                buf[t] = (p + buf[t] as i64) as i32;
-            }
-        }
-        _ => {
-            // order == 4 (the only remaining legal value; §9.2.6).
-            for t in order..total {
-                let p = 4 * buf[t - 1] as i64 - 6 * buf[t - 2] as i64 + 4 * buf[t - 3] as i64
-                    - buf[t - 4] as i64;
-                buf[t] = (p + buf[t] as i64) as i32;
-            }
-        }
-    }
-}
-
-fn decode_lpc(br: &mut BitReader, block_size: u32, bps: u32, order: usize) -> Result<Vec<i32>> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..order {
-        samples.push(br.read_i32(bps)?);
-    }
-    let qlp_precision_raw = br.read_u32(4)?;
-    if qlp_precision_raw == 0xF {
-        return Err(Error::invalid("FLAC LPC: invalid qlp precision (0xF)"));
-    }
-    let qlp_precision = qlp_precision_raw + 1;
-    let qlp_shift = br.read_i32(5)?;
-    if qlp_shift < 0 {
-        return Err(Error::invalid("FLAC LPC: negative qlp_shift not supported"));
-    }
-    let mut coeffs = Vec::with_capacity(order);
-    for _ in 0..order {
-        coeffs.push(br.read_i32(qlp_precision)?);
-    }
-    // Decode the residual straight onto the tail of `samples`, then
-    // reconstruct in place (no separate residual buffer / copy).
-    decode_residual_into(br, &mut samples, block_size, order)?;
-    apply_lpc(&mut samples, &coeffs, qlp_shift as u32);
-    Ok(samples)
-}
-
-/// Reconstruct the block *in place* by running the §9.2.5 quantised LPC
-/// predictor. On entry `samples` holds `[warm-up(order) | residuals]`
-/// (the residual coder wrote its output straight onto the tail). Each
-/// position `t >= order` is overwritten by
-/// `(inner_product(samples[t-order..t], coeffs) >> qlp_shift)
-/// wrapping_add residual[t]`; the inner product reads only *earlier*
-/// positions, so overwriting `samples[t]` after computing it is safe
-/// and needs no separate residual buffer.
-///
-/// The per-sample inner product runs over the fixed-length window
-/// `buf[t-order..t]` against a same-length reversed coefficient view.
-/// Reversing the coefficients once up front (into a small stack buffer;
-/// FLAC LPC order is 1..=32) turns the naive `coeffs[i] *
-/// samples[len-1-i]` (a descending index) into two forward-scanned
-/// equal-length slices, which the compiler can walk without
-/// re-deriving `samples.len()` or bounds-checking each access. Output
-/// is bit-identical to the naive form: the same products are summed in
-/// `i64`, the same `>> qlp_shift` is applied, and the same
-/// `wrapping_add` truncation to `i32` closes each sample.
-fn apply_lpc(samples: &mut [i32], coeffs: &[i32], qlp_shift: u32) {
-    let order = coeffs.len();
-    let total = samples.len();
-    let buf = samples;
-
-    // Reversed coefficients: `rc[j]` multiplies the sample `order-1-j`
-    // steps back, so the window `buf[t-order..t]` (ascending in time)
-    // pairs element-for-element with `rc`. The FLAC LPC order is 1..=32
-    // (§9.2.5, subframe type `0b1xxxxx` → order `(code & 0x1F) + 1`), so
-    // a 32-entry stack buffer always holds the reversed row; the
-    // `min(32)` keeps the copy bounded even if a caller ever passed a
-    // longer coefficient slice.
-    let mut rc_stack = [0i32; 32];
-    let n = order.min(32);
-    for (j, &c) in coeffs.iter().rev().take(n).enumerate() {
-        rc_stack[j] = c;
-    }
-    let rc = &rc_stack[..n];
-
-    for t in order..total {
-        let window = &buf[t - order..t];
-        let mut pred: i64 = 0;
-        for (&s, &c) in window.iter().zip(rc) {
-            pred += (c as i64) * (s as i64);
-        }
-        let predicted = (pred >> qlp_shift) as i32;
-        buf[t] = predicted.wrapping_add(buf[t]);
-    }
-}
-
-/// Decode the §9.2.7 partitioned Rice residual, appending the
-/// `block_size - predictor_order` residual values directly onto the tail
-/// of `samples` (which already holds the `predictor_order` warm-up
-/// samples). Writing straight into the reconstruction buffer avoids a
-/// separate residual `Vec` allocation and the copy the split
-/// `decode_residual` + `apply_*` form performed on every subframe.
-///
-/// The residual arithmetic is unchanged: Rice `(q << k) | r` folded via
-/// the standard zig-zag `(u >> 1)` / `-(u >> 1) - 1` mapping, and the
-/// escape partition's raw `raw_bps`-wide signed reads.
-fn decode_residual_into(
-    br: &mut BitReader,
-    samples: &mut Vec<i32>,
-    block_size: u32,
-    predictor_order: usize,
-) -> Result<()> {
-    let method = br.read_u32(2)?;
-    let (param_bits, escape_marker) = match method {
-        0 => (4u32, 15u32),
-        1 => (5u32, 31u32),
-        _ => return Err(Error::invalid("reserved FLAC residual coding method")),
-    };
-    let partition_order = br.read_u32(4)?;
-    let n_partitions = 1u32 << partition_order;
-    if !block_size.is_multiple_of(n_partitions) {
-        return Err(Error::invalid(
-            "FLAC residual: block_size not divisible by partition count",
-        ));
-    }
-    let partition_size = block_size / n_partitions;
-    if partition_size as usize <= predictor_order {
-        // First partition would have zero or negative samples — invalid.
-        return Err(Error::invalid(
-            "FLAC residual: first partition smaller than predictor order",
-        ));
-    }
-
-    let total = block_size as usize - predictor_order;
-    samples.reserve(total);
-    for p in 0..n_partitions {
-        let n_samples = if p == 0 {
-            partition_size as usize - predictor_order
-        } else {
-            partition_size as usize
-        };
-        let k = br.read_u32(param_bits)?;
-        if k == escape_marker {
-            // "Escape" partition: 5 bits of raw bps then n_samples raw signed values.
-            let raw_bps = br.read_u32(5)?;
-            for _ in 0..n_samples {
-                samples.push(br.read_i32(raw_bps)?);
-            }
-        } else {
-            for _ in 0..n_samples {
-                let q = br.read_unary()?;
-                let r = br.read_u32(k)?;
-                let unsigned = ((q as u64) << k) | (r as u64);
-                let signed: i64 = if unsigned & 1 == 0 {
-                    (unsigned >> 1) as i64
-                } else {
-                    -((unsigned >> 1) as i64) - 1
-                };
-                samples.push(signed as i32);
-            }
-        }
-    }
-    Ok(())
-}
-
-// --- Wide (33-bit) subframe path ----------------------------------------
-//
-// The side channel of a 32-bit stereo-decorrelated frame carries samples
-// one bit wider than the declared depth (RFC 9639 §4.2 / Appendix A.2 —
-// "the side channel needs one extra bit of bit depth, as the subtraction
-// can produce sample values twice as large as the maximum possible in any
-// given bit depth"). At the 32-bit ceiling that is 33 bits, which does not
-// fit in `i32`, so these mirror the narrow path with `i64` storage. The
-// arithmetic is identical (same predictor difference equations, same
-// zig-zag Rice residual, same escape partitions); only the sample width
-// grows. All products stay well inside `i64`: a 33-bit sample times a
-// ≤ 15-bit coefficient is ≤ 48 bits, summed over ≤ 32 taps is ≤ 53 bits.
-
-/// Decode one 33-bit-wide subframe, returning `i64` samples.
-///
-/// Used only for the side channel of a 32-bit stereo-decorrelated frame;
-/// `bps` must be exactly 33 (STREAMINFO bps 32 + the +1 side bit). Any
-/// other width is a caller bug and returns [`Error::Unsupported`].
-pub fn decode_subframe_wide(br: &mut BitReader, block_size: u32, bps: u32) -> Result<Vec<i64>> {
+/// Decode one 33-bit subframe — the side channel of a 32-bit
+/// stereo-decorrelated frame — into a new `i64` vector. Any other width
+/// is a caller bug and returns [`Error::Unsupported`].
+pub fn decode_subframe_wide(br: &mut BitReservoir, block_size: u32, bps: u32) -> Result<Vec<i64>> {
     if bps != 33 {
         return Err(Error::unsupported(format!(
             "FLAC wide subframe bps {bps} (the wide path handles only the \
              33-bit side channel of a 32-bit decorrelated frame)"
         )));
     }
-    let pad = br.read_u32(1)?;
-    if pad != 0 {
-        return Err(Error::invalid("subframe header pad bit must be zero"));
-    }
-    let type_code = br.read_u32(6)? as u8;
-    let has_wasted = br.read_bit()?;
-    let wasted = if has_wasted { br.read_unary()? + 1 } else { 0 };
-    if wasted >= bps {
-        return Err(Error::invalid(format!("wasted bits {wasted} >= bps {bps}")));
-    }
-    let effective_bps = bps - wasted;
+    let mut samples = vec![0i64; block_size as usize];
+    decode_subframe_into(br, &mut samples, bps)?;
+    Ok(samples)
+}
 
-    let mut samples = match type_code {
+/// Decode one subframe into `out`; the block size is `out.len()`.
+///
+/// `bps` must be `1..=32` for an `i32` slice and `1..=33` for an `i64`
+/// slice. On error the contents of `out` are unspecified.
+pub fn decode_subframe_into<S: Sample>(
+    br: &mut BitReservoir,
+    out: &mut [S],
+    bps: u32,
+) -> Result<()> {
+    debug_assert!((1..=33).contains(&bps));
+    // §9.2.1: one zero bit, six type bits, the wasted-bits flag.
+    let header = br.read_u32(8)?;
+    if header & 0x80 != 0 {
+        return Err(Error::invalid(
+            "FLAC subframe: first header bit must be zero",
+        ));
+    }
+    let type_code = (header >> 1) & 0x3F;
+    // §9.2.2: the flag is followed by (wasted bits - 1) in unary.
+    let wasted = if header & 1 != 0 {
+        br.read_unary()?.saturating_add(1)
+    } else {
+        0
+    };
+    if wasted >= bps {
+        return Err(Error::invalid(format!(
+            "FLAC subframe: {wasted} wasted bits leave no sample bits at depth {bps}"
+        )));
+    }
+    let depth = bps - wasted;
+
+    match type_code {
         0b000000 => {
-            let v = br.read_i64(effective_bps)?;
-            vec![v; block_size as usize]
+            let v = S::from_i64(br.read_signed(depth)?);
+            out.fill(v);
         }
-        0b000001 => {
-            let mut s = Vec::with_capacity(block_size as usize);
-            for _ in 0..block_size {
-                s.push(br.read_i64(effective_bps)?);
-            }
-            s
-        }
+        0b000001 => br.read_signed_run(depth, out)?,
         0b001000..=0b001100 => {
-            let order = (type_code & 0x07) as usize;
-            decode_fixed_wide(br, block_size, effective_bps, order)?
+            let order = (type_code - 8) as usize;
+            read_warm_up(br, out, order, depth)?;
+            decode_residual(br, out, order)?;
+            restore_fixed(out, order);
         }
         0b100000..=0b111111 => {
-            let order = ((type_code & 0x1F) + 1) as usize;
-            decode_lpc_wide(br, block_size, effective_bps, order)?
+            let order = (type_code - 31) as usize;
+            read_warm_up(br, out, order, depth)?;
+            // §9.2.6: (precision - 1) in 4 bits, 0b1111 forbidden.
+            let precision = br.read_u32(4)? + 1;
+            if precision == 16 {
+                return Err(Error::invalid(
+                    "FLAC linear predictor: forbidden coefficient precision 0b1111",
+                ));
+            }
+            // A 5-bit two's-complement shift that MUST NOT be negative.
+            let shift = br.read_u32(5)?;
+            if shift & 0x10 != 0 {
+                return Err(Error::invalid(
+                    "FLAC linear predictor: negative prediction shift",
+                ));
+            }
+            let mut coefficients = [0i32; MAX_LPC_ORDER];
+            br.read_signed_run(precision, &mut coefficients[..order])?;
+            decode_residual(br, out, order)?;
+            restore_linear(out, &coefficients[..order], shift);
         }
         _ => {
             return Err(Error::invalid(format!(
-                "reserved FLAC subframe type 0x{type_code:02x}"
+                "FLAC subframe: reserved type 0b{type_code:06b}"
             )));
         }
-    };
+    }
 
     if wasted > 0 {
-        for s in samples.iter_mut() {
-            *s <<= wasted;
-        }
-    }
-    Ok(samples)
-}
-
-fn decode_fixed_wide(
-    br: &mut BitReader,
-    block_size: u32,
-    bps: u32,
-    order: usize,
-) -> Result<Vec<i64>> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..order {
-        samples.push(br.read_i64(bps)?);
-    }
-    decode_residual_into_wide(br, &mut samples, block_size, order)?;
-    apply_fixed_predictor_wide(&mut samples, order);
-    Ok(samples)
-}
-
-/// `i64` twin of [`apply_fixed_predictor`] — same difference-equation
-/// constants, widened storage. See that function for the derivation.
-///
-/// All arithmetic is `wrapping_*`, mirroring the narrow path's `as i32`
-/// truncation: a valid 33-bit stream keeps every reconstructed sample and
-/// predictor sum well inside `i64` (a 33-bit value times the ≤ 6 fixed
-/// coefficient is ≤ 36 bits), so no wrap ever occurs and the output is
-/// exact; a hostile/invalid stream that would otherwise grow a sample past
-/// `i64::MAX` wraps instead of panicking (debug overflow check), preserving
-/// the crate-wide panic-freedom contract exercised by the fuzz harnesses.
-fn apply_fixed_predictor_wide(samples: &mut [i64], order: usize) {
-    let total = samples.len();
-    let buf = samples;
-    match order {
-        0 => {}
-        1 => {
-            for t in order..total {
-                buf[t] = buf[t].wrapping_add(buf[t - 1]);
-            }
-        }
-        2 => {
-            for t in order..total {
-                let p = buf[t - 1].wrapping_mul(2).wrapping_sub(buf[t - 2]);
-                buf[t] = buf[t].wrapping_add(p);
-            }
-        }
-        3 => {
-            for t in order..total {
-                let p = buf[t - 1]
-                    .wrapping_mul(3)
-                    .wrapping_sub(buf[t - 2].wrapping_mul(3))
-                    .wrapping_add(buf[t - 3]);
-                buf[t] = buf[t].wrapping_add(p);
-            }
-        }
-        _ => {
-            for t in order..total {
-                let p = buf[t - 1]
-                    .wrapping_mul(4)
-                    .wrapping_sub(buf[t - 2].wrapping_mul(6))
-                    .wrapping_add(buf[t - 3].wrapping_mul(4))
-                    .wrapping_sub(buf[t - 4]);
-                buf[t] = buf[t].wrapping_add(p);
-            }
-        }
-    }
-}
-
-fn decode_lpc_wide(
-    br: &mut BitReader,
-    block_size: u32,
-    bps: u32,
-    order: usize,
-) -> Result<Vec<i64>> {
-    let mut samples = Vec::with_capacity(block_size as usize);
-    for _ in 0..order {
-        samples.push(br.read_i64(bps)?);
-    }
-    let qlp_precision_raw = br.read_u32(4)?;
-    if qlp_precision_raw == 0xF {
-        return Err(Error::invalid("FLAC LPC: invalid qlp precision (0xF)"));
-    }
-    let qlp_precision = qlp_precision_raw + 1;
-    let qlp_shift = br.read_i32(5)?;
-    if qlp_shift < 0 {
-        return Err(Error::invalid("FLAC LPC: negative qlp_shift not supported"));
-    }
-    let mut coeffs = Vec::with_capacity(order);
-    for _ in 0..order {
-        coeffs.push(br.read_i32(qlp_precision)? as i64);
-    }
-    decode_residual_into_wide(br, &mut samples, block_size, order)?;
-    apply_lpc_wide(&mut samples, &coeffs, qlp_shift as u32);
-    Ok(samples)
-}
-
-/// `i64` twin of [`apply_lpc`]. The inner product accumulates in `i64`
-/// exactly as the narrow path does (which already promoted to `i64`), so
-/// this is bit-identical to the ≤ 32-bit form on any sample that fits both
-/// widths; the only difference is the reconstructed samples themselves are
-/// stored `i64`-wide. Arithmetic is `wrapping_*` for the same reason as
-/// [`apply_fixed_predictor_wide`]: a valid 33-bit stream never wraps (a
-/// 33-bit sample times a ≤ 15-bit coefficient summed over ≤ 32 taps is
-/// ≤ 53 bits), while a hostile stream wraps rather than panicking.
-fn apply_lpc_wide(samples: &mut [i64], coeffs: &[i64], qlp_shift: u32) {
-    let order = coeffs.len();
-    let total = samples.len();
-    let buf = samples;
-    for t in order..total {
-        let window = &buf[t - order..t];
-        let mut pred: i64 = 0;
-        for (&s, &c) in window.iter().zip(coeffs.iter().rev()) {
-            pred = pred.wrapping_add(c.wrapping_mul(s));
-        }
-        buf[t] = buf[t].wrapping_add(pred >> qlp_shift);
-    }
-}
-
-/// `i64` twin of [`decode_residual_into`]. Identical partition walk and
-/// zig-zag mapping; the decoded residual is stored `i64`-wide.
-fn decode_residual_into_wide(
-    br: &mut BitReader,
-    samples: &mut Vec<i64>,
-    block_size: u32,
-    predictor_order: usize,
-) -> Result<()> {
-    let method = br.read_u32(2)?;
-    let (param_bits, escape_marker) = match method {
-        0 => (4u32, 15u32),
-        1 => (5u32, 31u32),
-        _ => return Err(Error::invalid("reserved FLAC residual coding method")),
-    };
-    let partition_order = br.read_u32(4)?;
-    let n_partitions = 1u32 << partition_order;
-    if !block_size.is_multiple_of(n_partitions) {
-        return Err(Error::invalid(
-            "FLAC residual: block_size not divisible by partition count",
-        ));
-    }
-    let partition_size = block_size / n_partitions;
-    if partition_size as usize <= predictor_order {
-        return Err(Error::invalid(
-            "FLAC residual: first partition smaller than predictor order",
-        ));
-    }
-
-    let total = block_size as usize - predictor_order;
-    samples.reserve(total);
-    for p in 0..n_partitions {
-        let n_samples = if p == 0 {
-            partition_size as usize - predictor_order
-        } else {
-            partition_size as usize
-        };
-        let k = br.read_u32(param_bits)?;
-        if k == escape_marker {
-            let raw_bps = br.read_u32(5)?;
-            for _ in 0..n_samples {
-                samples.push(br.read_i64(raw_bps)?);
-            }
-        } else {
-            for _ in 0..n_samples {
-                let q = br.read_unary()?;
-                let r = br.read_u32(k)?;
-                let unsigned = ((q as u64) << k) | (r as u64);
-                let signed: i64 = if unsigned & 1 == 0 {
-                    (unsigned >> 1) as i64
-                } else {
-                    -((unsigned >> 1) as i64) - 1
-                };
-                samples.push(signed);
-            }
+        // §9.2.2: pad with `wasted` zero bits by shifting left.
+        for s in out.iter_mut() {
+            *s = S::from_i64(s.to_i64() << wasted);
         }
     }
     Ok(())
+}
+
+/// Read the `order` unencoded warm-up samples that open a predicted
+/// subframe (§9.2.5, §9.2.6). A predictor needs more samples than its
+/// order to have anything to predict, so an order that does not leave at
+/// least one residual sample is rejected here, before anything is
+/// written past the block.
+fn read_warm_up<S: Sample>(
+    br: &mut BitReservoir,
+    out: &mut [S],
+    order: usize,
+    depth: u32,
+) -> Result<()> {
+    if order >= out.len() {
+        return Err(Error::invalid(format!(
+            "FLAC subframe: predictor order {order} needs a block larger than {} samples",
+            out.len()
+        )));
+    }
+    br.read_signed_run(depth, &mut out[..order])
+}
+
+/// Decode the coded residual (§9.2.7) of a predicted subframe into
+/// `out[order..]`.
+///
+/// The residual is cut into `2^partition order` partitions of
+/// `block size >> partition order` samples each, the first one shortened
+/// by the predictor order. Two MUSTs bound the partition order: the block
+/// size is evenly divisible by the partition count, and
+/// `block size >> partition order` is larger than the predictor order —
+/// so the first partition always holds at least one residual sample, and
+/// a stream where it would hold none (or fewer) is invalid.
+fn decode_residual<S: Sample>(br: &mut BitReservoir, out: &mut [S], order: usize) -> Result<()> {
+    let block_size = out.len();
+    // Two method bits and four partition-order bits.
+    let lead = br.read_u32(6)?;
+    let (parameter_bits, escape) = match lead >> 4 {
+        0b00 => (4u32, 0b1111u32),
+        0b01 => (5, 0b11111),
+        _ => return Err(Error::invalid("FLAC residual: reserved coding method")),
+    };
+    let partition_order = lead & 0xF;
+    let partition_len = block_size >> partition_order;
+    if partition_len << partition_order != block_size {
+        return Err(Error::invalid(format!(
+            "FLAC residual: block size {block_size} is not divisible by 2^{partition_order} partitions"
+        )));
+    }
+    if partition_len <= order {
+        return Err(Error::invalid(format!(
+            "FLAC residual: partition of {partition_len} samples is not larger than predictor order {order}"
+        )));
+    }
+
+    let mut rest = &mut out[order..];
+    let mut len = partition_len - order;
+    for _ in 0..1usize << partition_order {
+        let (partition, tail) = rest.split_at_mut(len);
+        rest = tail;
+        len = partition_len;
+        let parameter = br.read_u32(parameter_bits)?;
+        if parameter == escape {
+            // §9.2.7.1: 5 bits of width, then that many bits per sample;
+            // width 0 means every residual in the partition is zero.
+            let width = br.read_u32(5)?;
+            br.read_signed_run(width, partition)?;
+        } else {
+            br.read_rice_run(parameter, partition)?;
+        }
+    }
+    Ok(())
+}
+
+/// Add the fixed predictor of §9.2.5 (Table 20) back onto the residual.
+/// On entry `buf` is `[warm-up (order) | residual]`; on return it is the
+/// decoded signal. The last `order` decoded samples are carried in
+/// locals, so the loop touches each slot exactly once.
+fn restore_fixed<S: Sample>(buf: &mut [S], order: usize) {
+    let (warm, rest) = buf.split_at_mut(order);
+    let w = |i: usize| warm[i].to_i64();
+    match order {
+        // Prediction 0: the residual is the signal.
+        0 => {}
+        1 => {
+            let mut a = w(0);
+            for s in rest {
+                *s = S::from_i64(s.to_i64().wrapping_add(a));
+                a = s.to_i64();
+            }
+        }
+        2 => {
+            let (mut b, mut a) = (w(0), w(1));
+            for s in rest {
+                let p = a.wrapping_mul(2).wrapping_sub(b);
+                *s = S::from_i64(s.to_i64().wrapping_add(p));
+                (b, a) = (a, s.to_i64());
+            }
+        }
+        3 => {
+            let (mut c, mut b, mut a) = (w(0), w(1), w(2));
+            for s in rest {
+                let p = a.wrapping_sub(b).wrapping_mul(3).wrapping_add(c);
+                *s = S::from_i64(s.to_i64().wrapping_add(p));
+                (c, b, a) = (b, a, s.to_i64());
+            }
+        }
+        _ => {
+            let (mut d, mut c, mut b, mut a) = (w(0), w(1), w(2), w(3));
+            for s in rest {
+                let p = a
+                    .wrapping_add(c)
+                    .wrapping_mul(4)
+                    .wrapping_sub(b.wrapping_mul(6))
+                    .wrapping_sub(d);
+                *s = S::from_i64(s.to_i64().wrapping_add(p));
+                (d, c, b, a) = (c, b, a, s.to_i64());
+            }
+        }
+    }
+}
+
+/// Add the linear predictor of §9.2.6 back onto the residual. On entry
+/// `buf` is `[warm-up (order) | residual]`. `coefficients[0]` multiplies
+/// the sample directly before the predicted one, `coefficients[1]` the
+/// one before that, and so on; the sum is shifted right arithmetically by
+/// `shift` and added to the residual.
+///
+/// One loop is compiled per order (1..=32), each over a fixed-length
+/// window, so the inner product has a constant trip count.
+fn restore_linear<S: Sample>(buf: &mut [S], coefficients: &[i32], shift: u32) {
+    macro_rules! by_order {
+        ($($n:literal)*) => {
+            match coefficients.len() {
+                $($n => restore_linear_n::<S, $n>(buf, coefficients, shift),)*
+                _ => unreachable!("linear predictor order is 1..=32"),
+            }
+        };
+    }
+    by_order!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+              17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+}
+
+#[inline(always)]
+fn restore_linear_n<S: Sample, const N: usize>(buf: &mut [S], coefficients: &[i32], shift: u32) {
+    // Oldest-first copy of the coefficients, so `taps[j]` pairs with
+    // `window[j]` when the window is in time order.
+    let mut taps = [0i64; N];
+    for (tap, &c) in taps.iter_mut().zip(coefficients.iter().rev()) {
+        *tap = c as i64;
+    }
+    for t in N..buf.len() {
+        let (past, current) = buf.split_at_mut(t);
+        let window: &[S; N] = past[t - N..].try_into().expect("window of N samples");
+        let mut sum = 0i64;
+        for (tap, s) in taps.iter().zip(window) {
+            sum = sum.wrapping_add(tap.wrapping_mul(s.to_i64()));
+        }
+        let slot = &mut current[0];
+        *slot = S::from_i64(slot.to_i64().wrapping_add(sum >> shift));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Regression test for the panic the `panic_free_decode` fuzz
-    /// harness found on 2026-05-10 — a STREAMINFO declaring
-    /// `bits_per_sample=32` combined with a stereo-decorrelated frame
-    /// asks for a 33-bit side-channel sample, which `read_i32` can't
-    /// represent. We now reject `bps > 32` (and `bps == 0`) at
-    /// `decode_subframe` entry rather than panicking inside the
-    /// bit reader.
+    /// The narrow entry point holds `i32` samples, so a 33-bit side
+    /// channel (and a zero depth) is refused up front.
     #[test]
     fn decode_subframe_rejects_bps_above_32_without_panic() {
         let bytes = [0u8; 16];
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let err = decode_subframe(&mut br, 4096, 33).expect_err("bps 33 must be rejected");
         match err {
             Error::Unsupported(_) => {}
@@ -565,7 +313,7 @@ mod tests {
     #[test]
     fn decode_subframe_rejects_bps_zero_without_panic() {
         let bytes = [0u8; 16];
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let err = decode_subframe(&mut br, 4096, 0).expect_err("bps 0 must be rejected");
         assert!(matches!(err, Error::Unsupported(_)));
     }
@@ -574,7 +322,7 @@ mod tests {
     use oxideav_core::bits::BitWriter;
 
     /// Encode a chosen residual through the zig-zag + Rice mapping the
-    /// wide decoder inverts (`decode_residual_into_wide`), so a test can
+    /// wide decoder inverts (`decode_residual`), so a test can
     /// build a Rice-coded partition by hand. `-((u>>1))-1` for odd is the
     /// inverse of this `2r`/`-2r-1` fold.
     fn write_rice(w: &mut BitWriter, r: i64, k: u32) {
@@ -605,7 +353,7 @@ mod tests {
         w.write_u64(val as u64, 33);
         w.align_to_byte();
         let bytes = w.finish();
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let s = decode_subframe_wide(&mut br, 6, 33).unwrap();
         assert_eq!(s, vec![val; 6]);
     }
@@ -629,7 +377,7 @@ mod tests {
         }
         w.align_to_byte();
         let bytes = w.finish();
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let s = decode_subframe_wide(&mut br, vals.len() as u32, 33).unwrap();
         assert_eq!(s, vals.to_vec());
     }
@@ -666,7 +414,7 @@ mod tests {
         }
         w.align_to_byte();
         let bytes = w.finish();
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let s = decode_subframe_wide(&mut br, 6, 33).unwrap();
         assert_eq!(s, expected);
     }
@@ -702,7 +450,7 @@ mod tests {
         }
         w.align_to_byte();
         let bytes = w.finish();
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let s = decode_subframe_wide(&mut br, 6, 33).unwrap();
         assert_eq!(s, expected);
     }
@@ -710,7 +458,7 @@ mod tests {
     #[test]
     fn wide_rejects_non_33_bps() {
         let bytes = [0u8; 8];
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         assert!(matches!(
             decode_subframe_wide(&mut br, 16, 34),
             Err(Error::Unsupported(_))
@@ -726,7 +474,7 @@ mod tests {
     #[test]
     fn wide_fixed_predictor_order4_wraps_without_panic() {
         let mut buf = vec![i64::MAX; 65535];
-        apply_fixed_predictor_wide(&mut buf, 4);
+        restore_fixed(&mut buf, 4);
     }
 
     /// Same contract for the wide LPC reconstruction: a maximal
@@ -734,8 +482,8 @@ mod tests {
     #[test]
     fn wide_lpc_predictor_wraps_without_panic() {
         let mut buf = vec![i64::MAX; 4096];
-        let coeffs = vec![i64::from(i16::MAX); 32]; // wider than any real qlp coeff
-        apply_lpc_wide(&mut buf, &coeffs, 0);
+        let coeffs = [i32::MAX; 32]; // wider than any real coefficient
+        restore_linear(&mut buf, &coeffs, 0);
     }
 
     /// Wasted-bits on the wide path: the unary-coded count reduces the
@@ -761,7 +509,7 @@ mod tests {
         }
         w.align_to_byte();
         let bytes = w.finish();
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let s = decode_subframe_wide(&mut br, vals.len() as u32, 33).unwrap();
         assert_eq!(s, vals.to_vec());
     }
@@ -796,7 +544,7 @@ mod tests {
         }
         w.align_to_byte();
         let bytes = w.finish();
-        let mut br = BitReader::new(&bytes);
+        let mut br = BitReservoir::new(&bytes);
         let s = decode_subframe_wide(&mut br, 8, 33).unwrap();
         assert_eq!(s, expected);
     }
