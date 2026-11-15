@@ -2001,6 +2001,10 @@ fn verify_encoded_frame(
 
 // --- Per-frame encoding ---------------------------------------------------
 
+/// Largest frame number a fixed block size stream can carry (31 bits,
+/// RFC 9639 §9.1.5).
+const MAX_FRAME_NUMBER: u64 = 0x7FFF_FFFF;
+
 fn encode_frame(
     frame_number: u64,
     block_size: u32,
@@ -2012,6 +2016,16 @@ fn encode_frame(
     let n_ch = channels.len();
     if !(1..=8).contains(&n_ch) {
         return Err(Error::invalid("FLAC encoder: channel count out of range"));
+    }
+    // RFC 9639 §9.1.5: the frame number of a fixed block size stream
+    // "MUST NOT be larger than what fits a value of 31 bits". A stream
+    // that long cannot be continued; say so instead of writing a header
+    // every decoder has to refuse.
+    if frame_number > MAX_FRAME_NUMBER {
+        return Err(Error::unsupported(format!(
+            "FLAC encoder: frame number {frame_number} exceeds the 31-bit limit of a \
+             fixed block size stream (RFC 9639 §9.1.5); use a larger block size"
+        )));
     }
 
     // The estimate-driven search writes its subframes itself; the
@@ -7525,6 +7539,53 @@ mod tests {
         assert_eq!(encode_sample_size(32), 7);
         // A depth with no table entry falls back to "from STREAMINFO".
         assert_eq!(encode_sample_size(10), 0);
+    }
+
+    /// The last frame number a fixed block size stream can carry encodes
+    /// (as a six-byte coded number) and parses; the next one is refused
+    /// rather than written with a seven-byte number, which RFC 9639
+    /// §9.1.5 reserves for sample numbers.
+    #[test]
+    fn frame_number_stops_at_31_bits() {
+        let samples: Vec<i32> = (0..64).map(|i| (i * 37) % 201 - 100).collect();
+        let mut scratch = SubframeScratch::default();
+        let frame = encode_frame(
+            MAX_FRAME_NUMBER,
+            64,
+            44_100,
+            16,
+            std::slice::from_ref(&samples),
+            &mut scratch,
+        )
+        .unwrap();
+        let hdr = crate::frame::parse_frame_header(&frame).unwrap();
+        assert_eq!(hdr.coded_number, MAX_FRAME_NUMBER);
+        assert_eq!(hdr.header_byte_len, 4 + 6 + 1 + 1);
+        let mut strict = FrameScratch::strict();
+        let info = StreamInfo {
+            min_block_size: 64,
+            max_block_size: 64,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: 44_100,
+            channels: 1,
+            bits_per_sample: 16,
+            total_samples: 0,
+            md5: [0; 16],
+        };
+        strict.decode(&frame, &info).unwrap();
+        assert_eq!(strict.planes()[0], samples);
+
+        let err = encode_frame(
+            MAX_FRAME_NUMBER + 1,
+            64,
+            44_100,
+            16,
+            std::slice::from_ref(&samples),
+            &mut scratch,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
     }
 
     #[test]

@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - demuxer: a metadata block or ID3v2 tag whose length field promises
   more bytes than the input holds no longer allocates that length up
   front (up to 16 MiB and 256 MiB respectively).
+- encoder: a stream that would need a frame number above 31 bits
+  (2^31 frames; RFC 9639 §9.1.5) ends with an error instead of a frame
+  header that decoders must refuse.
 - frame header: the forbidden block size 65536 (RFC 9639 §9.1.6), a set
   reserved bit after the bit depth (§9.1.4) and a frame number of more
   than 31 bits (§9.1.5) are rejected. A header that is cut short by the
