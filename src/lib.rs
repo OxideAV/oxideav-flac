@@ -14,8 +14,9 @@
 //!   subframe types, all residual partition methods, 4 to 32 bits per sample,
 //!   up to 8 channels, stereo decorrelation) and a working pure-Rust
 //!   encoder that produces bit-exact round-trippable output. The encoder
-//!   tries CONSTANT, FIXED 0..=4, LPC 1..=8 and VERBATIM per subframe,
-//!   picks the smallest, evaluates all four stereo channel assignments
+//!   has nine compression levels; per subframe it chooses among
+//!   CONSTANT, VERBATIM, FIXED 0..=4 and LPC (orders up to 12 by default,
+//!   32 on request), chooses among the four stereo channel assignments
 //!   for 2-channel input, and writes a full STREAMINFO (including MD5
 //!   signature and frame-size/sample-count bookkeeping) at flush time.
 

@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/levels.rs`: speed and size of every compression level on a
   stereo and a 5.1 signal, with a mode that writes the signals as WAVE
   files for measuring another encoder on the same input.
+- fuzz: `encoder_options` draws a stream bit depth for
+  `bits_per_sample`, feeds left-justified input and checks the depth
+  STREAMINFO states.
+- tests: a variable block size stream assembled bit by bit is checked
+  against the black-box decoder.
 - tests: a gated run (`OXIDEAV_FLAC_LONG_STREAM=1`) over a stream of
   2^32 + 123 457 samples: decode, MD5, seeking past the 32-bit mark,
   and this encoder's output checked by the black-box tool.

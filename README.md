@@ -216,10 +216,30 @@ and 8, and on 24-bit multichannel input 25–50 % behind from level 5 up
 (level 8: about half the speed): each
 of the six channels is searched on its own there, without the
 two-of-four shortcut the stereo layout estimate gives, and 24-bit
-samples take the wider residual kernel. Decoding the same streams
-(`levels … decode`, sample planes with the CRC-16 check, no output
-file) runs at roughly 400–550 MiB of PCM per CPU second for the stereo
-signal and 700–850 for the 5.1 one at every level.
+samples take the wider residual kernel.
+
+Decoding this encoder's streams of the same two signals, to sample
+planes with the CRC-16 check and no output file (`levels SECONDS RUNS -
+decode LEVEL SIGNAL`, MiB of PCM per CPU second with the start-up cost
+subtracted, median of 3, one sitting):
+
+| level | 16-bit stereo MiB/s | 24-bit 5.1 MiB/s |
+|---:|---:|---:|
+| 0 | 369 | 883 |
+| 1 | 374 | 862 |
+| 2 | 374 | 878 |
+| 3 | 297 | 687 |
+| 4 | 379 | 683 |
+| 5 | 445 | 570 |
+| 6 | 531 | 575 |
+| 7 | 496 | 577 |
+| 8 | 496 | 582 |
+
+The 5.1 column shows the cost of the predictors: fixed ones at levels
+0–2, a linear predictor of order up to 6 or 8 at levels 3–4 and up to
+12 above. The stereo runs are short (0.6 s each) and the machine was
+busy; their scatter between 300 and 530 MiB/s is the measurement, not
+the level.
 
 ### Multithreaded encoding
 
@@ -459,6 +479,10 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   `.with_allow_non_subset_partition_order(true)` lifts the residual
   search ceiling to the full field range (0..=15). Output stays a valid
   (non-subset) FLAC stream.
+- **Not written**: variable block size streams (every stream this
+  encoder writes has one block size, the last block aside; the decoder
+  reads both kinds), and at 32 bits the decorrelated layouts for blocks
+  whose side channel needs its 33rd bit.
 - **Block size**: 4096 samples per frame (fixed-blocking strategy) by
   default. `.with_block_size(n)` sets the per-frame block size to any `n` in
   the STREAMINFO range `16..=65535` (RFC 9639 §8.2); every frame but the
@@ -601,12 +625,19 @@ tools are not installed.
   both sides of the 32-bit mark, and this encoder's file of the same
   samples passes `flac -t`. Last run: pass.
 - **Hand-built frames** (`tests/spec_edges.rs`): every frame of that
-  suite which this crate decodes — about 390, among them escaped
+  suite which this crate decodes — about 400, among them escaped
   partitions of every width, Rice parameters at both limits, partition
   order 15, every block-size code, and the 33-bit side channel through
   every predictor — is also decoded by the black-box decoder and must
   give the same samples. It refuses 5 of them, all cases of the
   empty-first-partition tolerance described above.
+
+Not covered by any outside stream or tool: FLAC in Ogg (this crate
+registers the codec for it, the Ogg container is another crate's), and
+escaped residual partitions as written by an encoder other than this
+one (no outside encoder at hand produces them; this crate's decoder
+reads its own and the hand-built ones, and the black-box decoder reads
+this encoder's — 74 219 escaped partitions in the own-stream matrix).
 
 ## Codec identification
 
@@ -684,7 +715,9 @@ trait:
   `Demuxer::chapters()`. Each non-lead-out track becomes one
   `Chapter` carrying its sample-offset range and the track number
   as `id`. A track that opens with index point 0 (its pre-gap, §8.7)
-  starts at its index point 1. The full parsed CUESHEET (media catalog number, lead-in
+  starts at its index point 1, as in a disc's table of contents, and
+  each chapter runs up to the start of the next, so a pre-gap belongs
+  to the chapter before it and the chapters leave no hole. The full parsed CUESHEET (media catalog number, lead-in
   sample count, per-track ISRC, INDEX point list) is also retained
   on the demuxer for CD-DA fidelity. A malformed CUESHEET is
   non-fatal: it is dropped and an empty chapter list returned.
@@ -730,8 +763,9 @@ panic-freedom contract — every public surface must return a `Result`
 on malformed input, never panic, abort, or OOM: `panic_free_decode`,
 `decode`, `roundtrip`, `flac_oracle_decode` (cross-decode against an
 optional system black-box validator loaded via `dlsym`, skipped
-silently when absent), `metadata_walker`, `encoder_options`,
-`md5_streaming`, `utf8_varint`, `frame_header`, `metadata_chain`,
+silently when absent), `metadata_walker`, `encoder_options`
+(which also draws a stream bit depth for `bits_per_sample`, valid or
+not), `md5_streaming`, `utf8_varint`, `frame_header`, `metadata_chain`,
 `subframe_decode`, `application`, and `seek` (demuxer `seek_to` +
 post-seek packet drain against unsorted / placeholder / out-of-range
 SEEKTABLE points the §8.5.1-enforcing writer never emits). Daily split
@@ -817,12 +851,13 @@ cargo run --example profile_flac --release -- <mode> [<iters>]
 
 `profile/` carries committed SVG flamegraphs (`encode.svg`,
 `decode.svg`, `roundtrip.svg`) plus folded-stack inputs — see
-`profile/README.md` for the recipe. The decode path is realtime by
-orders of magnitude; the encode path is mono-realtime and within a
-small factor of realtime for stereo / multichannel, with the
-remaining cost in the per-subframe LPC + apodization window search
-and the Rice partition-order search. See `CHANGELOG.md` for the
-encoder optimisation history.
+`profile/README.md` for the recipe. Those graphs predate the
+compression levels and show the exhaustive search; at the levels the
+encoder's time now goes to the LPC analysis, the residual of each
+candidate predictor, the partition-order estimate and the MD5, and the
+decoder's to Rice decoding and the predictor loops. Both run hundreds
+of times faster than real time (see the tables above). See
+`CHANGELOG.md` for the optimisation history.
 
 ## Codec / container IDs
 
