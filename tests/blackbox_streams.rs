@@ -228,10 +228,9 @@ fn metadata_blocks_from_the_black_box_tools() {
             let ends: Vec<i64> = demux.chapters().iter().map(|c| c.end.value).collect();
             // mm:ss:ff with 75 frames per second of 588 samples each.
             // Track 2 opens with a pre-gap (index 0) at 00:01:50 and
-            // begins at its index 1; track 1 ends where that gap starts.
+            // begins at its index 1, where track 1's chapter ends.
             let want = [0, 2 * 75 * 588, (3 * 75 + 37) * 588];
-            let gap = (75 + 50) * 588;
-            if starts != want || ends != [gap, want[2], planes[0].len() as i64] {
+            if starts != want || ends != [want[1], want[2], planes[0].len() as i64] {
                 return Err(format!("chapters {starts:?} .. {ends:?}"));
             }
             Ok(())

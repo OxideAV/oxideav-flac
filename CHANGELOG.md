@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table), and to follow a seek point without checking that a frame
   starts there.
 - demuxer: a CUESHEET track that opens with index point 0 (its pre-gap)
-  becomes a chapter starting at index point 1.
+  becomes a chapter starting at index point 1, and the chapter before
+  it runs up to there.
 - verify: `verify_stream` reads past an ID3v2 tag in front of the
   stream and ignores bytes after the last sample STREAMINFO counts, as
   the demuxer does.

@@ -378,10 +378,14 @@ struct FlacDemuxer {
 /// transform is:
 ///
 /// * Each non-lead-out track becomes one chapter.
-/// * `start` = the CUESHEET track's `offset_samples`, moved past the
-///   pre-gap when the track opens with index point 0.
-/// * `end`   = the next CUESHEET track's `offset_samples` (the
-///   lead-out entry supplies this for the final chapter).
+/// * `start` = where the track begins. RFC 9639 §8.7.1 notes that the
+///   FLAC track offset is that of the track's *first* index point,
+///   unlike a CD table of contents, which lists index point 1 even when
+///   there is an index point 0 (the pre-gap, §8.7.1.1). A track that
+///   opens with index point 0 therefore starts at its index point 1.
+/// * `end`   = the start of the next chapter, so the chapters are
+///   contiguous and a pre-gap plays out at the end of the chapter before
+///   it, as it does on a disc; the lead-out offset ends the last one.
 /// * `id`    = the CUESHEET track number (1..=99 for CD-DA audio).
 /// * `title` = `None`; the CUESHEET block doesn't carry track titles.
 ///   A Vorbis-comment `TRACK01=…` style tag is the usual companion
@@ -391,30 +395,25 @@ fn build_chapters_from_cuesheet(cs: Option<&CueSheet>, time_base: TimeBase) -> V
     let Some(cs) = cs else {
         return Vec::new();
     };
-    if cs.tracks.len() < 2 {
-        // Only the lead-out present — no payload chapters to surface.
+    let Some((lead_out, tracks)) = cs.tracks.split_last() else {
         return Vec::new();
-    }
-    let mut out = Vec::with_capacity(cs.tracks.len() - 1);
-    for window in cs.tracks.windows(2) {
-        let cur = &window[0];
-        let next = &window[1];
-        // §8.7.1.1: index point 0 is the track's pre-gap, so a track
-        // that opens with one begins at its index point 1.
-        let pre_gap = match cur.indices.as_slice() {
-            [first, second, ..] if first.number == 0 && second.number == 1 => {
-                second.offset_samples.saturating_sub(first.offset_samples)
-            }
+    };
+    let limit = lead_out.offset_samples;
+    let start_of = |track: &crate::metadata::CueSheetTrack| {
+        let past_pre_gap = match track.indices.as_slice() {
+            [first, second, ..] if first.number == 0 && second.number == 1 => second.offset_samples,
             _ => 0,
         };
-        let start = cur
-            .offset_samples
-            .saturating_add(pre_gap)
-            .min(next.offset_samples);
+        track.offset_samples.saturating_add(past_pre_gap).min(limit)
+    };
+    let mut out = Vec::with_capacity(tracks.len());
+    for (i, track) in tracks.iter().enumerate() {
+        let start = start_of(track);
+        let end = tracks.get(i + 1).map_or(limit, start_of).max(start);
         out.push(Chapter {
-            id: cur.number as u64,
+            id: track.number as u64,
             start: Timestamp::new(start as i64, time_base),
-            end: Timestamp::new(next.offset_samples as i64, time_base),
+            end: Timestamp::new(end as i64, time_base),
             title: None,
             language: None,
         });

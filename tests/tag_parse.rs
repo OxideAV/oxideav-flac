@@ -339,7 +339,7 @@ fn flac_write_cuesheet_round_trips_through_demuxer() {
 
 /// RFC 9639 §8.7: index point 0 of a track is its pre-gap. A chapter
 /// begins where the track does, at index point 1, and the chapter before
-/// it ends where the gap starts.
+/// it runs up to there, so the chapters leave no hole.
 #[test]
 fn flac_cuesheet_chapter_starts_after_the_pre_gap() {
     use oxideav_flac::metadata::{CueSheet, CueSheetIndex, CueSheetTrack, write_cuesheet};
@@ -393,7 +393,7 @@ fn flac_cuesheet_chapter_starts_after_the_pre_gap() {
     assert_eq!(
         spans,
         [
-            (1, 0, 588 * 1000),
+            (1, 0, 588 * 1150),
             (2, 588 * 1150, 588 * 3000),
             (3, 588 * 3000, 588 * 5000),
         ]

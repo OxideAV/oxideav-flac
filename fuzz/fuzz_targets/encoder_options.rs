@@ -26,7 +26,10 @@
 //!
 //! This target carves the fuzz input into:
 //!
-//!   - 1 B  format selector (U8 / S16 / S24 / S32)
+//!   - 1 B  format selector (U8 / S16 / S24 / S32) in the low two bits;
+//!     the upper six bits, when not zero, are a stream bit depth for
+//!     `FlacEncoderOptions::bits_per_sample` (1..=63: depths the format
+//!     can carry and depths it must refuse)
 //!   - 1 B  channel selector (a raw 0..=255 byte — most values
 //!     should be rejected by the `1..=8` guard without panicking)
 //!   - 1 B  sample-rate selector (8 kHz, 44.1 kHz, 48 kHz, 96 kHz,
@@ -85,6 +88,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let fmt_sel = data[0] & 0x03;
+    let depth_sel = data[0] >> 2;
     let ch_raw = data[1];
     let sr_sel = data[2] & 0x07;
     let pad_sel = data[3] & 0x07;
@@ -148,6 +152,9 @@ fuzz_target!(|data: &[u8]| {
     let mut opts = FlacEncoderOptions::default();
     opts.padding_bytes = padding_bytes;
     opts.verify = verify;
+    if depth_sel != 0 {
+        opts.bits_per_sample = Some(depth_sel);
+    }
 
     let mut enc = match make_encoder_with_options(&params, opts.clone()) {
         Ok(e) => e,
@@ -203,6 +210,24 @@ fuzz_target!(|data: &[u8]| {
     // with an `Err`, so leaving them in would just shrink the
     // useful corpus.
     clamp_pcm_in_place(&mut pcm, format);
+    // A stream narrower than the format takes left-justified input: the
+    // bits below the declared depth are zero. They sit in the first
+    // (least significant) byte of each little-endian sample, and for
+    // `U8` the offset of 128 leaves them where they are.
+    if let Some(depth) = opts.bits_per_sample {
+        let pad = (bytes_per_sample * 8) as u32 - depth as u32;
+        let keep = 0xFFu8 << pad;
+        for sample in pcm.chunks_exact_mut(bytes_per_sample) {
+            sample[0] &= keep;
+        }
+        // The stream says what it was asked to carry.
+        let info = oxideav_flac::metadata::StreamInfo::parse(&extradata[4..38])
+            .expect("the encoder's STREAMINFO parses");
+        assert_eq!(
+            info.bits_per_sample, depth,
+            "STREAMINFO does not state the requested depth"
+        );
+    }
 
     let frame = AudioFrame {
         samples,
