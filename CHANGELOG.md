@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-flac/compare/v0.0.13...v0.0.14) - 2026-11-21
+
+### Other
+
+- decode speed per level, what is not covered, corrected stale statements
+- contiguous chapters across pre-gaps; fuzz the bit depth option
+- vectorised intake, split 32-bit residual kernel for wide samples; level table
+- variable block size stream and a stream past 2^32 samples, checked outside
+- frame-accurate seeking by halving a byte range; whole-file matrix
+- any depth from 4 to 32 bits; 32-bit stereo decorrelation; own-stream matrix
+- every depth from 4 to 32 bits, left-justified; outside-encoder matrix
+- stop at the 31-bit frame number limit
+- black-box check only at standard rates and with a tool that takes 32 bits
+- FrameScratch is public API
+- frame cuts do not depend on how the input is chunked
+- collapse a nested if in the black-box check (clippy)
+- a black-box decoder checks the encoder's edge-case streams
+- output_params from STREAMINFO; reset drops the pending packet
+- README speed table and decode/demux notes; verify reuses planes; speed example file column
+- frame_header runs its boundary sweep once per process
+- decode an empty first residual partition; strict mode for the encoder self-check
+- frames end where their CRC-16 says, with bounded resynchronisation
+- reject the header values the specification forbids; spec edge tests
+- subframes on a 64-bit bit reservoir, planes kept between frames
+- seek point offset past u64::MAX falls back to the header scan
+
 ### Fixed
 
 - decoder / demuxer: streams of 4 to 7 bits per sample are decoded (to
