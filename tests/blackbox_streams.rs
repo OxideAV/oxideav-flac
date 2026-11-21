@@ -658,3 +658,303 @@ fn cut_and_damaged_streams_yield_their_whole_frames() {
     }
     tally.finish("cut and damaged streams");
 }
+
+/// A stream longer than 2^32 samples (about 149 hours at 8 kHz): sample
+/// numbers, the STREAMINFO count and seeking all pass the 32-bit mark.
+///
+/// It pipes 4 GiB through the black-box encoder and takes minutes, so it
+/// runs only when `OXIDEAV_FLAC_LONG_STREAM` is set.
+#[test]
+fn stream_longer_than_32_bits_of_samples() {
+    if std::env::var_os("OXIDEAV_FLAC_LONG_STREAM").is_none() || !have_flac() {
+        eprintln!("skip: set OXIDEAV_FLAC_LONG_STREAM=1 (and install `flac`) to run");
+        return;
+    }
+    use std::io::Write;
+    const TOTAL: u64 = (1 << 32) + 123_457;
+    const BLOCK: u64 = 4096;
+    // Steps of a thousand samples, so frames are not all alike.
+    let value = |i: u64| ((i / 1000) % 200) as i32 - 100;
+    let chunk_of = |start: u64, len: usize| -> Vec<u8> {
+        (0..len as u64)
+            .map(|k| value(start + k) as i8 as u8)
+            .collect()
+    };
+
+    let scratch = Scratch::new("streams-long");
+    let path = scratch.path("long.flac");
+    let mut child = std::process::Command::new("flac")
+        .args([
+            "-s",
+            "-f",
+            "-0",
+            "-b",
+            "4096",
+            "--force-raw-format",
+            "--endian=little",
+            "--sign=signed",
+            "--channels=1",
+            "--bps=8",
+            "--sample-rate=8000",
+            "-o",
+        ])
+        .arg(&path)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn flac");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let mut at = 0u64;
+        while at < TOTAL {
+            let len = (TOTAL - at).min(1 << 20) as usize;
+            stdin.write_all(&chunk_of(at, len)).expect("feed flac");
+            at += len as u64;
+        }
+    }
+    assert!(child.wait().expect("flac exit").success());
+
+    // The outside encoder's file, read from disk.
+    let open = || {
+        let file: Box<dyn oxideav_core::ReadSeek> = Box::new(std::fs::File::open(&path).unwrap());
+        let mut reg = oxideav_core::ContainerRegistry::new();
+        oxideav_flac::register_containers(&mut reg);
+        reg.open_demuxer("flac", file, &oxideav_core::NullCodecResolver)
+            .unwrap()
+    };
+    let mut demux = open();
+    assert_eq!(
+        demux.duration_micros(),
+        Some((TOTAL as i128 * 1_000_000 / 8000) as i64)
+    );
+    let info = {
+        let extradata = &demux.streams()[0].params.extradata;
+        oxideav_flac::metadata::StreamInfo::parse(&extradata[4..38]).unwrap()
+    };
+    assert_eq!(info.total_samples, TOTAL);
+    let mut frames = oxideav_flac::decoder::FrameScratch::new();
+    let mut md5 = oxideav_flac::verify::Md5Verifier::new(8);
+    let mut at = 0u64;
+    loop {
+        let pkt = match demux.next_packet() {
+            Ok(p) => p,
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux at sample {at}: {e}"),
+        };
+        assert_eq!(pkt.pts, Some(at as i64));
+        let shape = frames.decode(&pkt.data, &info).unwrap();
+        let plane = &frames.planes()[0];
+        for (k, &s) in plane.iter().enumerate() {
+            if s != value(at + k as u64) {
+                panic!("sample {} decoded as {s}", at + k as u64);
+            }
+        }
+        md5.update(&frames.planes()[..1]);
+        at += shape.block_size as u64;
+    }
+    assert_eq!(at, TOTAL);
+    assert!(md5.verify(&info.md5).unwrap(), "MD5 matches");
+
+    // Seeking beyond the 32-bit mark.
+    let last_frame = (TOTAL - 1) / BLOCK * BLOCK;
+    for (target, expect) in [
+        (TOTAL - 1, last_frame),
+        ((1 << 32) + 5, (1 << 32) / BLOCK * BLOCK),
+        ((1 << 32) - 1, ((1 << 32) - 1) / BLOCK * BLOCK),
+        (3_000_000_123, 3_000_000_123 / BLOCK * BLOCK),
+        (0, 0),
+        (TOTAL + 10, last_frame),
+    ] {
+        assert_eq!(demux.seek_to(0, target as i64).unwrap(), expect as i64);
+        let pkt = demux.next_packet().unwrap();
+        assert_eq!(pkt.pts, Some(expect as i64));
+        frames.decode(&pkt.data, &info).unwrap();
+        assert_eq!(frames.planes()[0][0], value(expect));
+    }
+
+    // This crate's encoder over the same samples, checked outside.
+    let params = encoder_params(1, 8, 8000);
+    let mut enc = oxideav_flac::encoder::make_encoder_with_options(
+        &params,
+        oxideav_flac::encoder::FlacEncoderOptions::level(0),
+    )
+    .unwrap();
+    let ours = scratch.path("ours.flac");
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&ours).unwrap());
+    out.write_all(b"fLaC").unwrap();
+    out.write_all(&enc.output_params().extradata).unwrap();
+    let mut at = 0u64;
+    while at < TOTAL {
+        let len = (TOTAL - at).min(1 << 20) as usize;
+        let data: Vec<u8> = chunk_of(at, len)
+            .iter()
+            .map(|b| b.wrapping_add(128))
+            .collect();
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: len as u32,
+            pts: None,
+            data: vec![data],
+        }))
+        .unwrap();
+        while let Ok(p) = enc.receive_packet() {
+            out.write_all(&p.data).unwrap();
+        }
+        at += len as u64;
+    }
+    enc.flush().unwrap();
+    while let Ok(p) = enc.receive_packet() {
+        out.write_all(&p.data).unwrap();
+    }
+    // The final STREAMINFO replaces the placeholder at the start.
+    use std::io::Seek;
+    let mut file = out.into_inner().unwrap();
+    file.seek(std::io::SeekFrom::Start(4)).unwrap();
+    file.write_all(&enc.output_params().extradata).unwrap();
+    drop(file);
+    let info =
+        oxideav_flac::metadata::StreamInfo::parse(&enc.output_params().extradata[4..38]).unwrap();
+    assert_eq!(info.total_samples, TOTAL);
+    tool_test(&ours).expect("the black-box tool accepts the long stream");
+}
+
+/// The coded number of RFC 9639 §9.1.5 (the UTF-8-like extension up to
+/// 36 bits).
+fn coded_number(v: u64) -> Vec<u8> {
+    if v < 0x80 {
+        return vec![v as u8];
+    }
+    let len = (2..=7usize)
+        .find(|&len| v < 1u64 << ((7 - len) + 6 * (len - 1)))
+        .expect("at most 36 bits");
+    let mut out = vec![0u8; len];
+    let mut rest = v;
+    for byte in out.iter_mut().skip(1).rev() {
+        *byte = 0x80 | (rest & 0x3F) as u8;
+        rest >>= 6;
+    }
+    out[0] = (0xFFu16 << (8 - len)) as u8 | rest as u8;
+    out
+}
+
+/// A variable block size frame (the coded number is the first sample)
+/// of two 16-bit channels, with one subframe stored as is and one as a
+/// second-order fixed predictor with a single Rice partition.
+fn variable_frame(first_sample: u64, planes: &[Vec<i32>; 2]) -> Vec<u8> {
+    use oxideav_core::bits::BitWriter;
+    use oxideav_flac::crc::{crc8, crc16};
+    let n = planes[0].len();
+    let mut w = BitWriter::new();
+    w.write_u32(0x3FFE, 14); // sync code
+    w.write_u32(0b01, 2); // reserved 0, variable block size
+    w.write_u32(0b0111, 4); // block size - 1 in 16 bits
+    w.write_u32(0b1001, 4); // 44.1 kHz
+    w.write_u32(0b0001, 4); // two independent channels
+    w.write_u32(0b100, 3); // 16 bits
+    w.write_u32(0, 1);
+    for b in coded_number(first_sample) {
+        w.write_u32(b as u32, 8);
+    }
+    w.write_u32(n as u32 - 1, 16);
+    let header = w.bytes().to_vec();
+    w.write_u32(crc8(&header) as u32, 8);
+
+    // Channel 0: verbatim.
+    w.write_u32(0b0000_0010, 8);
+    for &s in &planes[0] {
+        w.write_i32(s, 16);
+    }
+    // Channel 1: fixed predictor of order 2 when the block is long
+    // enough, with Rice parameter 14 in a 4-bit field.
+    let order = 2.min(n - 1);
+    w.write_u32((0b001000 | order as u32) << 1, 8);
+    for &s in &planes[1][..order] {
+        w.write_i32(s, 16);
+    }
+    w.write_u32(0b00_0000, 6); // 4-bit parameters, partition order 0
+    w.write_u32(14, 4);
+    for i in order..n {
+        let p = &planes[1];
+        let prediction = match order {
+            0 => 0,
+            1 => p[i - 1] as i64,
+            _ => 2 * p[i - 1] as i64 - p[i - 2] as i64,
+        };
+        let r = p[i] as i64 - prediction;
+        let folded = if r >= 0 { 2 * r } else { -2 * r - 1 } as u32;
+        w.write_unary(folded >> 14);
+        w.write_u32(folded & 0x3FFF, 14);
+    }
+    w.align_to_byte();
+    let body = w.bytes().to_vec();
+    w.write_u32(crc16(&body) as u32, 16);
+    w.finish()
+}
+
+/// No outside encoder at hand writes variable block size streams, so
+/// this one is assembled here bit by bit, with blocks from 1 to 65535
+/// samples, and shown to the black-box decoder: it must test the file
+/// clean (MD5 included) and decode it to the same samples as this crate.
+#[test]
+fn variable_block_size_stream_decodes_like_the_black_box() {
+    use oxideav_flac::metadata::StreamInfo;
+    use oxideav_flac::verify::Md5Verifier;
+    let sizes = [16usize, 4096, 17, 255, 256, 1000, 65_535, 4608, 33, 1];
+    let mut rng = Rng(99);
+    let mut frames = Vec::new();
+    let mut all = [Vec::new(), Vec::new()];
+    let mut first = 0u64;
+    let mut md5 = Md5Verifier::new(16);
+    let (mut smallest, mut largest) = (u32::MAX, 0u32);
+    for &size in &sizes {
+        let planes = [
+            (0..size)
+                .map(|_| rng.range(-32_768, 32_767) as i32)
+                .collect::<Vec<_>>(),
+            (0..size)
+                .map(|i| (i as i32 * 37 % 2000) - 1000 + rng.range(-9, 9) as i32)
+                .collect(),
+        ];
+        let frame = variable_frame(first, &planes);
+        smallest = smallest.min(frame.len() as u32);
+        largest = largest.max(frame.len() as u32);
+        frames.extend_from_slice(&frame);
+        md5.update(&planes);
+        all[0].extend_from_slice(&planes[0]);
+        all[1].extend_from_slice(&planes[1]);
+        first += size as u64;
+    }
+    let info = StreamInfo {
+        min_block_size: 16,
+        max_block_size: 65_535,
+        min_frame_size: smallest,
+        max_frame_size: largest,
+        sample_rate: RATE,
+        channels: 2,
+        bits_per_sample: 16,
+        total_samples: first,
+        md5: md5.finalize(),
+    };
+    let mut file = b"fLaC".to_vec();
+    file.extend_from_slice(&[0x80, 0, 0, 34]);
+    file.extend_from_slice(&info.write().unwrap());
+    file.extend_from_slice(&frames);
+
+    let want = pack(&all, 16);
+    let ours = decode_file(&file).unwrap();
+    assert_eq!(ours.packets, sizes.len());
+    assert_eq!(ours.pcm, want);
+    assert_eq!(verify_stream(&file).unwrap(), VerifyOutcome::Match);
+    let mut census = Census::default();
+    census.take(&file).unwrap();
+    assert_eq!(census.variable_block_frames, sizes.len() as u64);
+
+    if !have_flac() {
+        eprintln!("skip the black-box half: `flac` not installed");
+        return;
+    }
+    let scratch = Scratch::new("streams-variable");
+    let path = scratch.path("variable.flac");
+    std::fs::write(&path, &file).unwrap();
+    tool_test(&path).expect("the black-box decoder tests the stream clean");
+    assert_eq!(tool_decode(&scratch, &path).unwrap(), want);
+}
