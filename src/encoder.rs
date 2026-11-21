@@ -1262,6 +1262,7 @@ pub fn make_encoder_with_options(
         sample_format: sample_fmt,
         bps,
         pad_bits: (format_bits - bps) as u32,
+        planes: Vec::new(),
         channels,
         sample_rate,
         block_size,
@@ -1522,6 +1523,9 @@ struct FlacEncoder {
     /// Zero bits below each input sample when the stream depth is
     /// narrower than the sample format (the input is left-justified).
     pad_bits: u32,
+    /// Per-channel sample planes of the block being coded on the serial
+    /// path, kept between blocks.
+    planes: Vec<Vec<i32>>,
     channels: u16,
     sample_rate: u32,
     block_size: u32,
@@ -1565,16 +1569,17 @@ struct FlacEncoder {
 }
 
 /// Split interleaved samples into the (empty) per-channel `planes`.
+/// Each plane is filled from an iterator of known length, so it grows
+/// once and the copy is a plain strided loop.
 fn deinterleave(src: &[i32], planes: &mut [Vec<i32>]) {
     let n_ch = planes.len();
     if let [l, r] = planes {
-        for pair in src.as_chunks::<2>().0 {
-            l.push(pair[0]);
-            r.push(pair[1]);
-        }
+        let pairs = src.as_chunks::<2>().0;
+        l.extend(pairs.iter().map(|pair| pair[0]));
+        r.extend(pairs.iter().map(|pair| pair[1]));
     } else {
         for (c, plane) in planes.iter_mut().enumerate() {
-            plane.extend(src.iter().skip(c).step_by(n_ch));
+            plane.extend(src.chunks_exact(n_ch).map(|frame| frame[c]));
         }
     }
 }
@@ -1626,32 +1631,31 @@ impl FlacEncoder {
             .ok_or_else(|| Error::invalid("empty frame"))?;
         let first_new = self.interleaved.len();
         match self.sample_format {
+            // Each arm extends from an iterator of known length: one
+            // reservation, then a loop the compiler can vectorise.
             SampleFormat::S16 => {
-                for chunk in data.as_chunks::<2>().0 {
-                    self.interleaved
-                        .push(i16::from_le_bytes([chunk[0], chunk[1]]) as i32);
-                }
+                let samples = data.as_chunks::<2>().0;
+                self.interleaved
+                    .extend(samples.iter().map(|&c| i16::from_le_bytes(c) as i32));
             }
             SampleFormat::S24 => {
-                for chunk in data.as_chunks::<3>().0 {
-                    let mut v =
-                        (chunk[0] as i32) | ((chunk[1] as i32) << 8) | ((chunk[2] as i32) << 16);
-                    if v & 0x0080_0000 != 0 {
-                        v |= 0xFF00_0000_u32 as i32;
-                    }
-                    self.interleaved.push(v);
-                }
+                let samples = data.as_chunks::<3>().0;
+                // Assemble in the top three bytes, then shift down with
+                // the sign.
+                self.interleaved.extend(
+                    samples
+                        .iter()
+                        .map(|&[a, b, c]| i32::from_le_bytes([0, a, b, c]) >> 8),
+                );
             }
             SampleFormat::S32 => {
-                for chunk in data.as_chunks::<4>().0 {
-                    self.interleaved
-                        .push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                }
+                let samples = data.as_chunks::<4>().0;
+                self.interleaved
+                    .extend(samples.iter().map(|&c| i32::from_le_bytes(c)));
             }
             SampleFormat::U8 => {
-                for &b in data.iter() {
-                    self.interleaved.push((b as i32) - 128);
-                }
+                self.interleaved
+                    .extend(data.iter().map(|&b| (b as i32) - 128));
             }
             _ => return Err(Error::unsupported("FLAC encoder: unsupported input format")),
         }
@@ -1861,11 +1865,28 @@ impl FlacEncoder {
         block: usize,
         drain_all: bool,
     ) -> Result<()> {
+        // The planes are kept between blocks and calls.
+        let mut per_channel = std::mem::take(&mut self.planes);
+        per_channel.resize_with(n_ch, Vec::new);
+        let result = self.encode_blocks_into(&mut per_channel, start, n_ch, block, drain_all);
+        self.planes = per_channel;
+        result
+    }
+
+    fn encode_blocks_into(
+        &mut self,
+        per_channel: &mut [Vec<i32>],
+        start: &mut usize,
+        n_ch: usize,
+        block: usize,
+        drain_all: bool,
+    ) -> Result<()> {
         while let Some(take) = self.next_block_len(*start, n_ch, block, drain_all) {
-            let mut per_channel: Vec<Vec<i32>> =
-                (0..n_ch).map(|_| Vec::with_capacity(take)).collect();
+            for plane in per_channel.iter_mut() {
+                plane.clear();
+            }
             let src = &self.interleaved[*start..*start + take * n_ch];
-            deinterleave(src, &mut per_channel);
+            deinterleave(src, per_channel);
             if self.compute_md5 {
                 feed_md5(&mut self.md5, &mut self.md5_buf, self.bps, src);
             }
@@ -1876,7 +1897,7 @@ impl FlacEncoder {
                 take as u32,
                 self.sample_rate,
                 self.bps,
-                &per_channel,
+                per_channel,
                 &mut self.scratch,
             )?;
 
@@ -1885,7 +1906,7 @@ impl FlacEncoder {
             // packet is queued, so a mis-encode aborts the stream rather
             // than producing a silently-corrupt `.flac`.
             if self.verify {
-                self.verify_frame(&data, &per_channel)?;
+                self.verify_frame(&data, per_channel)?;
             }
 
             self.queue_frame(self.frame_number, take, data);
@@ -6296,6 +6317,7 @@ mod tests {
             sample_format: fmt,
             bps,
             pad_bits: 0,
+            planes: Vec::new(),
             channels,
             sample_rate,
             block_size: DEFAULT_BLOCK_SIZE,

@@ -138,6 +138,9 @@ pub(super) struct FastScratch {
     win_coeffs: Vec<Vec<f64>>,
     /// `(estimated bits, window index, order)` picks across all windows.
     ranked: Vec<(f64, usize, usize)>,
+    /// The channel under search in two parts, for the wide-sample
+    /// residual kernel.
+    split: SplitSamples,
     /// Per-channel results for the frame under construction (up to the
     /// four stereo candidates).
     pub choices: Vec<Choice>,
@@ -533,17 +536,36 @@ fn fixed_residual(s: &[i32], order: usize, out: &mut Vec<i32>) -> bool {
 ///
 /// When `max|s| · (1 + Σ|q|) < 2^31` every partial dot product and every
 /// residual fits an `i32` exactly, so the kernel runs in 32-bit lanes
-/// (and no residual can leave the §9.2.7.3 range); otherwise it
-/// accumulates in 64 bits. Both produce the same residual.
-fn lpc_residual(s: &[i32], q: &[i32], shift: u32, out: &mut Vec<i32>) -> bool {
+/// (and no residual can leave the §9.2.7.3 range). Wider samples — 24-bit
+/// audio under any useful predictor — are split into a high and a low
+/// part whose dot products each fit 32 bits (see
+/// [`lpc_residual_split`]); only where even that does not hold does the
+/// kernel accumulate in 64 bits. All three produce the same residual.
+///
+/// `split` caches the two parts of `s`; the caller clears it whenever
+/// `s` changes.
+fn lpc_residual(
+    s: &[i32],
+    q: &[i32],
+    shift: u32,
+    out: &mut Vec<i32>,
+    split: &mut SplitSamples,
+) -> bool {
     let peak = s.iter().fold(0u32, |m, &x| m.max(x.unsigned_abs())) as u64;
     let qsum: u64 = q.iter().map(|&c| c.unsigned_abs() as u64).sum();
     let narrow = peak * (1 + qsum) < 1u64 << 31;
+    // High parts are at most `(peak >> SPLIT_BITS) + 1` in magnitude, low
+    // parts at most `2^SPLIT_BITS - 1`.
+    let splittable = ((peak >> SPLIT_BITS) + 1) * qsum < 1u64 << 31
+        && ((1u64 << SPLIT_BITS) - 1) * qsum < 1u64 << 31;
     macro_rules! fixed_n {
         ($($n:literal)*) => {
             match q.len() {
                 $($n => return if narrow {
                     lpc_residual_n32::<$n>(s, q, shift, out)
+                } else if splittable {
+                    split.prepare(s);
+                    lpc_residual_split::<$n>(s, split, q, shift, out)
                 } else {
                     lpc_residual_n::<$n>(s, q, shift, out)
                 },)*
@@ -574,6 +596,96 @@ fn lpc_residual_n32<const N: usize>(s: &[i32], q: &[i32], shift: u32, out: &mut 
         *o = x - (acc >> shift);
     }
     true
+}
+
+/// Where [`lpc_residual_split`] cuts a sample: the low part is this many
+/// bits wide.
+const SPLIT_BITS: u32 = 12;
+
+/// The samples of the channel under search as `high · 2^12 + low`, with
+/// `low` in `0..2^12`. Built on first use and kept for every predictor
+/// tried on the same samples.
+#[derive(Default)]
+pub(super) struct SplitSamples {
+    high: Vec<i32>,
+    low: Vec<i32>,
+    valid: bool,
+}
+
+impl SplitSamples {
+    /// Forget the samples the parts were built from.
+    fn clear(&mut self) {
+        self.valid = false;
+    }
+
+    fn prepare(&mut self, s: &[i32]) {
+        if self.valid {
+            return;
+        }
+        let low_mask = (1i32 << SPLIT_BITS) - 1;
+        self.high.clear();
+        self.high.extend(s.iter().map(|&x| x >> SPLIT_BITS));
+        self.low.clear();
+        self.low.extend(s.iter().map(|&x| x & low_mask));
+        self.valid = true;
+    }
+}
+
+/// `out[i] = Σ_j rev[j] · hist[i + j]` in wrapping 32-bit arithmetic.
+#[inline(always)]
+fn dot_rows<const N: usize>(hist: &[i32], rev: &[i32; N], out: &mut [i32]) {
+    for (o, win) in out.iter_mut().zip(hist.windows(N)) {
+        let win: &[i32; N] = win.try_into().expect("window of N");
+        let mut acc = 0i32;
+        for j in 0..N {
+            acc = acc.wrapping_add(rev[j].wrapping_mul(win[j]));
+        }
+        *o = acc;
+    }
+}
+
+/// Order-`N` kernel for samples too wide for [`lpc_residual_n32`].
+///
+/// With each sample written as `high · 2^12 + low`, the prediction sum,
+/// being linear in the samples, is
+/// `Σ q·s = (Σ q·high) · 2^12 + Σ q·low`, and the caller guarantees that
+/// both sums on the right stay inside 32 bits. They are computed in
+/// 32-bit lanes — four products per vector multiply, where the 64-bit
+/// kernel does one per scalar multiply — and joined in 64 bits once per
+/// sample. The joined sum is the exact one, so the residual is the same.
+fn lpc_residual_split<const N: usize>(
+    s: &[i32],
+    parts: &SplitSamples,
+    q: &[i32],
+    shift: u32,
+    out: &mut Vec<i32>,
+) -> bool {
+    let mut rev = [0i32; N];
+    for (j, &c) in q.iter().enumerate() {
+        rev[N - 1 - j] = c;
+    }
+    out.clear();
+    out.resize(s.len() - N, 0);
+    let mut ok = true;
+    // The two 32-bit sums go through small buffers, so that the loops
+    // computing them hold nothing but 32-bit lanes.
+    const CHUNK: usize = 256;
+    let mut high = [0i32; CHUNK];
+    let mut low = [0i32; CHUNK];
+    for (c, out_chunk) in out.chunks_mut(CHUNK).enumerate() {
+        let at = c * CHUNK;
+        let m = out_chunk.len();
+        dot_rows(&parts.high[at..at + m + N - 1], &rev, &mut high[..m]);
+        dot_rows(&parts.low[at..at + m + N - 1], &rev, &mut low[..m]);
+        let current = &s[at + N..at + N + m];
+        for ((o, &x), (&hi, &lo)) in out_chunk.iter_mut().zip(current).zip(high.iter().zip(&low)) {
+            let acc = ((hi as i64) << SPLIT_BITS) + lo as i64;
+            let r = x as i64 - (acc >> shift);
+            ok &= r > i32::MIN as i64 && r <= i32::MAX as i64;
+            *o = r as i32;
+        }
+    }
+    ok
 }
 
 /// Order-`N` kernel with 64-bit accumulation (32×32→64 products).
@@ -880,6 +992,7 @@ fn search_into(
 ) {
     let n = input.len();
     ch.parts.clear();
+    fs.split.clear();
     if input.iter().all(|&x| x == input[0]) {
         ch.kind = Some(Kind::Constant(input[0]));
         ch.wasted = 0;
@@ -989,7 +1102,7 @@ fn search_into(
                     continue;
                 };
                 let q = std::mem::take(&mut fs.qcoeffs);
-                if lpc_residual(&s, &q, shift, &mut fs.residual) {
+                if lpc_residual(&s, &q, shift, &mut fs.residual, &mut fs.split) {
                     let res = std::mem::take(&mut fs.residual);
                     let (rbits, m, po) =
                         plan_partitions(&res, n, order, cfg.max_partition_order, fs);
@@ -1516,8 +1629,70 @@ mod tests {
         assert!(lpc_residual_n32::<8>(&s, &q, 10, &mut a));
         assert!(lpc_residual_n::<8>(&s, &q, 10, &mut b));
         assert_eq!(a, b);
-        assert!(lpc_residual(&s, &q, 10, &mut a));
+        assert!(lpc_residual(
+            &s,
+            &q,
+            10,
+            &mut a,
+            &mut SplitSamples::default()
+        ));
         assert_eq!(a, b);
+    }
+
+    /// The split kernel gives the 64-bit kernel's residual on samples of
+    /// every width it is used for, at the extremes of the sample and
+    /// coefficient ranges, including residuals that leave 32 bits; and the
+    /// dispatcher's choice of kernel never changes a result.
+    #[test]
+    fn split_kernel_matches_the_64_bit_kernel() {
+        let mut st = 0x1357_9BDFu32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st as i32
+        };
+        let mut split_cases = 0;
+        for width in [8u32, 16, 17, 20, 24, 26, 28, 32] {
+            let mut s: Vec<i32> = (0..1500).map(|_| next() >> (32 - width)).collect();
+            // Both extremes of the range, and a run of each.
+            let lo = i32::MIN >> (32 - width);
+            let hi = i32::MAX >> (32 - width);
+            s[10] = lo;
+            s[11] = hi;
+            s[700..720].fill(lo);
+            s[720..740].fill(hi);
+            let mut parts = SplitSamples::default();
+            parts.prepare(&s);
+            for precision in [5u32, 12, 15] {
+                let limit = (1i32 << (precision - 1)) - 1;
+                let patterns: [&dyn Fn(usize, i32) -> i32; 3] = [
+                    &|_, r| r % (limit + 1),
+                    &|j, _| if j % 2 == 0 { limit } else { -limit - 1 },
+                    &|_, _| -limit - 1,
+                ];
+                for pattern in patterns {
+                    let q: Vec<i32> = (0..12).map(|j| pattern(j, next())).collect();
+                    let qsum: u64 = q.iter().map(|c| c.unsigned_abs() as u64).sum();
+                    let peak = 1u64 << (width - 1);
+                    let splittable = ((peak >> SPLIT_BITS) + 1) * qsum < 1 << 31;
+                    let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+                    for shift in [0u32, 7, 15] {
+                        let ok_b = lpc_residual_n::<12>(&s, &q, shift, &mut b);
+                        if splittable {
+                            let ok_a = lpc_residual_split::<12>(&s, &parts, &q, shift, &mut a);
+                            assert_eq!(a, b, "width {width} precision {precision} shift {shift}");
+                            assert_eq!(ok_a, ok_b);
+                            split_cases += 1;
+                        }
+                        let ok_c = lpc_residual(&s, &q, shift, &mut c, &mut parts);
+                        assert_eq!(c, b, "width {width} precision {precision} shift {shift}");
+                        assert_eq!(ok_c, ok_b);
+                    }
+                }
+            }
+        }
+        assert!(split_cases > 30, "the split kernel was exercised");
     }
 
     #[test]

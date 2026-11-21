@@ -164,6 +164,63 @@ levels existed) runs at about 1× real time.
   smallest: typically 0.2–1 % below level 8, at roughly 300× its time.
   It is meant for archival one-offs.
 
+### Every level, against the black-box encoder
+
+The table above is from music. This one sweeps all nine levels on two
+synthesised programme-like signals from `examples/levels.rs` (struck
+notes with decaying harmonics over a noise floor; 300 s each): 16-bit
+44.1 kHz stereo (50 MiB of PCM) and 24-bit 48 kHz 5.1 (247 MiB). Speed
+is MiB of PCM per CPU second (user + system, whole process including
+reading the WAVE file and writing the output; median of 5 runs, one
+thread, Apple Silicon machine that was running other builds); size is
+the output as a share of the PCM. `flac` 1.5 ran as a black box on the
+same files at the same level number, and accepted every file of this
+encoder with `-t`.
+
+16-bit / 44.1 kHz stereo:
+
+| level | this crate MiB/s | size | `flac` MiB/s | size | size vs `flac` |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 240 | 41.60 % | 229 | 42.45 % | −2.02 % |
+| 1 | 240 | 41.59 % | 219 | 42.11 % | −1.24 % |
+| 2 | 240 | 41.59 % | 180 | 41.84 % | −0.59 % |
+| 3 | 148 | 38.72 % | 194 | 39.03 % | −0.77 % |
+| 4 | 140 | 38.48 % | 174 | 38.57 % | −0.23 % |
+| 5 | 133 | 38.28 % | 126 | 38.45 % | −0.45 % |
+| 6 | 97 | 38.28 % | 84 | 38.45 % | −0.43 % |
+| 7 | 81 | 38.27 % | 99 | 38.24 % | +0.08 % |
+| 8 | 40 | 38.25 % | 49 | 38.23 % | +0.04 % |
+
+24-bit / 48 kHz 5.1:
+
+| level | this crate MiB/s | size | `flac` MiB/s | size | size vs `flac` |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 287 | 60.20 % | 260 | 60.31 % | −0.17 % |
+| 1 | 263 | 60.20 % | 263 | 60.31 % | −0.17 % |
+| 2 | 294 | 60.20 % | 272 | 60.31 % | −0.17 % |
+| 3 | 203 | 58.34 % | 238 | 58.35 % | −0.00 % |
+| 4 | 208 | 58.19 % | 233 | 58.19 % | −0.00 % |
+| 5 | 177 | 58.06 % | 240 | 58.19 % | −0.23 % |
+| 6 | 137 | 58.06 % | 192 | 58.19 % | −0.23 % |
+| 7 | 101 | 58.05 % | 168 | 58.06 % | −0.02 % |
+| 8 | 66 | 58.05 % | 129 | 58.05 % | −0.02 % |
+
+(Each table was measured in one sitting, both encoders alternating;
+the background load differed between the two sittings, so compare
+within a table.)
+
+Sizes are within 0.1 % of the black-box encoder's from level 7 up and
+smaller below (by 2 % at level 0 on stereo). Speed is level with it or
+ahead at levels 0–2 and 5–6 on stereo, 20–25 % behind at levels 3, 4, 7
+and 8, and on 24-bit multichannel input 25–50 % behind from level 5 up
+(level 8: about half the speed): each
+of the six channels is searched on its own there, without the
+two-of-four shortcut the stereo layout estimate gives, and 24-bit
+samples take the wider residual kernel. Decoding the same streams
+(`levels … decode`, sample planes with the CRC-16 check, no output
+file) runs at roughly 400–550 MiB of PCM per CPU second for the stereo
+signal and 700–850 for the 5.1 one at every level.
+
 ### Multithreaded encoding
 
 FLAC frames are independent of each other, so the encoder can code
@@ -507,7 +564,7 @@ tools are not installed.
   Rice parameter widths, all three decorrelated layouts, and 147 frames
   whose side channel needs its 33rd bit. No outside encoder writes
   escaped partitions, partition order 15 or variable block sizes; those
-  are covered by the hand-built frames below.
+  are covered by the hand-built streams and frames below.
 - **This encoder → outside decoders** (`tests/blackbox_ours.rs`): 1509
   streams over every encoder and muxer option (levels 0..=8 and the
   exhaustive search, depths 4..=32, 1..=8 channels, block sizes
@@ -532,6 +589,17 @@ tools are not installed.
   flipped, where every whole frame must come out at its own position
   and the black-box decoder, decoding through errors, must recover the
   same audio. All pass.
+- **Variable block size** (same file): no outside encoder at hand
+  writes such a stream, so one is assembled bit by bit in the test —
+  ten blocks of 1 to 65535 samples, the coded number being the first
+  sample — and the black-box decoder tests it clean, MD5 included, and
+  decodes it to the same samples as this crate.
+- **A stream longer than 2^32 samples** (same file, run on request with
+  `OXIDEAV_FLAC_LONG_STREAM=1`; it pipes 4 GiB through the black-box
+  encoder): 4 295 090 753 samples at 8 kHz, about 149 hours, decode to
+  the input with the MD5 confirmed, seeks land on the right frame on
+  both sides of the 32-bit mark, and this encoder's file of the same
+  samples passes `flac -t`. Last run: pass.
 - **Hand-built frames** (`tests/spec_edges.rs`): every frame of that
   suite which this crate decodes — about 390, among them escaped
   partitions of every width, Rice parameters at both limits, partition
@@ -712,6 +780,19 @@ per order). The decoded samples are identical. The encoder's search was
 not changed in that step, so its column has one figure. The "file"
 column includes the demuxer, which reads every frame's CRC-16 once to
 find where the frame ends before the decoder checks it again.
+
+`examples/levels.rs` measures every level on a stereo and a 5.1 signal
+(the tables under "Every level, against the black-box encoder"). The
+encoder's intake and its residual kernel for wide samples were reworked
+against it — samples are taken in and split into channels by vectorised
+loops over slices of known length, the channel planes are kept between
+blocks, and the residual of a linear predictor on 24-bit samples is
+formed from a high and a low part of each sample in 32-bit lanes and
+joined exactly, where it used to take one 64-bit multiply per tap. The
+output is byte-identical; CPU cycles per encode went down by 4–13 % at
+levels 0–7 on the 16-bit stereo signal and by 4–7 % at every level on
+the 24-bit 5.1 one (cycle counts of the process, minimum of 3 runs of
+12 encodes each, old and new binaries alternating).
 
 ## Benchmarks
 

@@ -57,8 +57,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape the default decoder tolerates.
 - `examples/speed.rs`: encode, decode and file-level decode speed in
   multiples of real time.
+- `examples/levels.rs`: speed and size of every compression level on a
+  stereo and a 5.1 signal, with a mode that writes the signals as WAVE
+  files for measuring another encoder on the same input.
+- tests: a gated run (`OXIDEAV_FLAC_LONG_STREAM=1`) over a stream of
+  2^32 + 123 457 samples: decode, MD5, seeking past the 32-bit mark,
+  and this encoder's output checked by the black-box tool.
 
 ### Changed
+
+- encoder: input samples are taken in and split into channels by
+  loops over slices of known length (one reservation each, vectorised)
+  and the channel planes are kept between blocks; the residual of a
+  linear predictor on samples too wide for 32-bit sums (24-bit audio)
+  is computed from a high and a low part of each sample in 32-bit
+  lanes, joined exactly, instead of one 64-bit multiply per tap. The
+  output is byte-identical. CPU cycles per encode, before → after, on
+  the two signals of `examples/levels.rs`: −4 % to −13 % at levels 0–7
+  (16-bit stereo), −4 % to −7 % at levels 0–8 (24-bit 5.1); level 8 on
+  stereo is unchanged.
 
 - demuxer: seeking halves a byte range by reading single frames from
   its middle instead of reading the stream from its start (no
