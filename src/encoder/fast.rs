@@ -1045,9 +1045,7 @@ pub(super) fn search_frame(
     scratch: &mut SubframeScratch,
 ) -> (u32, Vec<usize>) {
     let n_ch = channels.len();
-    if n_ch != 2 || bps >= 32 {
-        // Decorrelation needs a bps+1 side channel; 32-bit input stays
-        // independent (the side channel would need 33 bits).
+    if n_ch != 2 {
         for (i, c) in channels.iter().enumerate() {
             search_subframe(c, bps, i, cfg, scratch);
         }
@@ -1057,9 +1055,22 @@ pub(super) fn search_frame(
     let mut fs = std::mem::take(&mut scratch.fast_state);
     fs.side.clear();
     fs.mid.clear();
+    // The side channel is one bit deeper than the input (RFC 9639 §4.2).
+    // Samples are held in 32 bits here, so at 32-bit input a block is
+    // decorrelated only when its side channel happens to stay within 32
+    // bits; it is still written as a 33-bit subframe.
+    let mut side_fits = true;
     for (&a, &b) in l.iter().zip(r) {
-        fs.side.push(a - b);
+        let (d, overflow) = a.overflowing_sub(b);
+        side_fits &= !overflow;
+        fs.side.push(d);
         fs.mid.push(((a as i64 + b as i64) >> 1) as i32);
+    }
+    if !side_fits {
+        scratch.fast_state = fs;
+        search_subframe(l, bps, 0, cfg, scratch);
+        search_subframe(r, bps, 1, cfg, scratch);
+        return (1, vec![0, 1]);
     }
     let side = std::mem::take(&mut fs.side);
     let mid = std::mem::take(&mut fs.mid);
@@ -1184,7 +1195,14 @@ impl Bits {
 
     #[inline]
     fn put_signed(&mut self, v: i32, bits: u32) {
-        self.put(v as u32, bits);
+        if bits > 32 {
+            // A 33-bit field holding a value that fits 32 bits: the top
+            // bit repeats the sign.
+            self.put((v < 0) as u32, bits - 32);
+            self.put(v as u32, 32);
+        } else {
+            self.put(v as u32, bits);
+        }
     }
 
     #[inline(always)]

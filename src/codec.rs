@@ -137,7 +137,8 @@ mod tests {
                 "verify",
                 "block_size",
                 "padding",
-                "md5"
+                "md5",
+                "bits_per_sample"
             ]
         );
     }

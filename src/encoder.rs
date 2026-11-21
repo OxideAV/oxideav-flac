@@ -351,6 +351,23 @@ pub struct FlacEncoderOptions {
     /// its bytes); this crate's [`crate::verify`] reports
     /// `VerifyOutcome::NoSignature` for such a stream.
     pub skip_md5: bool,
+
+    /// Bit depth of the stream when it is narrower than the input sample
+    /// format: 4..=8 for `U8` input, 9..=16 for `S16`, 17..=24 for
+    /// `S24`, 25..=32 for `S32` (RFC 9639 §8.2 allows 4 to 32 bits).
+    /// `None` (the default) is the full width of the format.
+    ///
+    /// The input is expected left-justified, as PCM formats carry a
+    /// narrower depth: a 12-bit sample occupies the top 12 bits of an
+    /// `S16` and its low 4 bits are zero. A sample with any of those low
+    /// bits set is not audio of the declared depth and `send_frame`
+    /// refuses it. The decoder delivers such a stream the same way, so a
+    /// 20-bit stream decodes to the `S24` bytes that were encoded.
+    ///
+    /// Only 8, 12, 16, 20, 24 and 32 bits have a frame-header code; any
+    /// other depth is valid FLAC but outside the streamable subset
+    /// (RFC 9639 §7).
+    pub bits_per_sample: Option<u8>,
 }
 
 /// Registry options (`CodecParameters::options`), so callers that only
@@ -394,6 +411,12 @@ impl CodecOptionsStruct for FlacEncoderOptions {
             default: OptionValue::Bool(true),
             help: "compute the STREAMINFO MD5 of the input (false stores all zeros: not computed)",
         },
+        OptionField {
+            name: "bits_per_sample",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "stream bit depth when narrower than the sample format, input left-justified (0 = full width)",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
@@ -405,6 +428,10 @@ impl CodecOptionsStruct for FlacEncoderOptions {
             "exhaustive" => self.exhaustive_search = value.as_bool()?,
             "verify" => self.verify = value.as_bool()?,
             "md5" => self.skip_md5 = !value.as_bool()?,
+            "bits_per_sample" => {
+                let n = value.as_u32()?;
+                self.bits_per_sample = (n > 0).then_some(n.min(255) as u8);
+            }
             "block_size" => self.block_size = Some(value.as_u32()?),
             "padding" => {
                 let n = value.as_u32()? as usize;
@@ -462,6 +489,12 @@ impl FlacEncoderOptions {
     /// Set [`padding_bytes`](Self::padding_bytes).
     pub fn with_padding_bytes(mut self, bytes: usize) -> Self {
         self.padding_bytes = Some(bytes);
+        self
+    }
+
+    /// Set [`bits_per_sample`](Self::bits_per_sample).
+    pub fn with_bits_per_sample(mut self, bits: u8) -> Self {
+        self.bits_per_sample = Some(bits);
         self
     }
 
@@ -1112,7 +1145,7 @@ pub fn make_encoder_with_options(
         .sample_rate
         .ok_or_else(|| Error::invalid("FLAC encoder: missing sample_rate"))?;
     let sample_fmt = params.sample_format.unwrap_or(SampleFormat::S16);
-    let bps = match sample_fmt {
+    let format_bits: u8 = match sample_fmt {
         SampleFormat::U8 => 8,
         SampleFormat::S16 => 16,
         SampleFormat::S24 => 24,
@@ -1121,6 +1154,21 @@ pub fn make_encoder_with_options(
             return Err(Error::unsupported(format!(
                 "FLAC encoder: sample format {:?} not supported",
                 sample_fmt
+            )));
+        }
+    };
+    // A narrower stream depth must be one the decoder hands back in the
+    // same sample format: within the last byte of the format, and at
+    // least the 4 bits of RFC 9639 §8.2.
+    let bps = match options.bits_per_sample {
+        None => format_bits,
+        Some(n) if n <= format_bits && n > format_bits - 8 && n >= 4 => n,
+        Some(n) => {
+            return Err(Error::invalid(format!(
+                "FLAC encoder: bits_per_sample {n} does not fit sample format {:?} \
+                 (accepted: {}..={format_bits})",
+                sample_fmt,
+                (format_bits - 7).max(4)
             )));
         }
     };
@@ -1213,6 +1261,7 @@ pub fn make_encoder_with_options(
         output_params,
         sample_format: sample_fmt,
         bps,
+        pad_bits: (format_bits - bps) as u32,
         channels,
         sample_rate,
         block_size,
@@ -1470,6 +1519,9 @@ struct FlacEncoder {
     output_params: CodecParameters,
     sample_format: SampleFormat,
     bps: u8,
+    /// Zero bits below each input sample when the stream depth is
+    /// narrower than the sample format (the input is left-justified).
+    pad_bits: u32,
     channels: u16,
     sample_rate: u32,
     block_size: u32,
@@ -1535,7 +1587,7 @@ fn deinterleave(src: &[i32], planes: &mut [Vec<i32>]) {
 fn feed_md5(md5: &mut Md5, buf: &mut Vec<u8>, bps: u8, interleaved: &[i32]) {
     buf.clear();
     match bps {
-        8 => buf.extend(interleaved.iter().map(|&s| s as u8)),
+        ..=8 => buf.extend(interleaved.iter().map(|&s| s as u8)),
         9..=16 => {
             buf.resize(interleaved.len() * 2, 0);
             for (o, &s) in buf.as_chunks_mut::<2>().0.iter_mut().zip(interleaved) {
@@ -1572,6 +1624,7 @@ impl FlacEncoder {
             .data
             .first()
             .ok_or_else(|| Error::invalid("empty frame"))?;
+        let first_new = self.interleaved.len();
         match self.sample_format {
             SampleFormat::S16 => {
                 for chunk in data.as_chunks::<2>().0 {
@@ -1601,6 +1654,24 @@ impl FlacEncoder {
                 }
             }
             _ => return Err(Error::unsupported("FLAC encoder: unsupported input format")),
+        }
+        if self.pad_bits > 0 {
+            // Left-justified input of a narrower depth: drop the padding,
+            // which must be zero for the stream to be lossless.
+            let pad = self.pad_bits;
+            let fresh = &mut self.interleaved[first_new..];
+            let stray = fresh.iter().fold(0, |acc, &s| acc | s) & ((1i32 << pad) - 1);
+            if stray != 0 {
+                self.interleaved.truncate(first_new);
+                return Err(Error::invalid(format!(
+                    "FLAC encoder: input is not {}-bit audio (a sample has bits set \
+                     below the declared depth)",
+                    self.bps
+                )));
+            }
+            for s in fresh {
+                *s >>= pad;
+            }
         }
         self.encode_ready_frames(false)
     }
@@ -2191,18 +2262,18 @@ fn choose_channel_assignment(
     let independent_bits = sf_l.bits + sf_r.bits;
     let mut best = (independent_bits, 1u32, vec![sf_l.clone(), sf_r.clone()]);
 
-    // Stereo decorrelation modes need a side channel at `bps + 1` bits
-    // (to span the full L-R range). Our subframe encoders clamp to 32
-    // bits, so for 32-bit input we skip the decorrelation modes and
-    // fall back to LR-only (`assignment = 1`). The FLAC format spec
-    // caps `bits_per_sample` at 32, so the `== 32` boundary stays in LR.
-    if bps < 32 {
+    // The side channel is one bit deeper than the input (RFC 9639 §4.2).
+    // Samples are held in 32 bits here, so at 32-bit input a block is
+    // decorrelated only when its side channel happens to stay within 32
+    // bits; it is still written as a 33-bit subframe.
+    let side_fits = l.iter().zip(r).all(|(&a, &b)| a.checked_sub(b).is_some());
+    if side_fits {
         let mut side = Vec::with_capacity(n);
         let mut mid = Vec::with_capacity(n);
         for i in 0..n {
-            side.push((l[i] as i64 - r[i] as i64) as i32);
-            // FLAC's spec-defined mid is floor((L+R)/2); the absorbed LSB is
-            // recovered via `side`. `((L+R) >> 1)` is the canonical encoding.
+            side.push(l[i] - r[i]);
+            // §4.2: mid is (left + right) >> 1; the bit shifted out is
+            // the low bit of side.
             let sum = l[i] as i64 + r[i] as i64;
             mid.push((sum >> 1) as i32);
         }
@@ -2447,10 +2518,22 @@ fn write_subframe_header(w: &mut BitWriter, type_code: u32, wasted: u32) -> u32 
     }
 }
 
+/// Write one unencoded sample of `bps` bits. `bps` is 33 for the side
+/// channel of 32-bit input, whose values fit 32 bits by construction:
+/// the extra top bit repeats the sign.
+fn write_sample(w: &mut BitWriter, value: i32, bps: u32) {
+    if bps > 32 {
+        w.write_u32((value < 0) as u32, bps - 32);
+        w.write_u32(value as u32, 32);
+    } else {
+        w.write_i32(value, bps);
+    }
+}
+
 fn encode_constant_plan(value: i32, bps: u32, wasted: u32) -> SubframePlan {
     let mut w = BitWriter::new();
     let header_bits = write_subframe_header(&mut w, 0b000000, wasted);
-    w.write_i32(value, bps);
+    write_sample(&mut w, value, bps);
     bits_snapshot(w, header_bits + bps)
 }
 
@@ -2458,7 +2541,7 @@ fn encode_verbatim_plan(samples: &[i32], bps: u32, wasted: u32) -> SubframePlan 
     let mut w = BitWriter::new();
     let header_bits = write_subframe_header(&mut w, 0b000001, wasted);
     for &s in samples {
-        w.write_i32(s, bps);
+        write_sample(&mut w, s, bps);
     }
     bits_snapshot(w, header_bits + (bps * samples.len() as u32))
 }
@@ -2504,7 +2587,7 @@ fn encode_fixed_plan_s(
     let mut w = BitWriter::new();
     let header_bits = write_subframe_header(&mut w, 0b001000 | (order as u32 & 0x07), wasted);
     for i in 0..order {
-        w.write_i32(samples[i], bps);
+        write_sample(&mut w, samples[i], bps);
     }
     // Detach `residuals` so `encode_rice_residual_s` can borrow `scratch`
     // for its zigzag / prefix / raw_bits tables without aliasing the
@@ -2673,7 +2756,7 @@ fn encode_lpc_plan_at_s(
     // LPC subframe type is 100000 | (order-1).
     let header_bits = write_subframe_header(&mut w, 0b100000 | ((order - 1) as u32 & 0x1F), wasted);
     for i in 0..order {
-        w.write_i32(samples[i], bps);
+        write_sample(&mut w, samples[i], bps);
     }
     // qlp_precision-1 (4 bits) — the all-ones value 0xF is reserved.
     w.write_u32(precision - 1, 4);
@@ -6212,6 +6295,7 @@ mod tests {
             output_params: build_audio_params(channels, sample_rate, fmt),
             sample_format: fmt,
             bps,
+            pad_bits: 0,
             channels,
             sample_rate,
             block_size: DEFAULT_BLOCK_SIZE,

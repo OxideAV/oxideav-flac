@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder / demuxer: streams of 4 to 7 bits per sample are decoded (to
+  `U8`); the demuxer used to refuse them as unsupported.
+- decoder: a depth that is not a whole number of bytes is delivered
+  left-justified in its sample format (a 12-bit sample in the top 12
+  bits of an `S16`, a 20-bit one in the top 20 of an `S24`), as a WAVE
+  file carries it and as both black-box decoders deliver it. It used
+  to be delivered unshifted, so a 12-bit stream played 24 dB too quiet
+  in anything that took the format at its word. `FrameScratch` planes
+  are unchanged.
+
 ### Added
+
+- encoder: `FlacEncoderOptions::with_bits_per_sample` (registry key
+  `bits_per_sample`) writes a stream of any depth from 4 to 32 bits
+  from left-justified input.
+- encoder: 32-bit stereo is decorrelated (left-side, side-right,
+  mid-side) block by block wherever the side channel stays within 32
+  bits; it used to be coded as independent channels always.
+- decoder: `FrameScratch::subframes` reports how each subframe of the
+  last frame was coded (`SubframeSummary`: kind, predictor order,
+  wasted bits, precision, shift, partition order, Rice parameter
+  width, escaped partitions).
+- tests: `blackbox_foreign` (1589 streams from three outside encoders,
+  decoded here and compared with the input, the black-box decoder and
+  the MD5) and `blackbox_ours` (1509 streams from this encoder and
+  muxer, tested and decoded by two outside decoders); the hand-built
+  frames of `spec_edges` are also shown to the black-box decoder. All
+  skip where the tools are missing.
 
 - decoder: `Decoder::output_params` answers from STREAMINFO (channels,
   sample format, sample rate) at construction.

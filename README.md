@@ -256,13 +256,15 @@ A debug build of the encoder is about 20× slower.
 
 Spec-complete, covering the FLAC format (Subset and non-Subset):
 
-- **Bit depths**: 8, 12, 16, 20, 24, 32 bits per sample. Output format
-  is `U8` for 8 bps, `S16` for 9..=16, `S24` for 17..=24, `S32` for
-  25..=32. Every RFC 9639 §9.1.4 Table 17 frame-header bit-depth code is
-  honoured, including `0b111` (32 bits per sample) — the code a reference
-  encoder writes in every frame of a genuine 32-bit file. Streams an
-  outside encoder produced decode sample-exact (see the
-  `reference_encode_decode` oracle).
+- **Bit depths**: every depth of RFC 9639 §8.2, 4 to 32 bits per
+  sample. Output is the narrowest whole-byte format that holds the
+  depth — `U8` for 4..=8 bits, `S16` for 9..=16, `S24` for 17..=24,
+  `S32` for 25..=32 — with the samples **left-justified**: a 12-bit
+  sample occupies the top 12 bits of the `S16`, as in a WAVE file, so
+  full scale stays full scale. (`decoder::FrameScratch` gives the
+  unshifted `i32` planes.) Every §9.1.4 Table 17 frame-header depth
+  code is honoured, including `0b111` (32 bits) and `0b000` (depth from
+  STREAMINFO, which is how the depths without a code are stored).
 - **Sample rates**: full spec range (1 Hz up to 655_350 Hz), including
   the 11 fixed rate codes and the three variable-rate escapes.
 - **Channels**: 1..=8 independent, plus the three decorrelated stereo
@@ -293,7 +295,8 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   predictor order above the partition length. One deliberate
   tolerance: a first residual partition with *zero* samples (partition
   length equal to the predictor order), which §9.2.7 forbids but which
-  is unambiguous and which other decoders play, is decoded;
+  is unambiguous, is decoded (of the two black-box decoders tried, one
+  plays such a frame and one reports lost sync);
   `decoder::FrameScratch::strict()` refuses it, and the encoder checks
   its own frames that way.
 - **Stream parameters**: the output layout comes from STREAMINFO. A
@@ -320,19 +323,26 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
 
 ## Encode support
 
-- **Bit depths**: 8 (`U8`), 16 (`S16`), 24 (`S24`), 32 (`S32`) bps. Each
-  frame header carries the explicit RFC 9639 §9.1.4 Table 17 bit-depth
-  code (including `0b111` for 32 bps), so every frame self-describes its
-  depth without relying on STREAMINFO.
+- **Bit depths**: 4 to 32 bits per sample. By default the depth is the
+  width of the input format: 8 (`U8`), 16 (`S16`), 24 (`S24`), 32
+  (`S32`). `.with_bits_per_sample(n)` (registry key `bits_per_sample`)
+  declares a narrower stream whose samples arrive left-justified in
+  that format — 4..=8 bits in `U8`, 9..=16 in `S16`, 17..=24 in `S24`,
+  25..=32 in `S32` — which is exactly what the decoder delivers, so a
+  12- or 20-bit file survives decode → encode with its depth. Input
+  with a bit set below the declared depth is refused. Each frame header
+  carries the §9.1.4 Table 17 depth code where one exists (8, 12, 16,
+  20, 24, 32); the other depths use code `0b000` and are outside the
+  streamable subset.
 - **Sample rates**: any rate the STREAMINFO format can hold
   (up to 655_350 Hz).
 - **Channels**: 1..=8 independent. For stereo inputs the encoder
   evaluates all four spec-defined channel assignments (independent
   L/R, left-side, right-side, mid-side) per frame and picks the
-  smallest total subframe size. At the 32-bit depth ceiling it emits
-  independent L/R only (the decorrelated layouts would need a 33-bit
-  side subframe, which the subframe encoder does not yet write — the
-  *decoder* reads such frames from other encoders; see Decode support).
+  smallest total subframe size. At 32 bits the side channel is a
+  33-bit subframe (§4.2): a block is decorrelated whenever its side
+  channel stays within 32 bits, which is nearly always, and coded as
+  independent L/R when it does not.
 - **Predictors**: CONSTANT, VERBATIM, FIXED orders 0..=4 and LPC orders
   up to 12 (the streamable-subset ceiling for ≤ 48 kHz, RFC 9639 §7).
   At every compression level the encoder ranks candidates by estimate
@@ -353,11 +363,8 @@ Spec-complete, covering the FLAC format (Subset and non-Subset):
   independent L/R, left-side, side-right and mid-side (RFC 9639 §4.2)
   from per-channel size estimates. It then searches only the two
   channels the chosen layout codes; level 8 and the exhaustive search
-  code all four and compare. At the 32-bit depth ceiling the encoder
-  emits independent L/R only, since the decorrelated layouts would need
-  a 33-bit side subframe that the subframe encoder does not yet write.
-  The *decoder* reads such frames from other encoders; see Decode
-  support.
+  code all four and compare. 32-bit input is decorrelated block by
+  block wherever the side channel stays within 32 bits.
 - **Higher LPC orders (opt-in)**: `FlacEncoderOptions::default()
   .with_max_lpc_order(k)` lifts the LPC ceiling above 12, up to the
   §9.2.6 maximum of 32 (requests clamp into `1..=32`). That helps content
@@ -478,6 +485,46 @@ the `compression_quality` test suite:
   decoder agree with each other; the oracle proves the *bitstream* is
   correct against an outside implementation. The suite skips when no
   reference decoder is on `PATH`.
+
+## Checked against outside tools
+
+Two test matrices run this crate against black-box tools (`flac` 1.5,
+`ffmpeg`, `sox`, invoked as opaque processes); they skip where the
+tools are not installed.
+
+- **Outside encoders → this decoder** (`tests/blackbox_foreign.rs`):
+  1589 streams, 1589 decode to exactly the PCM that went in, with the
+  STREAMINFO MD5 confirmed. The sweep covers bit depths 4..=32, 1..=8
+  channels, 34 sample rates across every frame-header encoding, 27
+  block sizes with whole / short / one-sample last blocks, streams of
+  1..=17 samples, compression levels of all three encoders, predictor
+  orders 0..=32 and coefficient precisions 1..=15, residual partition
+  orders, 19 analysis windows, every stereo layout (forced where the
+  encoder allows), wasted bits 1..=31, and signals that force constant,
+  verbatim and full-range subframes. The test prints a census of what
+  those streams contained: all four subframe kinds, fixed orders 0..=4,
+  linear orders 1..=32, shifts 0..=15, partition orders 0..=14, both
+  Rice parameter widths, all three decorrelated layouts, and 147 frames
+  whose side channel needs its 33rd bit. No outside encoder writes
+  escaped partitions, partition order 15 or variable block sizes; those
+  are covered by the hand-built frames below.
+- **This encoder → outside decoders** (`tests/blackbox_ours.rs`): 1509
+  streams over every encoder and muxer option (levels 0..=8 and the
+  exhaustive search, depths 4..=32, 1..=8 channels, block sizes
+  16..=65535, the same sample rates, predictor orders up to 32,
+  partition orders up to 15, analysis windows, padding, MD5 off,
+  verify, 1..=16 threads, seek-table settings). All 1509 pass
+  `flac -t` with warnings treated as errors, decode there to the input,
+  and decode to the input in the second decoder too (one stream shape,
+  three channels in a single 65535-sample block, that decoder cannot
+  read from any encoder; the test checks that with a control).
+- **Hand-built frames** (`tests/spec_edges.rs`): every frame of that
+  suite which this crate decodes — about 390, among them escaped
+  partitions of every width, Rice parameters at both limits, partition
+  order 15, every block-size code, and the 33-bit side channel through
+  every predictor — is also decoded by the black-box decoder and must
+  give the same samples. It refuses 5 of them, all cases of the
+  empty-first-partition tolerance described above.
 
 ## Codec identification
 
