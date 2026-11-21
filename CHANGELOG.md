@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - decoder / demuxer: streams of 4 to 7 bits per sample are decoded (to
   `U8`); the demuxer used to refuse them as unsupported.
+- demuxer: `seek_to` lands on the frame that holds the target sample
+  whether or not the file has a SEEKTABLE. With one it used to stop at
+  the seek point before the target (up to 10 s early with the usual
+  table), and to follow a seek point without checking that a frame
+  starts there.
+- demuxer: a CUESHEET track that opens with index point 0 (its pre-gap)
+  becomes a chapter starting at index point 1.
+- verify: `verify_stream` reads past an ID3v2 tag in front of the
+  stream and ignores bytes after the last sample STREAMINFO counts, as
+  the demuxer does.
 - decoder: a depth that is not a whole number of bytes is delivered
   left-justified in its sample format (a 12-bit sample in the top 12
   bits of an `S16`, a 20-bit one in the top 20 of an `S24`), as a WAVE
@@ -35,8 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded here and compared with the input, the black-box decoder and
   the MD5) and `blackbox_ours` (1509 streams from this encoder and
   muxer, tested and decoded by two outside decoders); the hand-built
-  frames of `spec_edges` are also shown to the black-box decoder. All
-  skip where the tools are missing.
+  frames of `spec_edges` are also shown to the black-box decoder;
+  `blackbox_streams` covers metadata blocks, seeking and cut or
+  damaged streams. All skip where the tools are missing.
 
 - decoder: `Decoder::output_params` answers from STREAMINFO (channels,
   sample format, sample rate) at construction.
@@ -48,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multiples of real time.
 
 ### Changed
+
+- demuxer: seeking halves a byte range by reading single frames from
+  its middle instead of reading the stream from its start (no
+  SEEKTABLE) — at most 96 KiB per seek on a 1.4 MB file, growing with
+  the logarithm of the size.
 
 - decoder: `Decoder::reset` drops the pending packet and clears the
   end-of-stream mark; it used to leave the decoder reporting the end of

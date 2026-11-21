@@ -518,6 +518,20 @@ tools are not installed.
   and decode to the input in the second decoder too (one stream shape,
   three channels in a single 65535-sample block, that decoder cannot
   read from any encoder; the test checks that with a control).
+- **Whole files** (`tests/blackbox_streams.rs`): 39 files with every
+  metadata block as `flac` / `metaflac` write and edit them (padding up
+  to 16 MiB, seek tables of every shape including placeholders, tags
+  with repeated keys and a 16 MB value, two pictures, a cue sheet with
+  a pre-gap, APPLICATION blocks of kept WAVE chunks), block chains
+  rearranged by the test and accepted by the black-box decoder
+  (reversed order, reserved block types, empty blocks, 600 padding
+  blocks), and ID3 tags or stray bytes around the stream; 24 files
+  sought to 26 positions each, with and without seek tables, from the
+  outside encoder and from this crate's muxer; and 89 streams cut at
+  the end, cut at the start in the middle of a frame, or with one bit
+  flipped, where every whole frame must come out at its own position
+  and the black-box decoder, decoding through errors, must recover the
+  same audio. All pass.
 - **Hand-built frames** (`tests/spec_edges.rs`): every frame of that
   suite which this crate decodes — about 390, among them escaped
   partitions of every width, Rice parameters at both limits, partition
@@ -577,26 +591,32 @@ trait:
   and writes the metadata chain byte-for-byte. (Generating a table buffers
   the frame packets until the trailer, since the SEEKTABLE must precede
   the frames it indexes.)
-- **Seeking**: SEEKTABLE-driven byte-offset seek (`seek_to(pts)`
-  lands on the nearest prior seek point). Files **without** a SEEKTABLE
-  seek via a frame-header scanning fallback (RFC 9639 §8.5 — "it is
-  possible to seek to any given sample in a FLAC stream without a seek
-  table, but the delay can be unpredictable"): the demuxer walks the
-  frames forward from the start of the frame stream (the same framing
-  as packet reading) and lands on the last frame whose first sample is
-  ≤ the target, exhausting to the final frame for targets past the end
-  and clamping to sample 0 for negative targets. The scan applies the
-  §11 anti-DoS plausibility checks — each accepted coded number must
-  be strictly increasing and within the STREAMINFO total-sample bound —
-  so a stream with non-monotonic or out-of-range coded numbers can
-  never loop the scanner. A seek point whose 64-bit offset cannot
-  address a byte of the stream is ignored in favour of that scan.
+- **Seeking**: `seek_to(pts)` lands on the frame that holds the target
+  sample (a target past the end lands on the last frame, a negative one
+  on the first) and returns that frame's first sample, with or without
+  a SEEKTABLE. The search halves a byte range: it reads one frame from
+  the middle, compares its sample number with the target, and repeats
+  until the range is about 64 KiB, which it then reads through. A
+  SEEKTABLE only narrows the starting range to the two points around
+  the target. On a 1.4 MB test file every seek reads at most 96 KiB,
+  and the amount grows with the logarithm of the file size; before,
+  a file without a SEEKTABLE was read from its start up to the target,
+  and a file with one was entered at the seek point *before* the
+  target, which with the usual one point per 10 s can be 10 s early.
+  Nothing in the file is trusted on the way: a seek point counts only
+  if a frame with its sample number really starts at its offset, a
+  frame read from the middle only with a matching CRC-16 and a sample
+  number inside the stream, and if the narrowed range turns out not to
+  hold the target (sample numbers that do not increase) the frames are
+  read from the start under the §11 plausibility checks, so hostile
+  numbers cannot loop the search.
 - **Metadata surfaces**: Vorbis-comment key/value pairs and attached
   pictures (FLAC PICTURE block + ID3v2 APIC fallback).
 - **Chapters**: CUESHEET tracks are surfaced through
   `Demuxer::chapters()`. Each non-lead-out track becomes one
   `Chapter` carrying its sample-offset range and the track number
-  as `id`. The full parsed CUESHEET (media catalog number, lead-in
+  as `id`. A track that opens with index point 0 (its pre-gap, §8.7)
+  starts at its index point 1. The full parsed CUESHEET (media catalog number, lead-in
   sample count, per-track ISRC, INDEX point list) is also retained
   on the demuxer for CD-DA fidelity. A malformed CUESHEET is
   non-fatal: it is dropped and an empty chapter list returned.

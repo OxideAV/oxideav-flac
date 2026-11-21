@@ -274,10 +274,10 @@ fn flac_seek_with_overflowing_seekpoint_offset_falls_back_to_scan() {
 }
 
 /// A seek point whose offset is representable but lies past the end of
-/// the file is not an error at seek time; the following read reports the
-/// end of the stream and a later seek recovers.
+/// the file does not address a frame: it is left aside and the frame is
+/// found by reading, as in a file without a SEEKTABLE.
 #[test]
-fn flac_seek_with_offset_past_end_reports_eof_then_recovers() {
+fn flac_seek_point_past_the_end_of_the_file_is_not_followed() {
     let (f0, _) = build_frame(0);
     let (f1, _) = build_frame(1);
     let o1 = f0.len() as u64;
@@ -305,10 +305,94 @@ fn flac_seek_with_offset_past_end_reports_eof_then_recovers() {
         .expect("open flac");
 
     assert_eq!(demuxer.seek_to(0, 200).expect("seek"), 192);
-    assert!(matches!(
-        demuxer.next_packet(),
-        Err(oxideav_core::Error::Eof)
-    ));
+    assert_eq!(demuxer.next_packet().expect("packet").pts, Some(192));
     assert_eq!(demuxer.seek_to(0, 10).expect("seek"), 0);
     assert_eq!(demuxer.next_packet().expect("packet").pts, Some(0));
+}
+
+// --- Seeking in encoded streams ---------------------------------------------
+
+mod common;
+
+/// A reader that counts the bytes read through it.
+struct Counting {
+    inner: Cursor<Vec<u8>>,
+    read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl std::io::Read for Counting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Counting {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// A seek lands on the frame that holds the target sample — not on the
+/// seek point before it — and gets there by reading a small part of the
+/// file, whether the file has a dense SEEKTABLE, a sparse one, or none.
+#[test]
+fn seek_is_frame_accurate_and_reads_little_with_or_without_a_seektable() {
+    use common::*;
+    use oxideav_flac::container::FlacMuxerOptions;
+    use oxideav_flac::encoder::FlacEncoderOptions;
+
+    const BLOCK: usize = 1024;
+    let planes = signal(Signal::Noise, 16, 1, 700_000, 11);
+    let pcm = pack(&planes, 16);
+    let options = FlacEncoderOptions::level(0).with_block_size(BLOCK as u32);
+    let (extradata, packets) = encode_packets(&planes, 16, 44_100, options, 65_536).unwrap();
+
+    for (label, mux) in [
+        ("no seek table", FlacMuxerOptions::no_seektable()),
+        ("a point per second", FlacMuxerOptions::default()),
+        (
+            "two points",
+            FlacMuxerOptions::default().with_max_seek_points(2),
+        ),
+    ] {
+        let file = mux_file(&extradata, 1, 16, 44_100, &packets, mux).unwrap();
+        let size = file.len() as u64;
+        assert!(size > 1_000_000, "the file is large enough to matter");
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input: Box<dyn oxideav_core::ReadSeek> = Box::new(Counting {
+            inner: Cursor::new(file),
+            read: read.clone(),
+        });
+        let mut reg = ContainerRegistry::new();
+        oxideav_flac::register_containers(&mut reg);
+        let mut demux = reg
+            .open_demuxer("flac", input, &oxideav_core::NullCodecResolver)
+            .unwrap();
+        let mut dec = oxideav_flac::decoder::make_decoder(&demux.streams()[0].params).unwrap();
+
+        for target in [699_999usize, 0, 350_000, 1023, 1024, 612_345, 87, 512_000] {
+            let before = read.load(std::sync::atomic::Ordering::Relaxed);
+            let landed = demux.seek_to(0, target as i64).unwrap() as usize;
+            let cost = read.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert_eq!(landed, target / BLOCK * BLOCK, "{label}: target {target}");
+            assert!(
+                cost < size / 4,
+                "{label}: seeking to {target} read {cost} of {size} bytes"
+            );
+            let pkt = demux.next_packet().unwrap();
+            assert_eq!(pkt.pts, Some(landed as i64), "{label}: target {target}");
+            dec.send_packet(&pkt).unwrap();
+            let oxideav_core::Frame::Audio(frame) = dec.receive_frame().unwrap() else {
+                panic!("audio expected");
+            };
+            assert_eq!(
+                frame.data[0],
+                pcm[landed * 2..(landed + frame.samples as usize) * 2],
+                "{label}: target {target}"
+            );
+        }
+    }
 }

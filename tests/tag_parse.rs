@@ -337,6 +337,69 @@ fn flac_write_cuesheet_round_trips_through_demuxer() {
     assert_eq!(chapters[1].end.value, 44_100 * 60 * 7);
 }
 
+/// RFC 9639 §8.7: index point 0 of a track is its pre-gap. A chapter
+/// begins where the track does, at index point 1, and the chapter before
+/// it ends where the gap starts.
+#[test]
+fn flac_cuesheet_chapter_starts_after_the_pre_gap() {
+    use oxideav_flac::metadata::{CueSheet, CueSheetIndex, CueSheetTrack, write_cuesheet};
+
+    let track = |number: u8, offset: u64, indices: &[(u8, u64)]| CueSheetTrack {
+        offset_samples: offset,
+        number,
+        isrc: [0u8; 12],
+        is_audio: true,
+        pre_emphasis: false,
+        indices: indices
+            .iter()
+            .map(|&(number, offset_samples)| CueSheetIndex {
+                offset_samples,
+                number,
+            })
+            .collect(),
+    };
+    let cs = CueSheet {
+        media_catalog_number: [0u8; 128],
+        lead_in_samples: 88_200,
+        is_cdda: true,
+        tracks: vec![
+            track(1, 0, &[(1, 0)]),
+            // Two seconds of pre-gap, then the track, then a later index.
+            track(2, 588 * 1000, &[(0, 0), (1, 588 * 150), (2, 588 * 900)]),
+            track(3, 588 * 3000, &[(1, 0), (2, 588 * 10)]),
+            track(170, 588 * 5000, &[]),
+        ],
+    };
+    let cuesheet_bytes = write_cuesheet(&cs).expect("write_cuesheet");
+    let streaminfo = build_streaminfo();
+    let mut file = Vec::new();
+    file.extend_from_slice(b"fLaC");
+    file.extend_from_slice(&block_header(false, 0, streaminfo.len()));
+    file.extend_from_slice(&streaminfo);
+    file.extend_from_slice(&block_header(true, 5, cuesheet_bytes.len()));
+    file.extend_from_slice(&cuesheet_bytes);
+
+    let mut reg = ContainerRegistry::new();
+    oxideav_flac::register_containers(&mut reg);
+    let cursor: Box<dyn oxideav_core::ReadSeek> = Box::new(Cursor::new(file));
+    let demuxer = reg
+        .open_demuxer("flac", cursor, &oxideav_core::NullCodecResolver)
+        .expect("open");
+    let spans: Vec<(u64, i64, i64)> = demuxer
+        .chapters()
+        .iter()
+        .map(|c| (c.id, c.start.value, c.end.value))
+        .collect();
+    assert_eq!(
+        spans,
+        [
+            (1, 0, 588 * 1000),
+            (2, 588 * 1150, 588 * 3000),
+            (3, 588 * 3000, 588 * 5000),
+        ]
+    );
+}
+
 #[test]
 fn flac_malformed_cuesheet_does_not_break_demuxer() {
     // A CUESHEET payload that is *technically present in the block

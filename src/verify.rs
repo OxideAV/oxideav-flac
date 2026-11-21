@@ -166,15 +166,18 @@ pub enum VerifyOutcome {
 ///
 /// `frames` must begin at the first frame sync code. Frames are decoded
 /// back to back; each frame's byte length is taken from the decode itself
-/// (header + body + CRC-16). Decoding stops cleanly at the end of the
-/// buffer. Any per-frame decode error (bad CRC-16, malformed subframe)
-/// propagates.
+/// (header + body + CRC-16). Decoding stops at the end of the buffer, or
+/// once the number of samples STREAMINFO states has been decoded: what
+/// follows the stream (a tag of another format appended to the file) is
+/// not part of it. Any per-frame decode error (bad CRC-16, malformed
+/// subframe) propagates.
 pub fn verify_frame_stream(frames: &[u8], streaminfo: &StreamInfo) -> Result<VerifyOutcome> {
     let mut verifier = Md5Verifier::new(streaminfo.bits_per_sample as u32);
     let mut pos = 0usize;
     // One set of sample planes for the whole stream.
     let mut scratch = FrameScratch::new();
-    while pos < frames.len() {
+    let total = streaminfo.total_samples;
+    while pos < frames.len() && (total == 0 || verifier.samples_seen() < total) {
         let shape = scratch.decode(&frames[pos..], streaminfo)?;
         verifier.update(&scratch.planes()[..shape.channels]);
         if shape.frame_byte_len == 0 {
@@ -197,7 +200,20 @@ pub fn verify_frame_stream(frames: &[u8], streaminfo: &StreamInfo) -> Result<Ver
 /// decode, [`VerifyOutcome::NoSignature`] when the file stores no MD5, and
 /// `Err(Error::InvalidData)` when the recomputed digest disagrees with the
 /// stored one.
+///
+/// Like the demuxer, it reads past an ID3v2 tag in front of the stream
+/// marker, and ignores what follows the last sample STREAMINFO counts.
 pub fn verify_stream(file: &[u8]) -> Result<VerifyOutcome> {
+    let file = match file {
+        // ID3v2 header: "ID3", version, flags, 28-bit synchsafe size;
+        // flag 0x10 announces a 10-byte footer.
+        [b'I', b'D', b'3', _, _, flags, a, b, c, d, ..] => {
+            let size = (*a as usize) << 21 | (*b as usize) << 14 | (*c as usize) << 7 | *d as usize;
+            let footer = if flags & 0x10 != 0 { 10 } else { 0 };
+            file.get(10 + size + footer..).unwrap_or(&[])
+        }
+        _ => file,
+    };
     if file.len() < 4 || &file[0..4] != b"fLaC" {
         return Err(Error::invalid("FLAC verify: missing fLaC stream marker"));
     }
