@@ -10,7 +10,7 @@
 
 use oxideav_core::bits::BitWriter;
 use oxideav_flac::crc::{crc8, crc16};
-use oxideav_flac::decoder::decode_frame_channels;
+use oxideav_flac::decoder::{FrameScratch, decode_frame_channels};
 use oxideav_flac::frame::{BlockingStrategy, ChannelAssignment, parse_frame_header};
 use oxideav_flac::metadata::StreamInfo;
 
@@ -322,7 +322,90 @@ fn stream_info(channels: u8, bits_per_sample: u8) -> StreamInfo {
 fn decode(frame: &[u8], channels: u8, bits: u8) -> oxideav_core::Result<Vec<Vec<i32>>> {
     let decoded = decode_frame_channels(frame, &stream_info(channels, bits))?;
     assert_eq!(decoded.frame_byte_len, frame.len());
+    second_opinion(frame, channels, bits, &decoded.channels);
     Ok(decoded.channels)
+}
+
+/// Ask the black-box decoder, when one is installed, what it makes of a
+/// frame this crate decoded: it must produce the same samples. It may
+/// refuse a frame only where this crate's strict rule set
+/// ([`FrameScratch::strict`]) refuses it too, which is the one place the
+/// default decoder is knowingly more lenient than RFC 9639.
+fn second_opinion(frame: &[u8], channels: u8, bits: u8, ours: &[Vec<i32>]) {
+    use std::process::Command;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // Releases before 1.4 do not take 32-bit samples.
+    let present = *PRESENT.get_or_init(|| {
+        let Ok(probe) = Command::new("flac").arg("--version").output() else {
+            return false;
+        };
+        let banner = String::from_utf8_lossy(&probe.stdout).into_owned();
+        let mut version = banner
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .split('.')
+            .map(|part| part.parse::<u32>().unwrap_or(0));
+        probe.status.success() && (version.next(), version.next()) >= (Some(1), Some(4))
+    });
+    if !present {
+        return;
+    }
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let flac = dir.join(format!("oxideav-flac-edge-{}-{n}.flac", std::process::id()));
+    let wav = dir.join(format!("oxideav-flac-edge-{}-{n}.wav", std::process::id()));
+    let info = stream_info(channels, bits);
+    let mut file = b"fLaC".to_vec();
+    file.extend_from_slice(&[0x80, 0, 0, 34]);
+    file.extend_from_slice(&info.write().unwrap());
+    file.extend_from_slice(frame);
+    std::fs::write(&flac, &file).unwrap();
+    let out = Command::new("flac")
+        .args(["-s", "-d", "-f", "-o"])
+        .arg(&wav)
+        .arg(&flac)
+        .output()
+        .unwrap();
+    let data = std::fs::read(&wav).ok();
+    let _ = std::fs::remove_file(&flac);
+    let _ = std::fs::remove_file(&wav);
+    if !out.status.success() {
+        assert!(
+            FrameScratch::strict().decode(frame, &info).is_err(),
+            "the black-box decoder refused a frame that is strictly valid here: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return;
+    }
+    let data = data.expect("black-box decoder wrote a file");
+    let at = data
+        .windows(4)
+        .position(|w| w == b"data")
+        .expect("data chunk")
+        + 8;
+    // WAVE sample data: left-justified in whole bytes, one-byte samples
+    // unsigned.
+    let width = (bits as usize).div_ceil(8);
+    let shift = width as u32 * 8 - bits as u32;
+    let mut want = Vec::new();
+    for i in 0..ours[0].len() {
+        for plane in ours {
+            let v = (plane[i] as i64) << shift;
+            if width == 1 {
+                want.push((v + 128) as u8);
+            } else {
+                want.extend_from_slice(&v.to_le_bytes()[..width]);
+            }
+        }
+    }
+    assert!(
+        data[at..] == want[..],
+        "the black-box decoder produced other samples for this frame"
+    );
 }
 
 fn as_i32(samples: &[i64]) -> Vec<i32> {

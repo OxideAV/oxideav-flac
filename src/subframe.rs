@@ -74,6 +74,48 @@ pub enum EmptyFirstPartition {
     Reject,
 }
 
+/// How a subframe was coded (RFC 9639 §9.2.1, Table 19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubframeKind {
+    /// One value for the whole block (§9.2.3).
+    #[default]
+    Constant,
+    /// Every sample stored as is (§9.2.4).
+    Verbatim,
+    /// One of the five fixed predictors (§9.2.5).
+    Fixed,
+    /// A linear predictor with stored coefficients (§9.2.6).
+    Linear,
+}
+
+/// What one subframe's headers said: enough to describe a stream's use
+/// of the format without keeping the samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubframeSummary {
+    /// The coding of the subframe.
+    pub kind: SubframeKind,
+    /// Predictor order: 0..=4 for [`SubframeKind::Fixed`], 1..=32 for
+    /// [`SubframeKind::Linear`], 0 otherwise.
+    pub order: u8,
+    /// Wasted bits per sample (§9.2.2).
+    pub wasted_bits: u8,
+    /// Coefficient precision in bits, for a linear predictor.
+    pub precision: u8,
+    /// Right shift applied to the prediction, for a linear predictor.
+    pub shift: u8,
+    /// Width of the Rice parameter field, 4 or 5 (§9.2.7); 0 when the
+    /// subframe has no coded residual.
+    pub parameter_bits: u8,
+    /// Residual partition order.
+    pub partition_order: u8,
+    /// Largest Rice parameter used by a partition.
+    pub max_rice_parameter: u8,
+    /// Partitions stored as unencoded binary (§9.2.7.1).
+    pub escaped_partitions: u32,
+}
+
 /// Decode one subframe into `out`; the block size is `out.len()`.
 ///
 /// `bps` must be `1..=32` for an `i32` slice and `1..=33` for an `i64`
@@ -83,7 +125,7 @@ pub fn decode_subframe_into<S: Sample>(
     out: &mut [S],
     bps: u32,
 ) -> Result<()> {
-    decode_subframe_with(br, out, bps, EmptyFirstPartition::Accept)
+    decode_subframe_with(br, out, bps, EmptyFirstPartition::Accept).map(|_| ())
 }
 
 /// [`decode_subframe_into`] with an explicit choice for an empty first
@@ -93,7 +135,7 @@ pub fn decode_subframe_with<S: Sample>(
     out: &mut [S],
     bps: u32,
     empty_first: EmptyFirstPartition,
-) -> Result<()> {
+) -> Result<SubframeSummary> {
     debug_assert!((1..=33).contains(&bps));
     // §9.2.1: one zero bit, six type bits, the wasted-bits flag.
     let header = br.read_u32(8)?;
@@ -115,21 +157,32 @@ pub fn decode_subframe_with<S: Sample>(
         )));
     }
     let depth = bps - wasted;
+    let mut summary = SubframeSummary {
+        wasted_bits: wasted as u8,
+        ..SubframeSummary::default()
+    };
 
     match type_code {
         0b000000 => {
             let v = S::from_i64(br.read_signed(depth)?);
             out.fill(v);
         }
-        0b000001 => br.read_signed_run(depth, out)?,
+        0b000001 => {
+            summary.kind = SubframeKind::Verbatim;
+            br.read_signed_run(depth, out)?;
+        }
         0b001000..=0b001100 => {
             let order = (type_code - 8) as usize;
+            summary.kind = SubframeKind::Fixed;
+            summary.order = order as u8;
             read_warm_up(br, out, order, depth)?;
-            decode_residual(br, out, order, empty_first)?;
+            decode_residual(br, out, order, empty_first, &mut summary)?;
             restore_fixed(out, order);
         }
         0b100000..=0b111111 => {
             let order = (type_code - 31) as usize;
+            summary.kind = SubframeKind::Linear;
+            summary.order = order as u8;
             read_warm_up(br, out, order, depth)?;
             // §9.2.6: (precision - 1) in 4 bits, 0b1111 forbidden.
             let precision = br.read_u32(4)? + 1;
@@ -147,7 +200,9 @@ pub fn decode_subframe_with<S: Sample>(
             }
             let mut coefficients = [0i32; MAX_LPC_ORDER];
             br.read_signed_run(precision, &mut coefficients[..order])?;
-            decode_residual(br, out, order, empty_first)?;
+            summary.precision = precision as u8;
+            summary.shift = shift as u8;
+            decode_residual(br, out, order, empty_first, &mut summary)?;
             restore_linear(out, &coefficients[..order], shift);
         }
         _ => {
@@ -163,7 +218,7 @@ pub fn decode_subframe_with<S: Sample>(
             *s = S::from_i64(s.to_i64() << wasted);
         }
     }
-    Ok(())
+    Ok(summary)
 }
 
 /// Read the `order` unencoded warm-up samples that open a predicted
@@ -199,6 +254,7 @@ fn decode_residual<S: Sample>(
     out: &mut [S],
     order: usize,
     empty_first: EmptyFirstPartition,
+    summary: &mut SubframeSummary,
 ) -> Result<()> {
     let block_size = out.len();
     // Two method bits and four partition-order bits.
@@ -209,6 +265,8 @@ fn decode_residual<S: Sample>(
         _ => return Err(Error::invalid("FLAC residual: reserved coding method")),
     };
     let partition_order = lead & 0xF;
+    summary.parameter_bits = parameter_bits as u8;
+    summary.partition_order = partition_order as u8;
     let partition_len = block_size >> partition_order;
     if partition_len << partition_order != block_size {
         return Err(Error::invalid(format!(
@@ -234,8 +292,10 @@ fn decode_residual<S: Sample>(
             // §9.2.7.1: 5 bits of width, then that many bits per sample;
             // width 0 means every residual in the partition is zero.
             let width = br.read_u32(5)?;
+            summary.escaped_partitions += 1;
             br.read_signed_run(width, partition)?;
         } else {
+            summary.max_rice_parameter = summary.max_rice_parameter.max(parameter as u8);
             br.read_rice_run(parameter, partition)?;
         }
     }

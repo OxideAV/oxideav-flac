@@ -14,7 +14,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
     AttachedPicture, Chapter, CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet,
-    PictureType, Result, SampleFormat, StreamInfo, TimeBase, Timestamp,
+    PictureType, Result, StreamInfo, TimeBase, Timestamp,
 };
 use oxideav_core::{Demuxer, Muxer, ReadSeek, WriteSeek};
 
@@ -118,21 +118,16 @@ fn open_demuxer(
     // SEEKPOINT's offset to this value to land on a frame boundary.
     let first_frame_offset = input.stream_position()?;
 
-    // Project STREAMINFO bps onto the narrowest container-friendly
-    // SampleFormat. 12 and 20 bps are spec-allowed but don't have
-    // dedicated SampleFormat variants, so we widen them to the next
-    // standard width (S16 / S24). The decoder applies the same mapping.
-    let sample_format = match info.bits_per_sample {
-        8 => SampleFormat::U8,
-        9..=16 => SampleFormat::S16, // covers 12 bps + the 16 bps default
-        17..=24 => SampleFormat::S24, // covers 20 bps + the 24 bps default
-        25..=32 => SampleFormat::S32,
-        other => {
-            return Err(Error::unsupported(format!(
-                "unsupported FLAC bit depth {other}"
-            )));
-        }
-    };
+    // Each depth of RFC 9639 §8.2 (4..=32 bits) is delivered in the
+    // narrowest whole-byte format that holds it, left-justified; the
+    // decoder applies the same mapping.
+    let sample_format =
+        crate::decoder::output_format_for(info.bits_per_sample as u32).ok_or_else(|| {
+            Error::unsupported(format!(
+                "unsupported FLAC bit depth {}",
+                info.bits_per_sample
+            ))
+        })?;
 
     let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
     params.media_type = MediaType::Audio;

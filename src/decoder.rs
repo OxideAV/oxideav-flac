@@ -10,26 +10,19 @@ use crate::frame::{ChannelAssignment, parse_frame_header};
 use crate::metadata::{BlockHeader, BlockType, StreamInfo};
 use crate::reservoir::BitReservoir;
 use crate::subframe::{EmptyFirstPartition, decode_subframe_with};
+pub use crate::subframe::{SubframeKind, SubframeSummary};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let streaminfo = find_streaminfo(&params.extradata)?;
     let bps = streaminfo.bits_per_sample;
-    // Map STREAMINFO bps to the narrowest container-friendly output:
-    //   8        -> U8  (matches the FLAC spec's "8-bit samples are signed
-    //                   two's complement" rendered as WAV-style unsigned
-    //                   offset-128 bytes, the format the FLAC container
-    //                   surfaces in `params.sample_format`).
-    //   9..=16   -> S16
-    //   12 sits inside this range and stays S16.
-    //   17..=24  -> S24 (also covers the 20-bps spec corner).
-    //   25..=32  -> S32
-    let output_format = match bps {
-        8 => SampleFormat::U8,
-        1..=16 => SampleFormat::S16,
-        17..=24 => SampleFormat::S24,
-        25..=32 => SampleFormat::S32,
-        _ => return Err(Error::unsupported(format!("FLAC bps {bps}"))),
-    };
+    // RFC 9639 §8.2: a stream carries 4 to 32 bits per sample. The PCM
+    // side has whole-byte formats only, so each depth goes into the
+    // narrowest one that holds it, left-justified (a 12-bit sample
+    // occupies the top 12 bits of an S16, its low 4 bits zero): full
+    // scale stays full scale. One-byte output is unsigned with an
+    // offset of 128.
+    let output_format = output_format_for(bps as u32)
+        .ok_or_else(|| Error::unsupported(format!("FLAC bps {bps}")))?;
     Ok(Box::new(FlacDecoder {
         codec_id: params.codec_id.clone(),
         streaminfo,
@@ -100,7 +93,8 @@ impl Decoder for FlacDecoder {
             )));
         }
         let planes = &self.scratch.planes[..shape.channels];
-        let data = interleave(planes, self.output_format)?;
+        let pad = container_bits(self.output_format) - shape.bits_per_sample;
+        let data = interleave(planes, self.output_format, pad)?;
         Ok(Frame::Audio(AudioFrame {
             samples: shape.block_size as u32,
             pts: self.pending_pts,
@@ -136,6 +130,29 @@ impl Decoder for FlacDecoder {
             p.sample_rate = Some(self.streaminfo.sample_rate);
         }
         Some(p)
+    }
+}
+
+/// The PCM format a stream of `bps` bits per sample is delivered in:
+/// the narrowest whole-byte format that holds it. `None` outside the
+/// 4..=32 range of RFC 9639 §8.2.
+pub(crate) fn output_format_for(bps: u32) -> Option<SampleFormat> {
+    match bps {
+        4..=8 => Some(SampleFormat::U8),
+        9..=16 => Some(SampleFormat::S16),
+        17..=24 => Some(SampleFormat::S24),
+        25..=32 => Some(SampleFormat::S32),
+        _ => None,
+    }
+}
+
+/// Width in bits of the PCM formats the decoder delivers.
+fn container_bits(format: SampleFormat) -> u32 {
+    match format {
+        SampleFormat::U8 => 8,
+        SampleFormat::S16 => 16,
+        SampleFormat::S24 => 24,
+        _ => 32,
     }
 }
 
@@ -225,6 +242,8 @@ pub struct FrameScratch {
     /// The 33-bit side channel of a 32-bit stereo-decorrelated frame.
     side: Vec<i64>,
     empty_first: EmptyFirstPartition,
+    /// How each subframe of the last frame was coded, in stream order.
+    subframes: [SubframeSummary; 8],
 }
 
 impl FrameScratch {
@@ -251,6 +270,14 @@ impl FrameScratch {
     /// [`FrameShape::channels`] entries are meaningful.
     pub fn planes(&self) -> &[Vec<i32>] {
         &self.planes
+    }
+
+    /// How each subframe of the most recently decoded frame was coded,
+    /// in stream order (for a decorrelated stereo frame that is the
+    /// order of RFC 9639 §4.2: left/side, side/right or mid/side). Only
+    /// the first [`FrameShape::channels`] entries are meaningful.
+    pub fn subframes(&self) -> &[SubframeSummary] {
+        &self.subframes
     }
 
     /// Decode one frame from the start of `data` into the planes: header,
@@ -297,15 +324,15 @@ impl FrameScratch {
         }
         let rule = self.empty_first;
         for (index, plane) in self.planes[..n_channels].iter_mut().enumerate() {
-            if side_index == Some(index) {
+            self.subframes[index] = if side_index == Some(index) {
                 if wide_side {
-                    decode_subframe_with(&mut br, &mut self.side[..], bps + 1, rule)?;
+                    decode_subframe_with(&mut br, &mut self.side[..], bps + 1, rule)?
                 } else {
-                    decode_subframe_with(&mut br, &mut plane[..], bps + 1, rule)?;
+                    decode_subframe_with(&mut br, &mut plane[..], bps + 1, rule)?
                 }
             } else {
-                decode_subframe_with(&mut br, &mut plane[..], bps, rule)?;
-            }
+                decode_subframe_with(&mut br, &mut plane[..], bps, rule)?
+            };
         }
 
         // §9.3: zero bits up to the byte boundary, then the CRC-16 over
@@ -347,7 +374,9 @@ impl FrameScratch {
 
 /// Pack per-channel planes into one interleaved little-endian buffer in
 /// `format`.
-fn interleave(planes: &[Vec<i32>], format: SampleFormat) -> Result<Vec<u8>> {
+/// Interleave sample planes into `format`, shifting each sample left by
+/// `pad` bits so a depth narrower than the format is left-justified.
+fn interleave(planes: &[Vec<i32>], format: SampleFormat, pad: u32) -> Result<Vec<u8>> {
     let width = match format {
         SampleFormat::U8 => 1,
         SampleFormat::S16 => 2,
@@ -370,22 +399,22 @@ fn interleave(planes: &[Vec<i32>], format: SampleFormat) -> Result<Vec<u8>> {
             // SampleFormat::U8 is unsigned with a +128 offset.
             SampleFormat::U8 => {
                 for (frame, &s) in frames {
-                    frame[at] = (s as u8).wrapping_add(128);
+                    frame[at] = ((s << pad) as u8).wrapping_add(128);
                 }
             }
             SampleFormat::S16 => {
                 for (frame, &s) in frames {
-                    frame[at..at + 2].copy_from_slice(&(s as i16).to_le_bytes());
+                    frame[at..at + 2].copy_from_slice(&((s << pad) as i16).to_le_bytes());
                 }
             }
             SampleFormat::S24 => {
                 for (frame, &s) in frames {
-                    frame[at..at + 3].copy_from_slice(&s.to_le_bytes()[..3]);
+                    frame[at..at + 3].copy_from_slice(&(s << pad).to_le_bytes()[..3]);
                 }
             }
             _ => {
                 for (frame, &s) in frames {
-                    frame[at..at + 4].copy_from_slice(&s.to_le_bytes());
+                    frame[at..at + 4].copy_from_slice(&(s << pad).to_le_bytes());
                 }
             }
         }

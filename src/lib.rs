@@ -11,7 +11,7 @@
 //!   `metadata::parse_picture`. A muxer is also provided for round-trip
 //!   encoding.
 //! - The **codec** (id `flac`) ships both a spec-complete decoder (all
-//!   subframe types, all residual partition methods, 8/12/16/20/24/32 bps,
+//!   subframe types, all residual partition methods, 4 to 32 bits per sample,
 //!   up to 8 channels, stereo decorrelation) and a working pure-Rust
 //!   encoder that produces bit-exact round-trippable output. The encoder
 //!   tries CONSTANT, FIXED 0..=4, LPC 1..=8 and VERBATIM per subframe,
